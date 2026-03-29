@@ -1,0 +1,144 @@
+"""Parser for Spamhaus DROP, EDROP, and DBL feeds.
+
+DROP/EDROP are CIDR-based IP blocklists. Each line is:
+    <cidr> ; <SBL-id>
+
+DBL is a domain blocklist (one domain per line with comments).
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import logging
+import re
+
+from rpz_factory.fetcher import fetch_url
+from rpz_factory.models import EntryType, FetchResult, SourceName, ThreatEntry
+
+logger = logging.getLogger(__name__)
+
+DROP_URL = "https://www.spamhaus.org/drop/drop.txt"
+EDROP_URL = "https://www.spamhaus.org/drop/edrop.txt"
+DBL_URL = "https://www.spamhaus.org/drop/dbl.txt"
+
+# DROP/EDROP line format: 1.2.3.0/24 ; SBLxxxxxx
+_DROP_LINE_RE = re.compile(r"^(\d+\.\d+\.\d+\.\d+/\d+)\s*;\s*(\S+)")
+
+# DBL line: domain.tld  (may have trailing comment after ;)
+_DBL_LINE_RE = re.compile(r"^([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})\s*(?:;.*)?$")
+
+
+def _parse_drop_text(text: str, source: SourceName) -> FetchResult:
+    """Parse DROP or EDROP format text into CIDR entries."""
+    result = FetchResult(source=source)
+    seen: set[str] = set()
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(";"):
+            continue
+
+        result.raw_count += 1
+        m = _DROP_LINE_RE.match(line)
+        if m:
+            cidr = m.group(1)
+            # Validate the CIDR
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+            except ValueError:
+                logger.debug("Skipping invalid CIDR: %s", cidr)
+                continue
+
+            if cidr not in seen:
+                seen.add(cidr)
+                result.entries.append(
+                    ThreatEntry(
+                        value=cidr,
+                        entry_type=EntryType.CIDR,
+                        source=source,
+                        raw_line=line,
+                    )
+                )
+
+    return result
+
+
+def fetch_drop() -> FetchResult:
+    """Fetch and parse Spamhaus DROP list."""
+    result = FetchResult(source=SourceName.SPAMHAUS_DROP)
+    try:
+        text = fetch_url(DROP_URL)
+        assert isinstance(text, str)
+    except Exception as exc:
+        logger.error("Failed to fetch Spamhaus DROP: %s", exc)
+        result.error = str(exc)
+        return result
+
+    result = _parse_drop_text(text, SourceName.SPAMHAUS_DROP)
+    logger.info(
+        "Spamhaus DROP: parsed %d CIDR entries from %d lines",
+        len(result.entries),
+        result.raw_count,
+    )
+    return result
+
+
+def fetch_edrop() -> FetchResult:
+    """Fetch and parse Spamhaus EDROP list."""
+    result = FetchResult(source=SourceName.SPAMHAUS_EDROP)
+    try:
+        text = fetch_url(EDROP_URL)
+        assert isinstance(text, str)
+    except Exception as exc:
+        logger.error("Failed to fetch Spamhaus EDROP: %s", exc)
+        result.error = str(exc)
+        return result
+
+    result = _parse_drop_text(text, SourceName.SPAMHAUS_EDROP)
+    logger.info(
+        "Spamhaus EDROP: parsed %d CIDR entries from %d lines",
+        len(result.entries),
+        result.raw_count,
+    )
+    return result
+
+
+def fetch_dbl() -> FetchResult:
+    """Fetch and parse Spamhaus DBL (domain blocklist)."""
+    result = FetchResult(source=SourceName.SPAMHAUS_DBL)
+    try:
+        text = fetch_url(DBL_URL)
+        assert isinstance(text, str)
+    except Exception as exc:
+        # DBL may not be publicly accessible — this is expected
+        logger.warning("Failed to fetch Spamhaus DBL (may require auth): %s", exc)
+        result.error = str(exc)
+        return result
+
+    seen: set[str] = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(";"):
+            continue
+
+        result.raw_count += 1
+        m = _DBL_LINE_RE.match(line)
+        if m:
+            domain = m.group(1).lower().rstrip(".")
+            if domain and domain not in seen:
+                seen.add(domain)
+                result.entries.append(
+                    ThreatEntry(
+                        value=domain,
+                        entry_type=EntryType.DOMAIN,
+                        source=SourceName.SPAMHAUS_DBL,
+                        raw_line=line,
+                    )
+                )
+
+    logger.info(
+        "Spamhaus DBL: parsed %d domain entries from %d lines",
+        len(result.entries),
+        result.raw_count,
+    )
+    return result
