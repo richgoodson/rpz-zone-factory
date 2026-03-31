@@ -47,6 +47,8 @@ CONF_SOURCES=""         # Space-separated source list, or empty for all
 CONF_VERBOSITY=""       # 0=quiet, 1=-v, 2=-vv
 CONF_RELOAD=""          # yes or no
 CONF_RELOAD_ZONE=""     # Zone to reload via rndc
+CONF_COMPILE_ZONE=""    # yes or no — use named-compilezone for binary (raw) format
+CONF_CHECKZONE=""       # yes or no — validate with named-checkzone before deploying
 
 # Source config file if it exists (overrides defaults above)
 _conf_file="${RPZ_DIR}/.run-rpz.conf"
@@ -57,7 +59,7 @@ fi
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
@@ -728,6 +730,60 @@ run_setup() {
         CONF_RELOAD_ZONE=""
     fi
 
+    # ── Section 3b: Zone Validation & Compilation ─────────────────────────
+
+    if [ "$CONF_OUTPUT" = "rpz" ]; then
+        printf "\n─── Zone Validation & Compilation ──────────────────────────\n\n"
+
+        # named-checkzone
+        _def_checkzone="${CONF_CHECKZONE:-yes}"
+        if [ "$_def_checkzone" = "yes" ]; then _yn_def="y"; else _yn_def="n"; fi
+
+        if prompt_yn "Validate zone with named-checkzone before deploying?" "$_yn_def"; then
+            CONF_CHECKZONE="yes"
+            _cz_path=$(find_named_tool "named-checkzone")
+            if [ -n "$_cz_path" ]; then
+                printf "  ✓ named-checkzone found: %s\n" "$_cz_path"
+            else
+                printf "  ✗ named-checkzone not found in PATH or common locations\n"
+                printf "    Install BIND utilities for zone validation.\n"
+                printf "    Validation will be skipped at runtime if not found.\n"
+            fi
+        else
+            CONF_CHECKZONE="no"
+        fi
+
+        # named-compilezone (raw binary format)
+        printf "\n"
+        _def_compile="${CONF_COMPILE_ZONE:-no}"
+        if [ "$_def_compile" = "yes" ]; then _yn_def="y"; else _yn_def="n"; fi
+
+        printf "  Compiled (raw) zone format loads significantly faster than\n"
+        printf "  plain text. BIND skips the text parser and memory-maps the\n"
+        printf "  pre-parsed data. Recommended for large zones (>10K entries).\n"
+        printf "\n"
+        printf "  ⚠  Requires 'masterfile-format raw;' in named.conf zone statement.\n"
+        printf "     The BIND config example below will reflect your choice.\n"
+        printf "\n"
+
+        if prompt_yn "Compile zone to binary (raw) format with named-compilezone?" "$_yn_def"; then
+            CONF_COMPILE_ZONE="yes"
+            _compile_path=$(find_named_tool "named-compilezone")
+            if [ -n "$_compile_path" ]; then
+                printf "  ✓ named-compilezone found: %s\n" "$_compile_path"
+            else
+                printf "  ✗ named-compilezone not found in PATH or common locations\n"
+                printf "    Install BIND utilities for zone compilation.\n"
+                printf "    Will fall back to text format at runtime if not found.\n"
+            fi
+        else
+            CONF_COMPILE_ZONE="no"
+        fi
+    else
+        CONF_CHECKZONE="no"
+        CONF_COMPILE_ZONE="no"
+    fi
+
     # ── Save configuration ────────────────────────────────────────────────
 
     printf "\n─── Saving Configuration ───────────────────────────────────\n\n"
@@ -756,6 +812,10 @@ CONF_VERBOSITY="${CONF_VERBOSITY}"
 # BIND reload
 CONF_RELOAD="${CONF_RELOAD}"
 CONF_RELOAD_ZONE="${CONF_RELOAD_ZONE}"
+
+# Zone validation and compilation
+CONF_CHECKZONE="${CONF_CHECKZONE}"
+CONF_COMPILE_ZONE="${CONF_COMPILE_ZONE}"
 CONF
 
     printf "  ✓ Configuration saved to: %s\n" "$_conf_file"
@@ -865,6 +925,9 @@ CONF
         printf "  zone \"%s\" {\n" "$_ex_zone"
         printf "      type primary;\n"
         printf "      file \"%s\";\n" "$_ex_file"
+        if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
+            printf "      masterfile-format raw;   // compiled binary — faster loading\n"
+        fi
         printf "      allow-query { localhost; };\n"
         printf "      allow-transfer { none; };\n"
         printf "  };\n"
@@ -891,6 +954,20 @@ CONF
         printf "  • 'policy given' uses the action specified in each RPZ record\n"
         printf "    (rpz-zone-factory writes CNAME . records → NXDOMAIN).\n"
         printf "\n"
+        if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
+            printf "  • Zone is compiled to binary (raw) format for faster loading.\n"
+            printf "    The 'masterfile-format raw;' directive is REQUIRED in the zone\n"
+            printf "    statement above. Without it, BIND will fail to parse the file.\n"
+            printf "\n"
+            printf "  • The text zone is written to a .tmp file, validated with\n"
+            printf "    named-checkzone, then compiled with named-compilezone.\n"
+            printf "    If either step fails, the previous zone file is untouched.\n"
+            printf "\n"
+        elif [ "$CONF_CHECKZONE" = "yes" ]; then
+            printf "  • Zone is validated with named-checkzone before deployment.\n"
+            printf "    If validation fails, the previous zone file is untouched.\n"
+            printf "\n"
+        fi
         printf "  • RPZ zones are evaluated in order. Put whitelists first\n"
         printf "    with 'policy passthru' to override subsequent blocks.\n"
         printf "\n"
@@ -938,7 +1015,14 @@ build_args_from_config() {
     fi
 
     if [ -n "$CONF_OUTPUT_FILE" ]; then
-        RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}"
+        # When checkzone or compilezone is enabled, write to a temp file first
+        # so the previous zone file is preserved until validation passes.
+        if [ "$CONF_OUTPUT" = "rpz" ] && \
+           { [ "$CONF_CHECKZONE" = "yes" ] || [ "$CONF_COMPILE_ZONE" = "yes" ]; }; then
+            RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}.tmp"
+        else
+            RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}"
+        fi
     fi
 
     if [ -n "$CONF_SOURCES" ] && [ "$CONF_SOURCES" != "all" ]; then
@@ -958,6 +1042,31 @@ build_args_from_config() {
 
     log_info "Using saved config from .run-rpz.conf"
     return 0
+}
+
+# ─── BIND tool discovery ──────────────────────────────────────────────────────
+
+# Find a named-* tool (named-checkzone, named-compilezone) in common locations.
+# Echoes the path if found, empty string if not.
+find_named_tool() {
+    _tool_name="$1"
+
+    # Check PATH first
+    if command -v "$_tool_name" >/dev/null 2>&1; then
+        command -v "$_tool_name"
+        return 0
+    fi
+
+    # Common locations
+    for _try in /usr/sbin/"$_tool_name" /usr/local/sbin/"$_tool_name" \
+                /usr/bin/"$_tool_name" /usr/local/bin/"$_tool_name"; do
+        if [ -x "$_try" ]; then
+            echo "$_try"
+            return 0
+        fi
+    done
+
+    return 1
 }
 
 # ─── Main run ─────────────────────────────────────────────────────────────────
@@ -1032,10 +1141,89 @@ run_rpz() {
 
     log_info "rpz-zone-factory completed successfully"
 
-    # Zero-length file guard: abort before reloading if output is empty
-    if [ -n "$CONF_OUTPUT_FILE" ] && [ ! -s "$CONF_OUTPUT_FILE" ]; then
-        log_err "Output file is empty or missing: $CONF_OUTPUT_FILE — aborting reload"
-        return 1
+    # Zero-length file guard: abort before validating/reloading if output is empty
+    # When checkzone/compilezone is enabled, the output went to .tmp
+    if [ -n "$CONF_OUTPUT_FILE" ]; then
+        if { [ "$CONF_CHECKZONE" = "yes" ] || [ "$CONF_COMPILE_ZONE" = "yes" ]; } && \
+           [ "$CONF_OUTPUT" = "rpz" ]; then
+            _guard_file="${CONF_OUTPUT_FILE}.tmp"
+        else
+            _guard_file="$CONF_OUTPUT_FILE"
+        fi
+        if [ ! -s "$_guard_file" ]; then
+            log_err "Output file is empty or missing: $_guard_file — aborting"
+            return 1
+        fi
+    fi
+
+    # ── Zone validation and compilation (RPZ output only) ─────────────────
+
+    if [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_OUTPUT_FILE" ] && [ -n "$CONF_ZONE_NAME" ]; then
+
+        # When checkzone/compilezone is enabled, Python wrote to .tmp via
+        # build_args_from_config; the final path still has the old zone file.
+        _final_file="$CONF_OUTPUT_FILE"
+        _text_file="$CONF_OUTPUT_FILE"
+
+        if [ "$CONF_CHECKZONE" = "yes" ] || [ "$CONF_COMPILE_ZONE" = "yes" ]; then
+            _text_file="${CONF_OUTPUT_FILE}.tmp"
+
+            if [ ! -s "$_text_file" ]; then
+                log_err "Text zone file is empty or missing: $_text_file — aborting"
+                return 1
+            fi
+        fi
+
+        # Step 1: named-checkzone validation
+        if [ "$CONF_CHECKZONE" = "yes" ]; then
+            _checkzone_bin=$(find_named_tool "named-checkzone")
+            if [ -n "$_checkzone_bin" ]; then
+                log_info "Validating zone with named-checkzone..."
+                _cz_output=$("$_checkzone_bin" "$CONF_ZONE_NAME" "$_text_file" 2>&1)
+                _cz_rc=$?
+                if [ $_cz_rc -ne 0 ]; then
+                    log_err "named-checkzone failed (exit code: $_cz_rc)"
+                    log_err "$_cz_output"
+                    log_err "Keeping previous zone file intact. Fix the issue and re-run."
+                    rm -f "$_text_file"
+                    return 1
+                fi
+                log_info "named-checkzone passed: $_cz_output"
+            else
+                log_warn "named-checkzone not found — skipping validation"
+            fi
+        fi
+
+        # Step 2: named-compilezone (text → raw binary format)
+        if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
+            _compilezone_bin=$(find_named_tool "named-compilezone")
+            if [ -n "$_compilezone_bin" ]; then
+                log_info "Compiling zone to raw format with named-compilezone..."
+                _compile_output=$("$_compilezone_bin" -o "$_final_file" -F raw \
+                    "$CONF_ZONE_NAME" "$_text_file" 2>&1)
+                _compile_rc=$?
+                if [ $_compile_rc -ne 0 ]; then
+                    log_err "named-compilezone failed (exit code: $_compile_rc)"
+                    log_err "$_compile_output"
+                    log_err "Keeping previous zone file intact."
+                    rm -f "$_text_file"
+                    return 1
+                fi
+                log_info "Zone compiled: $_compile_output"
+                rm -f "$_text_file"
+
+                if [ ! -s "$_final_file" ]; then
+                    log_err "Compiled zone file is empty: $_final_file — aborting"
+                    return 1
+                fi
+            else
+                log_warn "named-compilezone not found — falling back to text format"
+                mv "$_text_file" "$_final_file"
+            fi
+        elif [ "$CONF_CHECKZONE" = "yes" ]; then
+            # Checkzone passed, no compilation — move validated text to final path
+            mv "$_text_file" "$_final_file"
+        fi
     fi
 
     # Optional BIND reload
