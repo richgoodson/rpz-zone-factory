@@ -4,18 +4,28 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
+from rpz_factory import __version__
+from rpz_factory.cache import load_cache, write_cache
 from rpz_factory.filters import filter_entries
 from rpz_factory.models import FetchResult, ThreatEntry
-from rpz_factory.parsers import abusech, cisa, spamhaus
+from rpz_factory.parsers import abusech, cisa, cryptoscamdb, scamsniffer, spamhaus
 from rpz_factory.renderers import pihole, rpz
+
+ALL_SOURCES = ["urlhaus", "cisa", "drop", "edrop", "dbl", "scamsniffer", "cryptoscamdb"]
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="rpz-zone-factory",
         description="Fetch threat intel and generate RPZ zone files or Pi-hole blocklists.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "--output",
@@ -36,9 +46,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sources",
         nargs="+",
-        default=["urlhaus", "cisa", "drop", "edrop", "dbl"],
-        choices=["urlhaus", "cisa", "drop", "edrop", "dbl"],
+        default=ALL_SOURCES,
+        choices=ALL_SOURCES,
         help="Sources to fetch (default: all)",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Cache directory for stale-data preservation (default: {RPZ_DIR}/.cache)",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -70,6 +85,19 @@ SOURCE_FETCHERS = {
     "drop": spamhaus.fetch_drop,
     "edrop": spamhaus.fetch_edrop,
     "dbl": spamhaus.fetch_dbl,
+    "scamsniffer": scamsniffer.fetch_and_parse,
+    "cryptoscamdb": cryptoscamdb.fetch_and_parse,
+}
+
+# Map source keys to SourceName enum values for cache lookups
+_SOURCE_KEY_TO_NAME = {
+    "urlhaus": "abusech_urlhaus",
+    "cisa": "cisa_kev",
+    "drop": "spamhaus_drop",
+    "edrop": "spamhaus_edrop",
+    "dbl": "spamhaus_dbl",
+    "scamsniffer": "scamsniffer",
+    "cryptoscamdb": "cryptoscamdb",
 }
 
 
@@ -78,6 +106,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _configure_logging(args.verbose)
     logger = logging.getLogger("rpz_factory")
+
+    # Resolve cache directory
+    cache_dir = args.cache_dir
+    if cache_dir is None:
+        rpz_dir = os.environ.get("RPZ_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        cache_dir = os.path.join(rpz_dir, ".cache")
 
     # Fetch from all requested sources
     all_entries: list[ThreatEntry] = []
@@ -91,13 +125,49 @@ def main(argv: list[str] | None = None) -> int:
             if result.error:
                 errors.append(f"{source_key}: {result.error}")
                 logger.warning("Source %s had error: %s", source_key, result.error)
-            all_entries.extend(result.entries)
-            logger.info(
-                "Source %s: %d entries collected", source_key, len(result.entries)
-            )
+                # Try cache fallback on error
+                cached = load_cache(cache_dir, result.source)
+                if cached:
+                    all_entries.extend(cached.entries)
+                    logger.info(
+                        "Source %s: %d entries loaded from cache", source_key, len(cached.entries)
+                    )
+                else:
+                    logger.error("Source %s: no cache available", source_key)
+            elif not result.entries:
+                logger.warning("Source %s returned no entries", source_key)
+                # Try cache fallback on empty result
+                cached = load_cache(cache_dir, result.source)
+                if cached:
+                    all_entries.extend(cached.entries)
+                    logger.info(
+                        "Source %s: %d entries loaded from cache", source_key, len(cached.entries)
+                    )
+            else:
+                all_entries.extend(result.entries)
+                write_cache(cache_dir, result)
+                logger.info(
+                    "Source %s: %d entries collected", source_key, len(result.entries)
+                )
         except Exception as exc:
             errors.append(f"{source_key}: {exc}")
             logger.error("Source %s failed: %s", source_key, exc)
+            # Try cache fallback on exception
+            from rpz_factory.models import SourceName
+            source_enum_value = _SOURCE_KEY_TO_NAME.get(source_key)
+            if source_enum_value:
+                try:
+                    source_enum = SourceName(source_enum_value)
+                    cached = load_cache(cache_dir, source_enum)
+                    if cached:
+                        all_entries.extend(cached.entries)
+                        logger.info(
+                            "Source %s: %d entries loaded from cache", source_key, len(cached.entries)
+                        )
+                    else:
+                        logger.error("Source %s: no cache available", source_key)
+                except ValueError:
+                    pass
 
     if not all_entries:
         logger.error("No entries collected from any source")

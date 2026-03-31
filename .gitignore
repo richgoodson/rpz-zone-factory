@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 block-combined.rpz.db
+.cache/

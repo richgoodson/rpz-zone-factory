@@ -11,11 +11,14 @@ A CLI pipeline that fetches threat intelligence from multiple sources and output
 | Spamhaus DROP | IP/CIDR | https://www.spamhaus.org/drop/drop.txt |
 | Spamhaus EDROP | IP/CIDR | https://www.spamhaus.org/drop/edrop.txt |
 | Spamhaus DBL | Domains | https://www.spamhaus.org/drop/dbl.txt |
+| Scam Sniffer | Domains (crypto scams) | https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/domains.json |
+| CryptoScamDB | Domains (crypto phishing) | https://raw.githubusercontent.com/CryptoScamDB/blacklist/master/data/urls.yaml |
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.9+
 - `requests` library
+- `pyyaml` library (for CryptoScamDB YAML feed)
 
 ```bash
 pip install -r requirements.txt
@@ -38,7 +41,7 @@ python run.py --output pihole --output-file blocklist.txt -v
 ### Select specific sources
 
 ```bash
-python run.py --sources urlhaus drop edrop --output rpz
+python run.py --sources urlhaus drop edrop scamsniffer --output rpz
 ```
 
 ### All options
@@ -46,14 +49,38 @@ python run.py --sources urlhaus drop edrop --output rpz
 ```
 usage: rpz-zone-factory [-h] [--output {rpz,pihole}] [--zone-name ZONE_NAME]
                         [--output-file OUTPUT_FILE]
-                        [--sources {urlhaus,cisa,drop,edrop,dbl} ...]
+                        [--sources {urlhaus,cisa,drop,edrop,dbl,scamsniffer,cryptoscamdb} ...]
+                        [--cache-dir CACHE_DIR]
                         [-v]
 
   --output {rpz,pihole}     Output format (default: rpz)
   --zone-name ZONE_NAME     RPZ zone name (default: rpz.local)
   --output-file OUTPUT_FILE Write output to file (default: stdout)
-  --sources                 Sources to fetch (default: all)
+  --sources                 Sources to fetch (default: all 7)
+  --cache-dir CACHE_DIR     Cache directory for stale-data preservation
   -v, --verbose             Increase verbosity (-v INFO, -vv DEBUG)
+```
+
+## Source Caching
+
+rpz-zone-factory maintains a per-source cache so that if a source is temporarily unavailable, its last-known-good data is preserved instead of being lost entirely.
+
+- **Cache directory:** `{project_dir}/.cache/` by default (override with `--cache-dir`)
+- **On successful fetch:** entries are written to `.cache/{source_name}.json`
+- **On failed fetch:** the cache is consulted. If a cache file exists, its entries are used and a WARNING is logged with the cache timestamp
+- **If no cache exists:** the source simply contributes nothing (same as before)
+
+Cache files are JSON with metadata for auditability:
+
+```json
+{
+  "source": "scamsniffer",
+  "cached_at": "2026-03-30T22:00:00Z",
+  "entry_count": 12345,
+  "entries": [
+    {"value": "domain.com", "entry_type": "domain", "raw_line": "..."}
+  ]
+}
 ```
 
 ## False Positive Filtering
@@ -139,21 +166,27 @@ To use the generated blocklist with Pi-hole:
 ```
 rpz-zone-factory/
 ├── README.md
+├── README-runner.md
 ├── requirements.txt
+├── run.py
+├── run-rpz.sh
 ├── rpz_factory/
 │   ├── __init__.py
 │   ├── cli.py          # argparse CLI entrypoint
+│   ├── cache.py        # per-source cache for stale-data preservation
 │   ├── fetcher.py      # HTTP fetch with retry/timeout per source
+│   ├── filters.py      # False positive filtering logic
+│   ├── models.py       # Dataclasses: ThreatEntry, FetchResult, etc.
 │   ├── parsers/
 │   │   ├── __init__.py
-│   │   ├── abusech.py   # Abuse.ch URLhaus RPZ feed parser
-│   │   ├── cisa.py      # CISA KEV JSON parser
-│   │   └── spamhaus.py  # Spamhaus DROP/EDROP/DBL parser
-│   ├── filters.py      # False positive filtering logic
-│   ├── renderers/
-│   │   ├── __init__.py
-│   │   ├── rpz.py      # RFC 5782 zone file renderer
-│   │   └── pihole.py   # Flat domain list renderer
-│   └── models.py       # Dataclasses: ThreatEntry, FetchResult, etc.
-└── run.py              # Thin entrypoint
+│   │   ├── abusech.py       # Abuse.ch URLhaus RPZ feed parser
+│   │   ├── cisa.py          # CISA KEV JSON parser
+│   │   ├── cryptoscamdb.py  # CryptoScamDB YAML blacklist parser
+│   │   ├── scamsniffer.py   # Scam Sniffer JSON blacklist parser
+│   │   └── spamhaus.py      # Spamhaus DROP/EDROP/DBL parser
+│   └── renderers/
+│       ├── __init__.py
+│       ├── rpz.py      # RFC 5782 zone file renderer
+│       └── pihole.py   # Flat domain list renderer
+└── .cache/             # per-source cached entries (auto-created)
 ```

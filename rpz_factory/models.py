@@ -18,6 +18,8 @@ class SourceName(enum.Enum):
     SPAMHAUS_DROP = "spamhaus_drop"
     SPAMHAUS_EDROP = "spamhaus_edrop"
     SPAMHAUS_DBL = "spamhaus_dbl"
+    SCAMSNIFFER = "scamsniffer"
+    CRYPTOSCAMDB = "cryptoscamdb"
 
 
 @dataclass(frozen=True)

@@ -116,10 +116,26 @@ def filter_entries(entries: list[ThreatEntry]) -> list[ThreatEntry]:
     """
     seen: set[str] = set()
     accepted: list[ThreatEntry] = []
-    stats = {"tld_safe": 0, "allowlist": 0, "duplicate": 0, "accepted": 0}
+    stats = {"tld_safe": 0, "allowlist": 0, "duplicate": 0, "dns_invalid": 0, "accepted": 0}
 
     for entry in entries:
         norm = entry.normalized_value()
+
+        # DNS validity check — reject domains with invalid label lengths,
+        # slashes (URL paths), or total length > 253
+        if entry.entry_type == EntryType.DOMAIN:
+            if "/" in norm or len(norm) > 253:
+                logger.debug(
+                    "SKIP invalid DNS name: %s (source=%s)", norm, entry.source.value
+                )
+                stats["dns_invalid"] += 1
+                continue
+            if any(len(label) > 63 or len(label) == 0 for label in norm.split(".")):
+                logger.debug(
+                    "SKIP label too long: %s (source=%s)", norm, entry.source.value
+                )
+                stats["dns_invalid"] += 1
+                continue
 
         # Dedup
         if norm in seen:
@@ -159,12 +175,13 @@ def filter_entries(entries: list[ThreatEntry]) -> list[ThreatEntry]:
         stats["accepted"] += 1
 
     logger.info(
-        "Filter results: %d accepted, %d duplicates, %d safe-TLD, %d allowlisted "
-        "(from %d total)",
+        "Filter results: %d accepted, %d duplicates, %d safe-TLD, %d allowlisted, "
+        "%d dns-invalid (from %d total)",
         stats["accepted"],
         stats["duplicate"],
         stats["tld_safe"],
         stats["allowlist"],
+        stats["dns_invalid"],
         len(entries),
     )
     return accepted

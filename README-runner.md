@@ -36,7 +36,7 @@ crontab -e
 
 ### Specific sources only
 ```
-0 6 * * * RPZ_DIR=/opt/rpz-zone-factory /usr/local/sbin/run-rpz.sh -- --output rpz --zone-name threat.rpz --sources urlhaus cisa --output-file /var/named/rpz/threat.rpz.db
+0 6 * * * RPZ_DIR=/opt/rpz-zone-factory /usr/local/sbin/run-rpz.sh -- --output rpz --zone-name threat.rpz --sources urlhaus cisa scamsniffer cryptoscamdb --output-file /var/named/rpz/threat.rpz.db
 ```
 
 ## Modes
