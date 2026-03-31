@@ -74,7 +74,7 @@ EXIT_CODE=0
 
 log_info() {
     if [ "$MODE" = "cron" ]; then
-        logger -t "$LOG_TAG" -p "${LOG_FACILITY}.info" "$1"
+        logger -t "$LOG_TAG" -p "${LOG_FACILITY}.info" -- "$1"
     else
         printf "[INFO]  %s\n" "$1" >&2
     fi
@@ -82,7 +82,7 @@ log_info() {
 
 log_warn() {
     if [ "$MODE" = "cron" ]; then
-        logger -t "$LOG_TAG" -p "${LOG_FACILITY}.warning" "$1"
+        logger -t "$LOG_TAG" -p "${LOG_FACILITY}.warning" -- "$1"
     else
         printf "[WARN]  %s\n" "$1" >&2
     fi
@@ -90,7 +90,7 @@ log_warn() {
 
 log_err() {
     if [ "$MODE" = "cron" ]; then
-        logger -t "$LOG_TAG" -p "${LOG_FACILITY}.err" "$1"
+        logger -t "$LOG_TAG" -p "${LOG_FACILITY}.err" -- "$1"
     else
         printf "[ERROR] %s\n" "$1" >&2
     fi
@@ -98,7 +98,7 @@ log_err() {
 
 log_notice() {
     if [ "$MODE" = "cron" ]; then
-        logger -t "$LOG_TAG" -p "${LOG_FACILITY}.notice" "$1"
+        logger -t "$LOG_TAG" -p "${LOG_FACILITY}.notice" -- "$1"
     else
         printf "[NOTE]  %s\n" "$1" >&2
     fi
