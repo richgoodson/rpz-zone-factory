@@ -42,20 +42,39 @@ python run.py --output pihole --output-file blocklist.txt -v
 python run.py --sources urlhaus drop scamsniffer --output rpz
 ```
 
+### Per-source mode (one zone per threat source)
+
+```bash
+python run.py --per-source --output-file /etc/namedb/master/rpz/ -v
+```
+
+This creates separate zone files: `urlhaus.rpz.db`, `cisa-kev.rpz.db`, `spamhaus-drop.rpz.db`, `scamsniffer.rpz.db`, `cryptoscamdb.rpz.db`. BIND logs then show which threat list triggered each block.
+
+### Per-source with allowlist
+
+```bash
+python run.py --per-source --output-file /etc/namedb/master/rpz/ --allowlist /etc/namedb/master/rpz/allowlist.txt -v
+```
+
+The allowlist is a plain text file (one domain per line, `#` comments). It generates `allowlist.rpz.db` with passthru CNAME records to override blocks from other zones.
+
 ### All options
 
 ```
 usage: rpz-zone-factory [-h] [--output {rpz,pihole}] [--zone-name ZONE_NAME]
                         [--output-file OUTPUT_FILE]
                         [--sources {urlhaus,cisa,drop,scamsniffer,cryptoscamdb} ...]
-                        [--cache-dir CACHE_DIR]
+                        [--cache-dir CACHE_DIR] [--per-source]
+                        [--allowlist ALLOWLIST]
                         [-v]
 
   --output {rpz,pihole}     Output format (default: rpz)
-  --zone-name ZONE_NAME     RPZ zone name (default: rpz.local)
-  --output-file OUTPUT_FILE Write output to file (default: stdout)
+  --zone-name ZONE_NAME     RPZ zone name for combined mode (default: rpz.local)
+  --output-file OUTPUT_FILE Output file (combined) or directory (per-source)
   --sources                 Sources to fetch (default: all 5)
   --cache-dir CACHE_DIR     Cache directory for stale-data preservation
+  --per-source              Output one zone file per source (RPZ only)
+  --allowlist ALLOWLIST      Path to allowlist file (generates allowlist.rpz zone)
   -v, --verbose             Increase verbosity (-v INFO, -vv DEBUG)
 ```
 
@@ -92,47 +111,117 @@ The pipeline applies rule-based filtering to reduce false positives:
 
 ## BIND Configuration
 
-To use the generated RPZ zone file with BIND, add the following to your `named.conf`:
+### Per-source mode (recommended)
+
+Define each zone in `named.conf`:
 
 ```bind
-// Define the RPZ zone
-zone "rpz.local" {
-    type master;
-    file "/etc/bind/zones/rpz.local.zone";
-    allow-query { none; };
+// Allowlist zone — evaluated first, passthru overrides blocks
+zone "allowlist.rpz" {
+    type primary;
+    file "/etc/namedb/master/rpz/allowlist.rpz.db";
+    allow-query { localhost; };
     allow-transfer { none; };
 };
 
-// Enable RPZ in the options or view
+// Threat source zones
+zone "urlhaus.rpz" {
+    type primary;
+    file "/etc/namedb/master/rpz/urlhaus.rpz.db";
+    allow-query { localhost; };
+    allow-transfer { none; };
+};
+
+zone "cisa-kev.rpz" {
+    type primary;
+    file "/etc/namedb/master/rpz/cisa-kev.rpz.db";
+    allow-query { localhost; };
+    allow-transfer { none; };
+};
+
+zone "spamhaus-drop.rpz" {
+    type primary;
+    file "/etc/namedb/master/rpz/spamhaus-drop.rpz.db";
+    allow-query { localhost; };
+    allow-transfer { none; };
+};
+
+zone "scamsniffer.rpz" {
+    type primary;
+    file "/etc/namedb/master/rpz/scamsniffer.rpz.db";
+    allow-query { localhost; };
+    allow-transfer { none; };
+};
+
+zone "cryptoscamdb.rpz" {
+    type primary;
+    file "/etc/namedb/master/rpz/cryptoscamdb.rpz.db";
+    allow-query { localhost; };
+    allow-transfer { none; };
+};
+```
+
+Enable the response policy (inside `options {}`):
+
+```bind
 options {
-    // ... other options ...
+    // ... existing options ...
 
     response-policy {
-        zone "rpz.local"
-            policy given     // use the CNAME target from the zone (NXDOMAIN via ".")
-            recursive-only yes;
+        zone "allowlist.rpz" policy passthru;
+        zone "urlhaus.rpz";
+        zone "cisa-kev.rpz";
+        zone "spamhaus-drop.rpz";
+        zone "scamsniffer.rpz";
+        zone "cryptoscamdb.rpz";
     };
 };
 ```
 
-Generate and deploy the zone file:
+RPZ zones are evaluated in order. The allowlist zone goes first with `policy passthru` so it can override blocks from subsequent zones.
+
+### Combined mode
+
+If you prefer a single combined zone:
+
+```bind
+zone "block.rpz" {
+    type primary;
+    file "/etc/namedb/master/block.rpz.db";
+    allow-query { localhost; };
+    allow-transfer { none; };
+};
+
+options {
+    response-policy {
+        zone "block.rpz" policy given;
+    };
+};
+```
+
+### Deployment
 
 ```bash
-# Generate the zone
-python run.py --output rpz --zone-name rpz.local --output-file /etc/bind/zones/rpz.local.zone
+# Per-source: generate all zone files
+python run.py --per-source --output-file /etc/namedb/master/rpz/ -v
 
-# Validate the zone file
-named-checkzone rpz.local /etc/bind/zones/rpz.local.zone
+# Validate a zone
+named-checkzone urlhaus.rpz /etc/namedb/master/rpz/urlhaus.rpz.db
 
-# Reload BIND
-rndc reload rpz.local
+# Load new zones for the first time
+rndc reconfig
+
+# Subsequent updates only need reload
+rndc reload urlhaus.rpz
 ```
 
-Set up a cron job to refresh periodically:
+For automated deployment, use `run-rpz.sh` (see [README-runner.md](README-runner.md)):
 
 ```cron
-0 */6 * * * /usr/bin/python3 /opt/rpz-zone-factory/run.py --output rpz --zone-name rpz.local --output-file /etc/bind/zones/rpz.local.zone -v && /usr/sbin/rndc reload rpz.local
+15 */4 * * * /opt/rpz-zone-factory/run-rpz.sh
 ```
+
+`run-rpz.sh` handles venv management, per-zone `named-checkzone` validation, and `rndc reload` for each zone automatically. Run `./run-rpz.sh --setup` for interactive configuration.
 
 ## Pi-hole Configuration
 
