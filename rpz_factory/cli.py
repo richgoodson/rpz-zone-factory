@@ -14,17 +14,15 @@ from rpz_factory.models import FetchResult, ThreatEntry
 from rpz_factory.parsers import abusech, cisa, cryptoscamdb, scamsniffer, spamhaus
 from rpz_factory.renderers import pihole, rpz
 
-ALL_SOURCES = ["urlhaus", "cisa", "drop", "edrop", "dbl", "scamsniffer", "cryptoscamdb"]
+ALL_SOURCES = ["urlhaus", "cisa", "drop", "scamsniffer", "cryptoscamdb"]
 
 # Per-source RPZ zone names (used with --per-source)
 SOURCE_ZONE_NAMES = {
-    "urlhaus": "rpz-urlhaus",
-    "cisa": "rpz-cisa-kev",
-    "drop": "rpz-spamhaus-drop",
-    "edrop": "rpz-spamhaus-edrop",
-    "dbl": "rpz-spamhaus-dbl",
-    "scamsniffer": "rpz-scamsniffer",
-    "cryptoscamdb": "rpz-cryptoscamdb",
+    "urlhaus": "urlhaus.rpz",
+    "cisa": "cisa-kev.rpz",
+    "drop": "spamhaus-drop.rpz",
+    "scamsniffer": "scamsniffer.rpz",
+    "cryptoscamdb": "cryptoscamdb.rpz",
 }
 
 
@@ -105,8 +103,6 @@ SOURCE_FETCHERS = {
     "urlhaus": abusech.fetch_and_parse,
     "cisa": cisa.fetch_and_parse,
     "drop": spamhaus.fetch_drop,
-    "edrop": spamhaus.fetch_edrop,
-    "dbl": spamhaus.fetch_dbl,
     "scamsniffer": scamsniffer.fetch_and_parse,
     "cryptoscamdb": cryptoscamdb.fetch_and_parse,
 }
@@ -116,8 +112,6 @@ _SOURCE_KEY_TO_NAME = {
     "urlhaus": "abusech_urlhaus",
     "cisa": "cisa_kev",
     "drop": "spamhaus_drop",
-    "edrop": "spamhaus_edrop",
-    "dbl": "spamhaus_dbl",
     "scamsniffer": "scamsniffer",
     "cryptoscamdb": "cryptoscamdb",
 }
@@ -141,7 +135,7 @@ def _parse_allowlist_file(path: str) -> list[str]:
     return domains
 
 
-def _render_allowlist_zone(domains: list[str], zone_name: str = "rpz-allowlist") -> str:
+def _render_allowlist_zone(domains: list[str], zone_name: str = "allowlist.rpz") -> str:
     """Render an allowlist zone file with passthru CNAME records."""
     import datetime
     from io import StringIO
@@ -354,7 +348,7 @@ def _run_per_source(
         allowlist_domains = _parse_allowlist_file(args.allowlist)
         if allowlist_domains:
             allowlist_text = _render_allowlist_zone(allowlist_domains)
-            allowlist_file = os.path.join(output_dir, "rpz-allowlist.db")
+            allowlist_file = os.path.join(output_dir, "allowlist.rpz.db")
             with open(allowlist_file, "w", encoding="utf-8") as f:
                 f.write(allowlist_text)
             logger.info("Allowlist: %d domains → %s", len(allowlist_domains), allowlist_file)
@@ -373,7 +367,7 @@ def _run_per_source(
         print(f"  {zone_name}: {count}", file=sys.stderr)
     if args.allowlist:
         _al_count = len(allowlist_domains) if 'allowlist_domains' in locals() else 0
-        print(f"  rpz-allowlist: {_al_count}", file=sys.stderr)
+        print(f"  allowlist.rpz: {_al_count}", file=sys.stderr)
     if errors:
         print(f"Source errors ({len(errors)}):", file=sys.stderr)
         for e in errors:

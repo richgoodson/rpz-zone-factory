@@ -630,9 +630,18 @@ run_setup() {
 
             # Allowlist file
             printf "\n  An allowlist zone (rpz-allowlist) provides BIND-level override\n"
-            printf "  for domains that appear in threat zones but should be allowed.\n\n"
+            printf "  for domains that appear in threat zones but should be allowed.\n"
+            printf "\n"
+            printf "  Point this to a plain text file with one domain per line.\n"
+            printf "  Lines starting with # are comments. Example:\n"
+            printf "\n"
+            printf "    # False positives\n"
+            printf "    bing.com\n"
+            printf "    www.bing.com\n"
+            printf "\n"
+            printf "  rpz-zone-factory will generate the RPZ allowlist zone from this file.\n\n"
             _def_allowlist="${CONF_ALLOWLIST_FILE:-}"
-            CONF_ALLOWLIST_FILE=$(prompt_value "Allowlist file path (blank to skip)" "$_def_allowlist")
+            CONF_ALLOWLIST_FILE=$(prompt_value "Allowlist text file path (blank to skip)" "$_def_allowlist")
         else
             CONF_PER_SOURCE="no"
             _def_zone="${CONF_ZONE_NAME:-block.rpz}"
@@ -652,8 +661,7 @@ run_setup() {
     printf "    urlhaus      — Abuse.ch URLhaus (malware distribution URLs)\n"
     printf "    cisa         — CISA Known Exploited Vulnerabilities\n"
     printf "    drop         — Spamhaus DROP (hijacked IP blocks)\n"
-    printf "    edrop        — Spamhaus EDROP (extended DROP)\n"
-    printf "    dbl          — Spamhaus DBL (domain blocklist)\n"
+
     printf "    scamsniffer  — Scam Sniffer crypto scam domains\n"
     printf "    cryptoscamdb — CryptoScamDB phishing/scam domains\n"
     printf "\n"
@@ -685,12 +693,21 @@ run_setup() {
         _def_rndc="${RNDC_BIN:-rndc}"
         RNDC_BIN=$(prompt_value "rndc binary" "$_def_rndc")
 
-        if [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_ZONE_NAME" ]; then
-            _def_rzone="$CONF_ZONE_NAME"
+        if [ "$CONF_PER_SOURCE" = "yes" ]; then
+            # Per-source mode: zone names are derived from source keys,
+            # no need to ask. All zones are reloaded automatically.
+            CONF_RELOAD_ZONE=""
+            printf "\n  Per-source mode: all source zones will be reloaded\n"
+            printf "  automatically after each update (allowlist.rpz,\n"
+            printf "  urlhaus.rpz, cisa-kev.rpz, spamhaus-drop.rpz, etc.)\n"
         else
-            _def_rzone="${CONF_RELOAD_ZONE:-block.rpz}"
+            if [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_ZONE_NAME" ]; then
+                _def_rzone="$CONF_ZONE_NAME"
+            else
+                _def_rzone="${CONF_RELOAD_ZONE:-block.rpz}"
+            fi
+            CONF_RELOAD_ZONE=$(prompt_value "Zone to reload" "$_def_rzone")
         fi
-        CONF_RELOAD_ZONE=$(prompt_value "Zone to reload" "$_def_rzone")
 
         # Test rndc access
         printf "\n  Testing rndc access...\n"
@@ -722,15 +739,18 @@ run_setup() {
             if [ $_rndc_rc -eq 0 ]; then
                 printf "  ✓ rndc status succeeded — you have access\n"
 
-                # Also test the actual reload (dry-ish: reload is idempotent)
-                _rndc_reload=$($RNDC_BIN reload "$CONF_RELOAD_ZONE" 2>&1)
-                _rndc_rrc=$?
-                if [ $_rndc_rrc -eq 0 ]; then
-                    printf "  ✓ rndc reload %s succeeded\n" "$CONF_RELOAD_ZONE"
-                else
-                    printf "  ✗ rndc reload %s failed: %s\n" "$CONF_RELOAD_ZONE" "$_rndc_reload"
-                    printf "    The zone may not exist yet. This is OK if you haven't\n"
-                    printf "    added the zone to named.conf yet (see BIND config below).\n"
+                # Test reload with a specific zone (skip in per-source mode
+                # since the zones may not exist yet)
+                if [ "$CONF_PER_SOURCE" != "yes" ] && [ -n "$CONF_RELOAD_ZONE" ]; then
+                    _rndc_reload=$($RNDC_BIN reload "$CONF_RELOAD_ZONE" 2>&1)
+                    _rndc_rrc=$?
+                    if [ $_rndc_rrc -eq 0 ]; then
+                        printf "  ✓ rndc reload %s succeeded\n" "$CONF_RELOAD_ZONE"
+                    else
+                        printf "  ✗ rndc reload %s failed: %s\n" "$CONF_RELOAD_ZONE" "$_rndc_reload"
+                        printf "    The zone may not exist yet. This is OK if you haven't\n"
+                        printf "    added the zone to named.conf yet (see BIND config below).\n"
+                    fi
                 fi
             else
                 printf "  ✗ rndc status failed (exit code %d)\n" "$_rndc_rc"
@@ -951,9 +971,9 @@ CONF
 
             # Show allowlist zone first
             printf "  // Allowlist zone (passthru overrides)\n"
-            printf "  zone \"rpz-allowlist\" {\n"
+            printf "  zone \"allowlist.rpz\" {\n"
             printf "      type primary;\n"
-            printf "      file \"%s/rpz-allowlist.db\";\n" "$_ex_dir"
+            printf "      file \"%s/allowlist.rpz.db\";\n" "$_ex_dir"
             if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
                 printf "      masterfile-format raw;\n"
             fi
@@ -962,7 +982,7 @@ CONF
             printf "  };\n\n"
 
             # Show each source zone
-            for _src_zone in rpz-urlhaus rpz-cisa-kev rpz-spamhaus-drop rpz-spamhaus-edrop rpz-spamhaus-dbl rpz-scamsniffer rpz-cryptoscamdb; do
+            for _src_zone in urlhaus.rpz cisa-kev.rpz spamhaus-drop.rpz scamsniffer.rpz cryptoscamdb.rpz; do
                 printf "  zone \"%s\" {\n" "$_src_zone"
                 printf "      type primary;\n"
                 printf "      file \"%s/%s.db\";\n" "$_ex_dir" "$_src_zone"
@@ -982,14 +1002,14 @@ CONF
             printf "      // ... existing options ...\n"
             printf "\n"
             printf "      response-policy {\n"
-            printf "          zone \"rpz-allowlist\" policy passthru;\n"
-            printf "          zone \"rpz-urlhaus\";\n"
-            printf "          zone \"rpz-cisa-kev\";\n"
-            printf "          zone \"rpz-spamhaus-drop\";\n"
-            printf "          zone \"rpz-spamhaus-edrop\";\n"
-            printf "          zone \"rpz-spamhaus-dbl\";\n"
-            printf "          zone \"rpz-scamsniffer\";\n"
-            printf "          zone \"rpz-cryptoscamdb\";\n"
+            printf "          zone \"allowlist.rpz\" policy passthru;\n"
+            printf "          zone \"urlhaus.rpz\";\n"
+            printf "          zone \"cisa-kev.rpz\";\n"
+            printf "          zone \"spamhaus-drop.rpz\";\n"
+
+
+            printf "          zone \"scamsniffer.rpz\";\n"
+            printf "          zone \"cryptoscamdb.rpz\";\n"
             printf "      };\n"
             printf "  };\n"
 
