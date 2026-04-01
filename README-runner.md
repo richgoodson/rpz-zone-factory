@@ -1,42 +1,43 @@
 # run-rpz.sh — Cron/Interactive Wrapper for rpz-zone-factory
 
-Portable POSIX shell wrapper for running [rpz-zone-factory](https://github.com/your-org/rpz-zone-factory) on a schedule via cron, or interactively from the command line. Works on **Debian**, **Ubuntu**, and **FreeBSD 13+**.
+Portable POSIX shell wrapper for running [rpz-zone-factory](https://github.com/richgoodson/rpz-zone-factory) on a schedule via cron, or interactively from the command line. Works on **Debian**, **Ubuntu**, and **FreeBSD 13+**.
 
 ## Quick Start
 
 ```sh
-# 1. Clone rpz-zone-factory somewhere
-git clone https://github.com/your-org/rpz-zone-factory.git /opt/rpz-zone-factory
+# 1. Clone rpz-zone-factory
+git clone https://github.com/richgoodson/rpz-zone-factory.git /opt/rpz-zone-factory
+cd /opt/rpz-zone-factory
 
-# 2. Copy this script somewhere in PATH
-cp run-rpz.sh /usr/local/sbin/run-rpz.sh
-chmod +x /usr/local/sbin/run-rpz.sh
+# 2. Run the setup wizard (creates venv, installs deps, configures everything)
+./run-rpz.sh --setup
 
-# 3. Run first-time setup (creates venv, installs deps)
-RPZ_DIR=/opt/rpz-zone-factory /usr/local/sbin/run-rpz.sh --setup
+# 3. Test interactively
+./run-rpz.sh -i
 
-# 4. Test interactively
-RPZ_DIR=/opt/rpz-zone-factory /usr/local/sbin/run-rpz.sh -i -- --output rpz --zone-name block.rpz -v
-
-# 5. Add to cron
+# 4. Add to cron (the wizard generates the cron entry for you)
 crontab -e
 ```
 
+The `--setup` wizard walks through output format, per-source mode, zone names, BIND reload, `named-checkzone` validation, and optionally `named-compilezone`. All choices are saved to `.run-rpz.conf` so subsequent runs (including cron) need zero arguments.
+
 ## Cron Examples
 
-### RPZ zone file for BIND (every 4 hours, reload zone after)
+After running `--setup`, the script reads `.run-rpz.conf` automatically — no CLI args needed:
+
+### Per-source RPZ zones for BIND (every 4 hours)
 ```
-15 */4 * * * RPZ_DIR=/opt/rpz-zone-factory /usr/local/sbin/run-rpz.sh --reload-bind block.rpz -- --output rpz --zone-name block.rpz --output-file /etc/namedb/rpz/block.rpz.db
+15 */4 * * * /opt/rpz-zone-factory/run-rpz.sh
 ```
 
-### Pi-hole flat file (daily at 3:30 AM)
+### With explicit args (overrides saved config)
 ```
-30 3 * * * RPZ_DIR=/opt/rpz-zone-factory /usr/local/sbin/run-rpz.sh -- --output pihole --output-file /etc/pihole/custom-rpz.list
+15 */4 * * * /opt/rpz-zone-factory/run-rpz.sh -- --output rpz --per-source --output-file /etc/namedb/master/rpz/ -v
 ```
 
-### Specific sources only
+### Pi-hole flat file (daily at 3:05 AM)
 ```
-0 6 * * * RPZ_DIR=/opt/rpz-zone-factory /usr/local/sbin/run-rpz.sh -- --output rpz --zone-name threat.rpz --sources urlhaus cisa scamsniffer cryptoscamdb --output-file /var/named/rpz/threat.rpz.db
+5 3 * * * /opt/rpz-zone-factory/run-rpz.sh -- --output pihole --output-file /usr/local/www/rpz-zone-factory/block.txt
 ```
 
 ## Modes
@@ -50,23 +51,43 @@ crontab -e
 
 | Option | Description |
 |--------|-------------|
+| `-v`, `--version` | Print version and exit |
 | `-h`, `--help` | Show usage and exit |
 | `-i`, `--interactive` | Force interactive mode |
 | `-c`, `--cron` | Force cron mode |
-| `--setup` | First-run setup: create venv, install deps, verify |
+| `--setup` | Interactive setup wizard: configure output, sources, BIND reload, zone validation/compilation, and generate cron entries |
 | `--reload-bind ZONE` | After successful run, call `rndc reload ZONE` |
 | `--rpz-dir DIR` | Override RPZ_DIR (can also set via environment) |
-| `--python BIN` | Override Python binary (default: `python3`) |
+| `--python BIN` | Override Python binary (default: `python3.11`) |
 | `-- ARGS...` | Everything after `--` is passed to rpz-zone-factory |
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RPZ_DIR` | `/opt/rpz-zone-factory` | Path to rpz-zone-factory project |
-| `PYTHON_BIN` | `python3` | Python interpreter |
+| `RPZ_DIR` | Script's own directory | Path to rpz-zone-factory project |
+| `PYTHON_BIN` | `python3.11` | Python interpreter (setup wizard scans for 3.9–3.14) |
 | `VENV_NAME` | `.venv` | Venv directory name within RPZ_DIR |
 | `RNDC_BIN` | `rndc` | Path to rndc binary |
+
+## Configuration File
+
+The `--setup` wizard saves all choices to `.run-rpz.conf` in the project directory. Key settings:
+
+| Setting | Description |
+|---------|-------------|
+| `CONF_OUTPUT` | `rpz` or `pihole` |
+| `CONF_PER_SOURCE` | `yes` or `no` — one zone file per source |
+| `CONF_OUTPUT_FILE` | Output file (combined) or directory (per-source) |
+| `CONF_ZONE_NAME` | Zone name for combined mode |
+| `CONF_ALLOWLIST_FILE` | Path to allowlist text file |
+| `CONF_RELOAD` | `yes` or `no` — rndc reload after update |
+| `CONF_CHECKZONE` | `yes` or `no` — validate with `named-checkzone` |
+| `CONF_COMPILE_ZONE` | `yes` or `no` — compile to binary (raw) format |
+| `CONF_SOURCES` | Space-separated source list, or `all` |
+| `CONF_VERBOSITY` | `0` (quiet), `1` (`-v`), `2` (`-vv`) |
+
+Edit `.run-rpz.conf` directly or re-run `--setup` to reconfigure.
 
 ## BIND Reload Permissions
 
@@ -156,8 +177,8 @@ journalctl -t rpz-zone-factory
 # Linux (syslog)
 grep rpz-zone-factory /var/log/syslog
 
-# FreeBSD
-grep rpz-zone-factory /var/log/messages
+# FreeBSD (daemon facility routes to daemon.log, not messages)
+grep rpz-zone-factory /var/log/daemon.log
 ```
 
 ## Venv Lifecycle

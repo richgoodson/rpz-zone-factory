@@ -106,6 +106,7 @@ The pipeline applies rule-based filtering to reduce false positives:
 
 - **Safe TLDs**: `.gov`, `.mil`, `.edu` domains are never blocked
 - **Critical allowlist**: ~50 top infrastructure domains (Google, Cloudflare, Amazon, Microsoft, Apple, etc.) are never blocked, including subdomain matching
+- **DNS label validation**: Rejects entries with labels >63 characters, paths, or total length >253
 - **Deduplication**: Entries are deduplicated across all sources
 - All skipped entries are logged with reasons (use `-v` to see)
 
