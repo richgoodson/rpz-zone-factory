@@ -1,6 +1,6 @@
 #!/bin/sh
 # run-rpz.sh — Cron/interactive wrapper for rpz-zone-factory
-# Version: 0.3.0
+# Version: 0.4.0
 # Portable: Debian, Ubuntu, FreeBSD 13+
 # POSIX sh — no bashisms.
 #
@@ -49,6 +49,8 @@ CONF_RELOAD=""          # yes or no
 CONF_RELOAD_ZONE=""     # Zone to reload via rndc
 CONF_COMPILE_ZONE=""    # yes or no — use named-compilezone for binary (raw) format
 CONF_CHECKZONE=""       # yes or no — validate with named-checkzone before deploying
+CONF_PER_SOURCE=""      # yes or no — output one zone file per source
+CONF_ALLOWLIST_FILE=""  # path to allowlist file (used with per-source mode)
 
 # Source config file if it exists (overrides defaults above)
 _conf_file="${RPZ_DIR}/.run-rpz.conf"
@@ -59,7 +61,7 @@ fi
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION="0.3.1"
+VERSION="0.4.0"
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
@@ -612,12 +614,35 @@ run_setup() {
     esac
 
     if [ "$CONF_OUTPUT" = "rpz" ]; then
-        _def_zone="${CONF_ZONE_NAME:-block.rpz}"
-        CONF_ZONE_NAME=$(prompt_value "RPZ zone name" "$_def_zone")
+        # Per-source mode question
+        _def_persource="${CONF_PER_SOURCE:-no}"
+        if [ "$_def_persource" = "yes" ]; then _yn_def="y"; else _yn_def="n"; fi
 
-        _def_outfile="${CONF_OUTPUT_FILE:-/usr/local/etc/namedb/master/block-combined.rpz.db}"
-        CONF_OUTPUT_FILE=$(prompt_value "Output file path" "$_def_outfile")
+        printf "\n  Per-source mode outputs one zone file per threat source,\n"
+        printf "  so BIND logs show which threat list triggered each block.\n\n"
+
+        if prompt_yn "Enable per-source mode?" "$_yn_def"; then
+            CONF_PER_SOURCE="yes"
+            CONF_ZONE_NAME=""  # ignored in per-source mode
+
+            _def_outdir="${CONF_OUTPUT_FILE:-/usr/local/etc/namedb/master/rpz}"
+            CONF_OUTPUT_FILE=$(prompt_value "Output directory path" "$_def_outdir")
+
+            # Allowlist file
+            printf "\n  An allowlist zone (rpz-allowlist) provides BIND-level override\n"
+            printf "  for domains that appear in threat zones but should be allowed.\n\n"
+            _def_allowlist="${CONF_ALLOWLIST_FILE:-}"
+            CONF_ALLOWLIST_FILE=$(prompt_value "Allowlist file path (blank to skip)" "$_def_allowlist")
+        else
+            CONF_PER_SOURCE="no"
+            _def_zone="${CONF_ZONE_NAME:-block.rpz}"
+            CONF_ZONE_NAME=$(prompt_value "RPZ zone name" "$_def_zone")
+
+            _def_outfile="${CONF_OUTPUT_FILE:-/usr/local/etc/namedb/master/block-combined.rpz.db}"
+            CONF_OUTPUT_FILE=$(prompt_value "Output file path" "$_def_outfile")
+        fi
     else
+        CONF_PER_SOURCE="no"
         CONF_ZONE_NAME=""
         _def_outfile="${CONF_OUTPUT_FILE:-/usr/local/etc/pihole/custom.list}"
         CONF_OUTPUT_FILE=$(prompt_value "Output file path" "$_def_outfile")
@@ -816,6 +841,10 @@ CONF_RELOAD_ZONE="${CONF_RELOAD_ZONE}"
 # Zone validation and compilation
 CONF_CHECKZONE="${CONF_CHECKZONE}"
 CONF_COMPILE_ZONE="${CONF_COMPILE_ZONE}"
+
+# Per-source mode
+CONF_PER_SOURCE="${CONF_PER_SOURCE}"
+CONF_ALLOWLIST_FILE="${CONF_ALLOWLIST_FILE}"
 CONF
 
     printf "  ✓ Configuration saved to: %s\n" "$_conf_file"
@@ -909,43 +938,101 @@ CONF
     printf "\n─── BIND Configuration ─────────────────────────────────────\n\n"
 
     if prompt_yn "Show example BIND response-policy configuration?" "y"; then
-        _ex_zone="${CONF_ZONE_NAME:-block.rpz}"
-        _ex_file="$CONF_OUTPUT_FILE"
-        # Sanity check: if output file looks like a directory or is empty, build a path
-        case "$_ex_file" in
-            "") _ex_file="/usr/local/etc/namedb/master/${_ex_zone}.db" ;;
-            */) _ex_file="${_ex_file}${_ex_zone}.db" ;;
-        esac
 
-        printf "\n"
-        printf "  ┌─────────────────────────────────────────────────────────┐\n"
-        printf "  │ 1. Zone definition (named.conf or included file)       │\n"
-        printf "  └─────────────────────────────────────────────────────────┘\n"
-        printf "\n"
-        printf "  zone \"%s\" {\n" "$_ex_zone"
-        printf "      type primary;\n"
-        printf "      file \"%s\";\n" "$_ex_file"
-        if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
-            printf "      masterfile-format raw;   // compiled binary — faster loading\n"
+        if [ "$CONF_PER_SOURCE" = "yes" ]; then
+            # Per-source BIND config example
+            _ex_dir="${CONF_OUTPUT_FILE:-/usr/local/etc/namedb/master/rpz}"
+
+            printf "\n"
+            printf "  ┌─────────────────────────────────────────────────────────┐\n"
+            printf "  │ 1. Zone definitions (named.conf or included file)      │\n"
+            printf "  └─────────────────────────────────────────────────────────┘\n"
+            printf "\n"
+
+            # Show allowlist zone first
+            printf "  // Allowlist zone (passthru overrides)\n"
+            printf "  zone \"rpz-allowlist\" {\n"
+            printf "      type primary;\n"
+            printf "      file \"%s/rpz-allowlist.db\";\n" "$_ex_dir"
+            if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
+                printf "      masterfile-format raw;\n"
+            fi
+            printf "      allow-query { localhost; };\n"
+            printf "      allow-transfer { none; };\n"
+            printf "  };\n\n"
+
+            # Show each source zone
+            for _src_zone in rpz-urlhaus rpz-cisa-kev rpz-spamhaus-drop rpz-spamhaus-edrop rpz-spamhaus-dbl rpz-scamsniffer rpz-cryptoscamdb; do
+                printf "  zone \"%s\" {\n" "$_src_zone"
+                printf "      type primary;\n"
+                printf "      file \"%s/%s.db\";\n" "$_ex_dir" "$_src_zone"
+                if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
+                    printf "      masterfile-format raw;\n"
+                fi
+                printf "      allow-query { localhost; };\n"
+                printf "      allow-transfer { none; };\n"
+                printf "  };\n\n"
+            done
+
+            printf "  ┌─────────────────────────────────────────────────────────┐\n"
+            printf "  │ 2. Response policy (inside options { } block)          │\n"
+            printf "  └─────────────────────────────────────────────────────────┘\n"
+            printf "\n"
+            printf "  options {\n"
+            printf "      // ... existing options ...\n"
+            printf "\n"
+            printf "      response-policy {\n"
+            printf "          zone \"rpz-allowlist\" policy passthru;\n"
+            printf "          zone \"rpz-urlhaus\";\n"
+            printf "          zone \"rpz-cisa-kev\";\n"
+            printf "          zone \"rpz-spamhaus-drop\";\n"
+            printf "          zone \"rpz-spamhaus-edrop\";\n"
+            printf "          zone \"rpz-spamhaus-dbl\";\n"
+            printf "          zone \"rpz-scamsniffer\";\n"
+            printf "          zone \"rpz-cryptoscamdb\";\n"
+            printf "      };\n"
+            printf "  };\n"
+
+        else
+            # Combined mode BIND config (original)
+            _ex_zone="${CONF_ZONE_NAME:-block.rpz}"
+            _ex_file="$CONF_OUTPUT_FILE"
+            # Sanity check: if output file looks like a directory or is empty, build a path
+            case "$_ex_file" in
+                "") _ex_file="/usr/local/etc/namedb/master/${_ex_zone}.db" ;;
+                */) _ex_file="${_ex_file}${_ex_zone}.db" ;;
+            esac
+
+            printf "\n"
+            printf "  ┌─────────────────────────────────────────────────────────┐\n"
+            printf "  │ 1. Zone definition (named.conf or included file)       │\n"
+            printf "  └─────────────────────────────────────────────────────────┘\n"
+            printf "\n"
+            printf "  zone \"%s\" {\n" "$_ex_zone"
+            printf "      type primary;\n"
+            printf "      file \"%s\";\n" "$_ex_file"
+            if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
+                printf "      masterfile-format raw;   // compiled binary — faster loading\n"
+            fi
+            printf "      allow-query { localhost; };\n"
+            printf "      allow-transfer { none; };\n"
+            printf "  };\n"
+            printf "\n"
+            printf "  ┌─────────────────────────────────────────────────────────┐\n"
+            printf "  │ 2. Response policy (inside options { } block)          │\n"
+            printf "  └─────────────────────────────────────────────────────────┘\n"
+            printf "\n"
+            printf "  options {\n"
+            printf "      // ... existing options ...\n"
+            printf "\n"
+            printf "      response-policy {\n"
+            printf "          zone \"%s\" policy given;\n" "$_ex_zone"
+            printf "          // Add more RPZ zones here, evaluated in order:\n"
+            printf "          // zone \"whitelist.rpz\" policy passthru;\n"
+            printf "          // zone \"malware.rpz\";\n"
+            printf "      };\n"
+            printf "  };\n"
         fi
-        printf "      allow-query { localhost; };\n"
-        printf "      allow-transfer { none; };\n"
-        printf "  };\n"
-        printf "\n"
-        printf "  ┌─────────────────────────────────────────────────────────┐\n"
-        printf "  │ 2. Response policy (inside options { } block)          │\n"
-        printf "  └─────────────────────────────────────────────────────────┘\n"
-        printf "\n"
-        printf "  options {\n"
-        printf "      // ... existing options ...\n"
-        printf "\n"
-        printf "      response-policy {\n"
-        printf "          zone \"%s\" policy given;\n" "$_ex_zone"
-        printf "          // Add more RPZ zones here, evaluated in order:\n"
-        printf "          // zone \"whitelist.rpz\" policy passthru;\n"
-        printf "          // zone \"malware.rpz\";\n"
-        printf "      };\n"
-        printf "  };\n"
         printf "\n"
         printf "  ┌─────────────────────────────────────────────────────────┐\n"
         printf "  │ Notes                                                  │\n"
@@ -1010,18 +1097,38 @@ build_args_from_config() {
 
     RPZ_ARGS="--output ${CONF_OUTPUT}"
 
-    if [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_ZONE_NAME" ]; then
-        RPZ_ARGS="$RPZ_ARGS --zone-name ${CONF_ZONE_NAME}"
-    fi
+    # Per-source mode
+    if [ "$CONF_PER_SOURCE" = "yes" ]; then
+        RPZ_ARGS="$RPZ_ARGS --per-source"
 
-    if [ -n "$CONF_OUTPUT_FILE" ]; then
-        # When checkzone or compilezone is enabled, write to a temp file first
-        # so the previous zone file is preserved until validation passes.
-        if [ "$CONF_OUTPUT" = "rpz" ] && \
-           { [ "$CONF_CHECKZONE" = "yes" ] || [ "$CONF_COMPILE_ZONE" = "yes" ]; }; then
-            RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}.tmp"
-        else
-            RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}"
+        if [ -n "$CONF_OUTPUT_FILE" ]; then
+            # In per-source mode with validation, write to .tmp subdirectory
+            if [ "$CONF_OUTPUT" = "rpz" ] && \
+               { [ "$CONF_CHECKZONE" = "yes" ] || [ "$CONF_COMPILE_ZONE" = "yes" ]; }; then
+                RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}/.tmp"
+            else
+                RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}"
+            fi
+        fi
+
+        if [ -n "$CONF_ALLOWLIST_FILE" ]; then
+            RPZ_ARGS="$RPZ_ARGS --allowlist ${CONF_ALLOWLIST_FILE}"
+        fi
+    else
+        # Combined mode
+        if [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_ZONE_NAME" ]; then
+            RPZ_ARGS="$RPZ_ARGS --zone-name ${CONF_ZONE_NAME}"
+        fi
+
+        if [ -n "$CONF_OUTPUT_FILE" ]; then
+            # When checkzone or compilezone is enabled, write to a temp file first
+            # so the previous zone file is preserved until validation passes.
+            if [ "$CONF_OUTPUT" = "rpz" ] && \
+               { [ "$CONF_CHECKZONE" = "yes" ] || [ "$CONF_COMPILE_ZONE" = "yes" ]; }; then
+                RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}.tmp"
+            else
+                RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}"
+            fi
         fi
     fi
 
@@ -1035,9 +1142,15 @@ build_args_from_config() {
     esac
 
     # Apply reload from config if not set via CLI
-    if [ $DO_RELOAD -eq 0 ] && [ "$CONF_RELOAD" = "yes" ] && [ -n "$CONF_RELOAD_ZONE" ]; then
-        DO_RELOAD=1
-        RELOAD_ZONE="$CONF_RELOAD_ZONE"
+    # In per-source mode, skip single-zone reload (handled separately)
+    if [ $DO_RELOAD -eq 0 ] && [ "$CONF_RELOAD" = "yes" ]; then
+        if [ "$CONF_PER_SOURCE" = "yes" ]; then
+            DO_RELOAD=1
+            RELOAD_ZONE="__per_source__"
+        elif [ -n "$CONF_RELOAD_ZONE" ]; then
+            DO_RELOAD=1
+            RELOAD_ZONE="$CONF_RELOAD_ZONE"
+        fi
     fi
 
     log_info "Using saved config from .run-rpz.conf"
@@ -1140,6 +1253,99 @@ run_rpz() {
     fi
 
     log_info "rpz-zone-factory completed successfully"
+
+    # ── Per-source mode: validation, compilation, reload ──────────────────
+
+    if [ "$CONF_PER_SOURCE" = "yes" ] && [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_OUTPUT_FILE" ]; then
+
+        if [ "$CONF_CHECKZONE" = "yes" ] || [ "$CONF_COMPILE_ZONE" = "yes" ]; then
+            # Python wrote to .tmp subdirectory; validate each and move to final dir
+            _tmp_dir="${CONF_OUTPUT_FILE}/.tmp"
+            mkdir -p "$CONF_OUTPUT_FILE"
+
+            if [ ! -d "$_tmp_dir" ]; then
+                log_err "Temp directory missing: $_tmp_dir — aborting"
+                return 1
+            fi
+
+            _checkzone_bin=""
+            if [ "$CONF_CHECKZONE" = "yes" ]; then
+                _checkzone_bin=$(find_named_tool "named-checkzone")
+                if [ -z "$_checkzone_bin" ]; then
+                    log_warn "named-checkzone not found — skipping validation"
+                fi
+            fi
+
+            _compilezone_bin=""
+            if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
+                _compilezone_bin=$(find_named_tool "named-compilezone")
+                if [ -z "$_compilezone_bin" ]; then
+                    log_warn "named-compilezone not found — will use text format"
+                fi
+            fi
+
+            for _db_file in "$_tmp_dir"/*.db; do
+                [ ! -f "$_db_file" ] && continue
+                _basename=$(basename "$_db_file")
+                _zone_name=$(echo "$_basename" | sed 's/\.db$//')
+                _final_file="${CONF_OUTPUT_FILE}/${_basename}"
+
+                if [ ! -s "$_db_file" ]; then
+                    log_warn "Zone file is empty, skipping: $_db_file"
+                    continue
+                fi
+
+                # named-checkzone
+                if [ -n "$_checkzone_bin" ]; then
+                    log_info "Validating $_zone_name with named-checkzone..."
+                    _cz_output=$("$_checkzone_bin" "$_zone_name" "$_db_file" 2>&1)
+                    _cz_rc=$?
+                    if [ $_cz_rc -ne 0 ]; then
+                        log_err "named-checkzone failed for $_zone_name (exit code: $_cz_rc)"
+                        log_err "$_cz_output"
+                        log_err "Keeping previous zone file intact for $_zone_name."
+                        continue
+                    fi
+                    log_info "named-checkzone passed for $_zone_name: $_cz_output"
+                fi
+
+                # named-compilezone
+                if [ -n "$_compilezone_bin" ]; then
+                    log_info "Compiling $_zone_name to raw format..."
+                    _compile_output=$("$_compilezone_bin" -o "$_final_file" -F raw \
+                        "$_zone_name" "$_db_file" 2>&1)
+                    _compile_rc=$?
+                    if [ $_compile_rc -ne 0 ]; then
+                        log_err "named-compilezone failed for $_zone_name (exit code: $_compile_rc)"
+                        log_err "$_compile_output"
+                        continue
+                    fi
+                    log_info "Zone compiled: $_compile_output"
+                else
+                    mv "$_db_file" "$_final_file"
+                fi
+            done
+
+            # Clean up tmp directory
+            rm -rf "$_tmp_dir"
+
+        fi
+
+        # Per-source BIND reload
+        if [ $DO_RELOAD -eq 1 ]; then
+            for _db_file in "$CONF_OUTPUT_FILE"/*.db; do
+                [ ! -f "$_db_file" ] && continue
+                _basename=$(basename "$_db_file")
+                _zone_name=$(echo "$_basename" | sed 's/\.db$//')
+                RELOAD_ZONE="$_zone_name"
+                reload_bind
+            done
+        fi
+
+        return 0
+    fi
+
+    # ── Combined mode guards and validation ───────────────────────────────
 
     # Zero-length file guard: abort before validating/reloading if output is empty
     # When checkzone/compilezone is enabled, the output went to .tmp
