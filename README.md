@@ -9,8 +9,6 @@ A CLI pipeline that fetches threat intelligence from multiple sources and output
 | Abuse.ch URLhaus | Domains (RPZ feed) | https://urlhaus.abuse.ch/downloads/rpz/ |
 | CISA KEV | Domains from CVE data | https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json |
 | Spamhaus DROP | IP/CIDR | https://www.spamhaus.org/drop/drop.txt |
-| Spamhaus EDROP | IP/CIDR | https://www.spamhaus.org/drop/edrop.txt |
-| Spamhaus DBL | Domains | https://www.spamhaus.org/drop/dbl.txt |
 | Scam Sniffer | Domains (crypto scams) | https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/domains.json |
 | CryptoScamDB | Domains (crypto phishing) | https://raw.githubusercontent.com/CryptoScamDB/blacklist/master/data/urls.yaml |
 
@@ -41,7 +39,7 @@ python run.py --output pihole --output-file blocklist.txt -v
 ### Select specific sources
 
 ```bash
-python run.py --sources urlhaus drop edrop scamsniffer --output rpz
+python run.py --sources urlhaus drop scamsniffer --output rpz
 ```
 
 ### All options
@@ -49,14 +47,14 @@ python run.py --sources urlhaus drop edrop scamsniffer --output rpz
 ```
 usage: rpz-zone-factory [-h] [--output {rpz,pihole}] [--zone-name ZONE_NAME]
                         [--output-file OUTPUT_FILE]
-                        [--sources {urlhaus,cisa,drop,edrop,dbl,scamsniffer,cryptoscamdb} ...]
+                        [--sources {urlhaus,cisa,drop,scamsniffer,cryptoscamdb} ...]
                         [--cache-dir CACHE_DIR]
                         [-v]
 
   --output {rpz,pihole}     Output format (default: rpz)
   --zone-name ZONE_NAME     RPZ zone name (default: rpz.local)
   --output-file OUTPUT_FILE Write output to file (default: stdout)
-  --sources                 Sources to fetch (default: all 7)
+  --sources                 Sources to fetch (default: all 5)
   --cache-dir CACHE_DIR     Cache directory for stale-data preservation
   -v, --verbose             Increase verbosity (-v INFO, -vv DEBUG)
 ```
@@ -159,7 +157,7 @@ To use the generated blocklist with Pi-hole:
    pihole -g  # update gravity after adding the list
    ```
 
-> **Note:** Pi-hole only supports domain-based blocking. IP/CIDR entries from Spamhaus DROP/EDROP are excluded from Pi-hole output.
+> **Note:** Pi-hole only supports domain-based blocking. IP/CIDR entries from Spamhaus DROP are excluded from Pi-hole output.
 
 ## Project Structure
 
@@ -183,7 +181,7 @@ rpz-zone-factory/
 │   │   ├── cisa.py          # CISA KEV JSON parser
 │   │   ├── cryptoscamdb.py  # CryptoScamDB YAML blacklist parser
 │   │   ├── scamsniffer.py   # Scam Sniffer JSON blacklist parser
-│   │   └── spamhaus.py      # Spamhaus DROP/EDROP/DBL parser
+│   │   └── spamhaus.py      # Spamhaus DROP parser
 │   └── renderers/
 │       ├── __init__.py
 │       ├── rpz.py      # RFC 5782 zone file renderer
