@@ -1,6 +1,6 @@
 #!/bin/sh
 # run-rpz.sh — Cron/interactive wrapper for rpz-zone-factory
-# Version: 0.4.0
+# Version: 0.4.2
 # Portable: Debian, Ubuntu, FreeBSD 13+
 # POSIX sh — no bashisms.
 #
@@ -51,6 +51,9 @@ CONF_COMPILE_ZONE=""    # yes or no — use named-compilezone for binary (raw) f
 CONF_CHECKZONE=""       # yes or no — validate with named-checkzone before deploying
 CONF_PER_SOURCE=""      # yes or no — output one zone file per source
 CONF_ALLOWLIST_FILE=""  # path to allowlist file (used with per-source mode)
+CONF_TSIG_KEY_FILE=""  # path to TSIG key file for allow.sh dynamic updates
+CONF_ALLOW_SERVER=""   # server for allow.sh nsupdate (default: localhost)
+CONF_ALLOW_ZONE=""     # zone name for allow.sh (default: allowlist.rpz)
 
 # Source config file if it exists (overrides defaults above)
 _conf_file="${RPZ_DIR}/.run-rpz.conf"
@@ -61,7 +64,7 @@ fi
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION="0.4.0"
+VERSION="0.4.2"
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
@@ -209,6 +212,17 @@ ARGS:
   Everything after "--" is passed directly to rpz-zone-factory.
   If no args are given, the script looks for .run-rpz.conf in its
   own directory (created by --setup) and uses the saved config.
+
+DYNAMIC ALLOWLIST:
+  Use allow.sh to add or remove domains from the RPZ allowlist in
+  real time, without waiting for the next scheduled run:
+
+    ./allow.sh example.com           # allow domain + *.domain
+    ./allow.sh -n example.com        # allow domain only (no wildcard)
+    ./allow.sh -r example.com        # remove from allowlist
+
+  Requires TSIG authentication. Run --setup to configure the TSIG key,
+  or see: ./allow.sh --help
 
 EXAMPLES:
   # First-time setup (interactive wizard)
@@ -829,6 +843,62 @@ run_setup() {
         CONF_COMPILE_ZONE="no"
     fi
 
+
+    # ── Section 3c: TSIG / Dynamic Allowlist ─────────────────────────────
+
+    if [ "$CONF_PER_SOURCE" = "yes" ] && [ -n "$CONF_ALLOWLIST_FILE" ]; then
+        printf "\n─── Dynamic Allowlist (TSIG) ────────────────────────────────\n\n"
+
+        printf "  allow.sh lets you add or remove domains from the RPZ allowlist\n"
+        printf "  in real time using TSIG-authenticated nsupdate, without waiting\n"
+        printf "  for the next scheduled rpz-zone-factory run.\n\n"
+        printf "  This requires a TSIG key that BIND trusts for the allowlist zone.\n\n"
+
+        if prompt_yn "Configure TSIG key for dynamic allowlist updates?" "y"; then
+
+            # Detect platform defaults
+            _tsig_os=$(uname -s)
+            case "$_tsig_os" in
+                FreeBSD)
+                    _def_tsig_dir="/usr/local/etc/namedb/tsig"
+                    _bind_user="bind"
+                    ;;
+                *)
+                    _def_tsig_dir="/etc/bind/tsig"
+                    _bind_user="bind"
+                    ;;
+            esac
+            _def_tsig_key="${_def_tsig_dir}/rpz-update.key"
+
+            _tsig_key="${CONF_TSIG_KEY_FILE:-$_def_tsig_key}"
+            CONF_TSIG_KEY_FILE=$(prompt_value "TSIG key file path" "$_tsig_key")
+
+            _allow_server="${CONF_ALLOW_SERVER:-localhost}"
+            CONF_ALLOW_SERVER=$(prompt_value "nsupdate server" "$_allow_server")
+
+            _allow_zone="${CONF_ALLOW_ZONE:-allowlist.rpz}"
+            CONF_ALLOW_ZONE=$(prompt_value "Allowlist zone name" "$_allow_zone")
+
+            # Check if TSIG key file exists
+            if [ -f "$CONF_TSIG_KEY_FILE" ]; then
+                printf "\n  ✓ TSIG key file found: %s\n" "$CONF_TSIG_KEY_FILE"
+            else
+                printf "\n  ✗ TSIG key file not found: %s\n" "$CONF_TSIG_KEY_FILE"
+                printf "\n  Run './allow.sh --setup' for full TSIG setup instructions.\n"
+            fi
+
+            printf "\n  Once configured, use allow.sh to manage the allowlist dynamically:\n\n"
+            printf "    ./allow.sh example.com           # allow domain + *.domain\n"
+            printf "    ./allow.sh -n example.com        # allow domain only (no wildcard)\n"
+            printf "    ./allow.sh -r example.com        # remove from allowlist\n"
+            printf "\n"
+        else
+            CONF_TSIG_KEY_FILE=""
+            CONF_ALLOW_SERVER=""
+            CONF_ALLOW_ZONE=""
+        fi
+    fi
+
     # ── Save configuration ────────────────────────────────────────────────
 
     printf "\n─── Saving Configuration ───────────────────────────────────\n\n"
@@ -865,6 +935,11 @@ CONF_COMPILE_ZONE="${CONF_COMPILE_ZONE}"
 # Per-source mode
 CONF_PER_SOURCE="${CONF_PER_SOURCE}"
 CONF_ALLOWLIST_FILE="${CONF_ALLOWLIST_FILE}"
+
+# Dynamic allowlist (TSIG / allow.sh)
+CONF_TSIG_KEY_FILE="${CONF_TSIG_KEY_FILE}"
+CONF_ALLOW_SERVER="${CONF_ALLOW_SERVER}"
+CONF_ALLOW_ZONE="${CONF_ALLOW_ZONE}"
 CONF
 
     printf "  ✓ Configuration saved to: %s\n" "$_conf_file"
@@ -977,9 +1052,19 @@ CONF
             if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
                 printf "      masterfile-format raw;\n"
             fi
+            if [ -n "$CONF_TSIG_KEY_FILE" ]; then
+                _tsig_keyname=$(basename "$CONF_TSIG_KEY_FILE" | sed 's/\.key$//')
+                printf "      allow-update { key \"%s\"; };\n" "$_tsig_keyname"
+            fi
             printf "      allow-query { localhost; };\n"
             printf "      allow-transfer { none; };\n"
             printf "  };\n\n"
+
+            # Show TSIG key include if configured
+            if [ -n "$CONF_TSIG_KEY_FILE" ]; then
+                printf "  // TSIG key for dynamic allowlist updates (allow.sh)\n"
+                printf "  include \"%s\";\n\n" "$CONF_TSIG_KEY_FILE"
+            fi
 
             # Show each source zone
             for _src_zone in urlhaus.rpz cisa-kev.rpz spamhaus-drop.rpz scamsniffer.rpz cryptoscamdb.rpz; do
@@ -1102,6 +1187,7 @@ CONF
     printf "  Config saved:  %s/.run-rpz.conf\n" "$RPZ_DIR"
     printf "  Test run:      %s -i\n" "$0"
     printf "  Full help:     %s --help\n" "$0"
+    printf "  Allowlist:     ./allow.sh <domain>  (see ./allow.sh --setup for TSIG setup)\n"
     printf "\n"
 
     return 0

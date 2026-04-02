@@ -145,6 +145,55 @@ rpzuser ALL=(ALL) NOPASSWD: /usr/sbin/rndc reload *
 
 Then: `RNDC_BIN="sudo rndc" /usr/local/sbin/run-rpz.sh --reload-bind block.rpz -- ...`
 
+## Dynamic Allowlist (allow.sh)
+
+`allow.sh` adds or removes domains from the RPZ allowlist zone in real time using TSIG-authenticated `nsupdate`, without waiting for the next scheduled rpz-zone-factory run. Changes are also persisted to the allowlist text file so they survive regeneration.
+
+### Quick usage
+
+```sh
+# Allow a domain (adds domain + *.domain by default)
+./allow.sh example.com
+
+# Allow domain only (no wildcard)
+./allow.sh -n example.com
+
+# Remove a domain from the allowlist
+./allow.sh -r example.com
+```
+
+### Requirements
+
+- TSIG key configured for the allowlist zone (see `./allow.sh --setup` for full walkthrough)
+- `nsupdate` and `rndc` available in PATH
+- BIND zone configured with `allow-update { key "rpz-update"; };`
+
+### Configuration
+
+`allow.sh` reads defaults from `.run-rpz.conf` (shared with `run-rpz.sh`). The `--setup` wizard in `run-rpz.sh` configures these automatically:
+
+| Setting | Description |
+|---------|-------------|
+| `CONF_TSIG_KEY_FILE` | Path to TSIG key file |
+| `CONF_ALLOW_SERVER` | Server for nsupdate (default: `localhost`) |
+| `CONF_ALLOW_ZONE` | Allowlist zone name (default: `allowlist.rpz`) |
+| `CONF_ALLOWLIST_FILE` | Allowlist text file (shared with rpz-zone-factory) |
+
+All settings can be overridden with flags. Run `./allow.sh -h` for the full flag list.
+
+### How it works
+
+1. Validates the domain name
+2. Appends/removes the domain in the allowlist text file (race condition safe — file is updated before the dynamic update)
+3. Sends `nsupdate` with TSIG key to add/remove RPZ passthru records
+4. Runs `rndc sync -clean <zone>` to flush the journal and remove the `.jnl` file
+
+### TSIG setup
+
+Run `./allow.sh --setup` for step-by-step instructions covering key generation, directory permissions, `named.conf` changes, and testing.
+
+The `run-rpz.sh --setup` wizard also walks through TSIG configuration when per-source mode with an allowlist is enabled.
+
 ## Platform Notes
 
 ### FreeBSD
