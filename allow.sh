@@ -31,8 +31,9 @@ ALLOWLIST_FILE=""
 RNDC_BIN="${RNDC_BIN:-rndc}"
 
 # TTL for nsupdate records. BIND ignores TTL for RPZ policy actions,
-# but nsupdate requires it syntactically.
-ALLOW_TTL="86400"
+# but nsupdate requires it syntactically. Use 300 to match the zone's
+# $TTL default so BIND doesn't emit explicit TTL directives in the zone file.
+ALLOW_TTL="300"
 
 # ─── Platform detection ───────────────────────────────────────────────────────
 
