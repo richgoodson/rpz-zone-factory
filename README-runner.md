@@ -145,6 +145,95 @@ rpzuser ALL=(ALL) NOPASSWD: /usr/sbin/rndc reload *
 
 Then: `RNDC_BIN="sudo rndc" /usr/local/sbin/run-rpz.sh --reload-bind block.rpz -- ...`
 
+## Running as a Non-Root User
+
+Don't run rpz-zone-factory as root. The pipeline needs write access to a few specific paths and read access to BIND credentials — all achievable with group permissions. Here's the complete list.
+
+### 1. Create a dedicated user (optional but recommended)
+
+You can run as any non-root user. If you want a dedicated service account:
+
+```sh
+# FreeBSD
+pw useradd rpzuser -m -G named -s /usr/sbin/nologin
+
+# Debian/Ubuntu
+useradd -r -m -G bind -s /usr/sbin/nologin rpzuser
+```
+
+Adding the user to the `named`/`bind` group gives it read access to BIND key files.
+
+### 2. Project directory
+
+The user needs write access to the project directory for the venv, cache, and config:
+
+```sh
+chown -R rpzuser:rpzuser /opt/rpz-zone-factory
+```
+
+This covers:
+- `.venv/` — Python virtual environment
+- `.cache/` — source cache and HTTP metadata
+- `.run-rpz.conf` — saved configuration
+
+### 3. Zone file output directory
+
+The user needs write access to wherever zone files are written:
+
+```sh
+# FreeBSD
+chown named:named /usr/local/etc/namedb/master/rpz
+chmod 775 /usr/local/etc/namedb/master/rpz
+pw groupmod named -m rpzuser
+
+# Debian/Ubuntu
+chown bind:bind /etc/bind/zones/rpz
+chmod 775 /etc/bind/zones/rpz
+usermod -aG bind rpzuser
+```
+
+This also covers `allowlist.txt` and `allow-audit.log`, which live in the same directory.
+
+### 4. rndc access
+
+See [BIND Reload Permissions](#bind-reload-permissions) above. The recommended approach is granting the user read access to the rndc key file via group membership.
+
+### 5. TSIG key access (for allow.sh)
+
+If using `allow.sh` for dynamic allowlist management, the user needs read access to the TSIG key file:
+
+```sh
+# FreeBSD
+chmod 640 /usr/local/etc/namedb/tsig/rpz-update.key
+chown named:named /usr/local/etc/namedb/tsig/rpz-update.key
+
+# Debian/Ubuntu
+chmod 640 /etc/bind/tsig/rpz-update.key
+chown bind:bind /etc/bind/tsig/rpz-update.key
+```
+
+The user's membership in the `named`/`bind` group (from step 1) covers this.
+
+### 6. named-checkzone
+
+`named-checkzone` is typically installed as part of the BIND utilities package and is world-executable. No special permissions needed. Verify with:
+
+```sh
+which named-checkzone && ls -la $(which named-checkzone)
+```
+
+### Summary
+
+| Resource | Permission needed | How |
+|----------|------------------|-----|
+| Project directory | read/write | `chown` to the user |
+| Zone file output directory | write | Group membership (`named`/`bind`) |
+| `allowlist.txt`, `allow-audit.log` | write | Same as zone directory |
+| `rndc.key` | read | Group membership |
+| TSIG key file | read | Group membership |
+| `named-checkzone` | execute | Already world-executable |
+| `.venv/`, `.cache/` | read/write | Inside project directory |
+
 ## Dynamic Allowlist (allow.sh)
 
 `allow.sh` adds or removes domains from the RPZ allowlist zone in real time using TSIG-authenticated `nsupdate`, without waiting for the next scheduled rpz-zone-factory run. Changes are also persisted to the allowlist text file so they survive regeneration.

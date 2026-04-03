@@ -71,6 +71,8 @@ See `./allow.sh --setup` for TSIG key configuration.
 - Python 3.9+ (managed automatically by `run-rpz.sh`)
 - `requests` and `pyyaml` (installed into a venv by `run-rpz.sh --setup`)
 
+> **Don't run this as root.** The pipeline needs write access to a few specific paths and read access to BIND credentials, all achievable with group permissions. See [Running as a Non-Root User](README-runner.md#running-as-a-non-root-user) in README-runner.md for the full setup.
+
 ## Python Engine Reference
 
 You don't normally invoke the Python CLI directly — `run-rpz.sh` handles it. These are here for reference and debugging.
