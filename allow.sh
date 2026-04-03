@@ -27,6 +27,9 @@ ALLOW_ZONE="${ALLOW_ZONE:-}"
 # Allowlist text file (persisted across rpz-zone-factory runs)
 ALLOWLIST_FILE=""
 
+# Audit log file (append-only operation log)
+AUDIT_LOG=""
+
 # rndc binary (for sync -clean)
 RNDC_BIN="${RNDC_BIN:-rndc}"
 
@@ -72,6 +75,9 @@ fi
 if [ -n "$CONF_ALLOWLIST_FILE" ] && [ -z "$ALLOWLIST_FILE" ]; then
     ALLOWLIST_FILE="$CONF_ALLOWLIST_FILE"
 fi
+if [ -n "$CONF_AUDIT_LOG" ] && [ -z "$AUDIT_LOG" ]; then
+    AUDIT_LOG="$CONF_AUDIT_LOG"
+fi
 
 # Apply defaults if still unset after config
 if [ -z "$TSIG_KEY_FILE" ]; then
@@ -83,16 +89,25 @@ fi
 if [ -z "$ALLOW_ZONE" ]; then
     ALLOW_ZONE="allowlist.rpz"
 fi
+# Audit log default: same directory as allowlist file, or script directory
+if [ -z "$AUDIT_LOG" ]; then
+    if [ -n "$ALLOWLIST_FILE" ]; then
+        AUDIT_LOG="$(dirname "$ALLOWLIST_FILE")/allow-audit.log"
+    else
+        AUDIT_LOG="${_script_real}/allow-audit.log"
+    fi
+fi
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION="0.4.2"
+VERSION="0.4.3"
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
-ACTION="add"          # "add" or "remove"
+ACTION="add"          # "add" or "remove" or "audit"
 SKIP_WILDCARD=0       # 0 = add wildcard, 1 = skip
 DOMAIN=""
+AUDIT_LINES=20        # default lines for --audit
 
 # ─── Usage ────────────────────────────────────────────────────────────────────
 
@@ -108,6 +123,7 @@ USAGE:
   ./allow.sh [OPTIONS] <domain>           Add domain + wildcard to allowlist
   ./allow.sh [OPTIONS] -n <domain>        Add domain only (no wildcard)
   ./allow.sh [OPTIONS] -r <domain>        Remove domain + wildcard from allowlist
+  ./allow.sh --audit [N]                  Show last N audit log entries (default 20)
 
 OPTIONS:
   -r, --remove          Remove domain instead of adding
@@ -123,6 +139,9 @@ OPTIONS:
                         Default: from .run-rpz.conf CONF_ALLOWLIST_FILE
   -h, --help            Show this help and exit
   -v, --version         Print version and exit
+  --audit [N]           Show last N audit log entries (default: 20)
+  --audit-file FILE     Path to audit log file
+                        Default: allow-audit.log next to allowlist file
   --setup               Show full TSIG key setup instructions
 
 EXAMPLES:
@@ -134,6 +153,12 @@ EXAMPLES:
 
   # Remove a domain from the allowlist
   ./allow.sh -r example.com
+
+  # Show the last 20 audit log entries
+  ./allow.sh --audit
+
+  # Show the last 50 audit log entries
+  ./allow.sh --audit 50
 
   # Use a specific TSIG key and server
   ./allow.sh -k /etc/bind/tsig/rpz-update.key -s 10.0.0.1 example.com
@@ -281,6 +306,23 @@ parse_args() {
             --setup)
                 usage_setup 0
                 ;;
+            --audit)
+                ACTION="audit"
+                # Check if next arg is a number (line count)
+                if [ -n "$2" ] && printf '%s' "$2" | grep -Eq '^[0-9]+$'; then
+                    AUDIT_LINES="$2"
+                    shift
+                fi
+                shift
+                ;;
+            --audit-file)
+                if [ -z "$2" ]; then
+                    printf "ERROR: --audit-file requires a file path argument\n" >&2
+                    usage 1
+                fi
+                AUDIT_LOG="$2"
+                shift 2
+                ;;
             -r|--remove)
                 ACTION="remove"
                 shift
@@ -336,7 +378,7 @@ parse_args() {
         esac
     done
 
-    if [ -z "$DOMAIN" ]; then
+    if [ "$ACTION" != "audit" ] && [ -z "$DOMAIN" ]; then
         printf "ERROR: No domain specified.\n\n" >&2
         usage 1
     fi
@@ -567,6 +609,56 @@ send"
     return $?
 }
 
+# ─── Audit log ────────────────────────────────────────────────────────────────
+
+# Append a line to the audit log.
+# Format: YYYY-MM-DDTHH:MM:SS+ZZZZ | action | domain | operator | result
+audit_write() {
+    _action="$1"
+    _domain="$2"
+    _result="$3"
+
+    _ts=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')
+    _operator=$(whoami 2>/dev/null || echo "unknown")
+
+    # Create audit log if it doesn't exist
+    if [ ! -f "$AUDIT_LOG" ]; then
+        touch "$AUDIT_LOG" 2>/dev/null || {
+            printf "WARNING: Cannot create audit log: %s\n" "$AUDIT_LOG" >&2
+            return 1
+        }
+    fi
+
+    printf '%s | %-6s | %s | %s | %s\n' \
+        "$_ts" "$_action" "$_domain" "$_operator" "$_result" \
+        >> "$AUDIT_LOG" 2>/dev/null || {
+        printf "WARNING: Failed to write audit log: %s\n" "$AUDIT_LOG" >&2
+        return 1
+    }
+
+    return 0
+}
+
+# Display last N lines from the audit log.
+audit_show() {
+    _lines="$1"
+
+    if [ ! -f "$AUDIT_LOG" ]; then
+        printf "No audit log found at: %s\n" "$AUDIT_LOG"
+        return 0
+    fi
+
+    _total=$(wc -l < "$AUDIT_LOG" | tr -d ' ')
+    printf "Audit log: %s (%s entries)\n" "$AUDIT_LOG" "$_total"
+    printf "Showing last %s:\n\n" "$_lines"
+    printf '%-25s | %-6s | %-40s | %-12s | %s\n' \
+        "TIMESTAMP" "ACTION" "DOMAIN" "OPERATOR" "RESULT"
+    printf '%s\n' "────────────────────────────────────────────────────────────────────────────────────────────────────"
+    tail -n "$_lines" "$AUDIT_LOG"
+
+    return 0
+}
+
 # ─── rndc sync ────────────────────────────────────────────────────────────────
 
 rndc_sync_clean() {
@@ -592,6 +684,12 @@ rndc_sync_clean() {
 
 main() {
     parse_args "$@"
+
+    # --audit doesn't need a domain, TSIG key, or preflight
+    if [ "$ACTION" = "audit" ]; then
+        audit_show "$AUDIT_LINES"
+        exit 0
+    fi
 
     if ! validate_domain "$DOMAIN"; then
         exit 1
@@ -631,12 +729,16 @@ main() {
             printf "\n  The domain was added to the allowlist text file but the\n" >&2
             printf "  dynamic update failed. The domain will take effect on the\n" >&2
             printf "  next scheduled rpz-zone-factory run.\n" >&2
+            audit_write "add" "$DOMAIN" "FAIL:nsupdate-rc${_nsupdate_rc}"
             exit 1
         fi
         printf "  nsupdate succeeded.\n"
 
         # Step 3: Sync and clean journal
         rndc_sync_clean "$ALLOW_ZONE"
+
+        # Step 4: Audit log
+        audit_write "add" "$DOMAIN" "OK"
 
         printf "\nDone. %s is now allowed through RPZ.\n" "$DOMAIN"
 
@@ -664,12 +766,16 @@ main() {
             printf "\n  The domain was removed from the allowlist text file but the\n" >&2
             printf "  dynamic update failed. The change will take effect on the\n" >&2
             printf "  next scheduled rpz-zone-factory run.\n" >&2
+            audit_write "remove" "$DOMAIN" "FAIL:nsupdate-rc${_nsupdate_rc}"
             exit 1
         fi
         printf "  nsupdate succeeded.\n"
 
         # Step 3: Sync and clean journal
         rndc_sync_clean "$ALLOW_ZONE"
+
+        # Step 4: Audit log
+        audit_write "remove" "$DOMAIN" "OK"
 
         printf "\nDone. %s removed from RPZ allowlist.\n" "$DOMAIN"
     fi
