@@ -160,6 +160,12 @@ Then: `RNDC_BIN="sudo rndc" /usr/local/sbin/run-rpz.sh --reload-bind block.rpz -
 
 # Remove a domain from the allowlist
 ./allow.sh -r example.com
+
+# View the audit log (last 20 entries)
+./allow.sh --audit
+
+# View the last 50 entries
+./allow.sh --audit 50
 ```
 
 ### Requirements
@@ -178,6 +184,7 @@ Then: `RNDC_BIN="sudo rndc" /usr/local/sbin/run-rpz.sh --reload-bind block.rpz -
 | `CONF_ALLOW_SERVER` | Server for nsupdate (default: `localhost`) |
 | `CONF_ALLOW_ZONE` | Allowlist zone name (default: `allowlist.rpz`) |
 | `CONF_ALLOWLIST_FILE` | Allowlist text file (shared with rpz-zone-factory) |
+| `CONF_AUDIT_LOG` | Path to audit log file (default: `allow-audit.log` next to allowlist file) |
 
 All settings can be overridden with flags. Run `./allow.sh -h` for the full flag list.
 
@@ -187,6 +194,38 @@ All settings can be overridden with flags. Run `./allow.sh -h` for the full flag
 2. Appends/removes the domain in the allowlist text file (race condition safe — file is updated before the dynamic update)
 3. Sends `nsupdate` with TSIG key to add/remove RPZ passthru records
 4. Runs `rndc sync -clean <zone>` to flush the journal and remove the `.jnl` file
+5. Writes an entry to the audit log (success or failure)
+
+### Audit log
+
+Every add/remove operation is logged to an append-only audit log. The log records:
+
+- Timestamp (local time with UTC offset)
+- Action (`add` or `remove`)
+- Domain
+- Operator (`whoami` — who ran the command)
+- Result (`OK` or `FAIL:reason`)
+
+Failures are logged too — if `nsupdate` fails, the log records the exit code.
+
+Example:
+
+```
+2026-04-03T12:22:04-0500 | add    | audit-test.example | alice | OK
+2026-04-03T12:22:22-0500 | remove | audit-test.example | alice | OK
+2026-04-03T12:30:01-0500 | add    | suspect.example    | root     | FAIL:nsupdate-rc1
+```
+
+The log file defaults to `allow-audit.log` in the same directory as the allowlist file. Override with `--audit-file` or `CONF_AUDIT_LOG` in `.run-rpz.conf`.
+
+View the log with `--audit`:
+
+```sh
+./allow.sh --audit        # last 20 entries
+./allow.sh --audit 50     # last 50 entries
+```
+
+`--audit` doesn't require a TSIG key, domain, or any preflight — it just reads the log file.
 
 ### TSIG setup
 
