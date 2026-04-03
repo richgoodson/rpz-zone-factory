@@ -12,8 +12,8 @@ import ipaddress
 import logging
 import re
 
-from rpz_factory.fetcher import fetch_url
-from rpz_factory.models import EntryType, FetchResult, SourceName, ThreatEntry
+from rpz_factory.fetcher import NotModified, fetch_url, get_last_fetch_meta
+from rpz_factory.models import EntryType, FetchResult, HttpMeta, SourceName, ThreatEntry
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +63,19 @@ def _parse_drop_text(text: str, source: SourceName) -> FetchResult:
     return result
 
 
-def fetch_drop() -> FetchResult:
+def fetch_drop(
+    *,
+    etag: str | None = None,
+    last_modified: str | None = None,
+) -> FetchResult:
     """Fetch and parse Spamhaus DROP list."""
     result = FetchResult(source=SourceName.SPAMHAUS_DROP)
     try:
-        text = fetch_url(DROP_URL)
+        text = fetch_url(DROP_URL, etag=etag, last_modified=last_modified)
         assert isinstance(text, str)
+    except NotModified:
+        result.not_modified = True
+        return result
     except Exception as exc:
         logger.error("Failed to fetch Spamhaus DROP: %s", exc)
         result.error = str(exc)

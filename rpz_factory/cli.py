@@ -8,9 +8,10 @@ import os
 import sys
 
 from rpz_factory import __version__
-from rpz_factory.cache import load_cache, write_cache
+from rpz_factory.cache import load_cache, load_http_meta, write_cache, write_http_meta
+from rpz_factory.fetcher import get_last_fetch_meta
 from rpz_factory.filters import filter_entries
-from rpz_factory.models import FetchResult, ThreatEntry
+from rpz_factory.models import FetchResult, HttpMeta, SourceName, ThreatEntry
 from rpz_factory.parsers import abusech, cisa, cryptoscamdb, scamsniffer, spamhaus
 from rpz_factory.renderers import pihole, rpz
 
@@ -107,6 +108,15 @@ SOURCE_FETCHERS = {
     "cryptoscamdb": cryptoscamdb.fetch_and_parse,
 }
 
+# URLs per source (for HTTP meta lookup after fetch)
+_SOURCE_URLS = {
+    "urlhaus": "https://urlhaus.abuse.ch/downloads/rpz/",
+    "cisa": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+    "drop": "https://www.spamhaus.org/drop/drop.txt",
+    "scamsniffer": "https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/domains.json",
+    "cryptoscamdb": "https://raw.githubusercontent.com/CryptoScamDB/blacklist/master/data/urls.yaml",
+}
+
 # Map source keys to SourceName enum values for cache lookups
 _SOURCE_KEY_TO_NAME = {
     "urlhaus": "abusech_urlhaus",
@@ -190,13 +200,53 @@ def main(argv: list[str] | None = None) -> int:
     # Fetch from all requested sources
     all_entries: list[ThreatEntry] = []
     errors: list[str] = []
+    not_modified_sources: list[str] = []
 
     for source_key in args.sources:
         fetcher = SOURCE_FETCHERS[source_key]
         logger.info("Fetching source: %s", source_key)
+
+        # Load HTTP conditional-request metadata from cache
+        source_enum_value = _SOURCE_KEY_TO_NAME.get(source_key)
+        http_meta: HttpMeta | None = None
+        if source_enum_value:
+            try:
+                source_enum = SourceName(source_enum_value)
+                http_meta = load_http_meta(cache_dir, source_enum)
+            except ValueError:
+                pass
+
+        # Build conditional kwargs
+        fetch_kwargs: dict[str, str | None] = {}
+        if http_meta:
+            fetch_kwargs["etag"] = http_meta.etag
+            fetch_kwargs["last_modified"] = http_meta.last_modified
+
         try:
-            result: FetchResult = fetcher()
-            if result.error:
+            result: FetchResult = fetcher(**fetch_kwargs)
+
+            if result.not_modified:
+                # 304 — use cached entries
+                logger.info("Source %s: not modified (304), using cache", source_key)
+                not_modified_sources.append(source_key)
+                if source_enum_value:
+                    try:
+                        source_enum = SourceName(source_enum_value)
+                        cached = load_cache(cache_dir, source_enum)
+                        if cached:
+                            all_entries.extend(cached.entries)
+                            logger.info(
+                                "Source %s: %d entries loaded from cache (304)",
+                                source_key,
+                                len(cached.entries),
+                            )
+                        else:
+                            logger.warning(
+                                "Source %s: 304 but no cache available", source_key
+                            )
+                    except ValueError:
+                        pass
+            elif result.error:
                 errors.append(f"{source_key}: {result.error}")
                 logger.warning("Source %s had error: %s", source_key, result.error)
                 # Try cache fallback on error
@@ -223,12 +273,23 @@ def main(argv: list[str] | None = None) -> int:
                 logger.info(
                     "Source %s: %d entries collected", source_key, len(result.entries)
                 )
+                # Save HTTP metadata for future conditional requests
+                source_url = _SOURCE_URLS.get(source_key)
+                if source_url:
+                    fetch_meta = get_last_fetch_meta(source_url)
+                    if fetch_meta and (fetch_meta.etag or fetch_meta.last_modified):
+                        write_http_meta(
+                            cache_dir,
+                            result.source,
+                            HttpMeta(
+                                etag=fetch_meta.etag,
+                                last_modified=fetch_meta.last_modified,
+                            ),
+                        )
         except Exception as exc:
             errors.append(f"{source_key}: {exc}")
             logger.error("Source %s failed: %s", source_key, exc)
             # Try cache fallback on exception
-            from rpz_factory.models import SourceName
-            source_enum_value = _SOURCE_KEY_TO_NAME.get(source_key)
             if source_enum_value:
                 try:
                     source_enum = SourceName(source_enum_value)
@@ -253,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Per-source mode ───────────────────────────────────────────────────
     if args.per_source:
-        return _run_per_source(args, all_entries, errors, logger)
+        return _run_per_source(args, all_entries, errors, logger, not_modified_sources)
 
     # ── Combined mode (original behavior) ─────────────────────────────────
     # Filter (cross-source dedup)
@@ -277,6 +338,8 @@ def main(argv: list[str] | None = None) -> int:
     # Summary to stderr
     print(f"\n--- rpz-zone-factory summary ---", file=sys.stderr)
     print(f"Sources fetched: {len(args.sources)}", file=sys.stderr)
+    if not_modified_sources:
+        print(f"Not modified (304): {', '.join(not_modified_sources)}", file=sys.stderr)
     print(f"Total raw entries: {len(all_entries)}", file=sys.stderr)
     print(f"After filtering: {len(filtered)}", file=sys.stderr)
     if errors:
@@ -293,9 +356,13 @@ def _run_per_source(
     all_entries: list[ThreatEntry],
     errors: list[str],
     logger: logging.Logger,
+    not_modified_sources: list[str] | None = None,
 ) -> int:
     """Per-source mode: group entries by source, filter each independently, write separate zone files."""
     from collections import defaultdict
+
+    if not_modified_sources is None:
+        not_modified_sources = []
 
     # Group entries by source key
     entries_by_source: dict[str, list[ThreatEntry]] = defaultdict(list)
@@ -358,13 +425,16 @@ def _run_per_source(
     # Summary to stderr
     print(f"\n--- rpz-zone-factory summary (per-source mode) ---", file=sys.stderr)
     print(f"Sources fetched: {len(args.sources)}", file=sys.stderr)
+    if not_modified_sources:
+        print(f"Not modified (304): {', '.join(not_modified_sources)}", file=sys.stderr)
     print(f"Total raw entries: {len(all_entries)}", file=sys.stderr)
     print(f"Total after filtering: {total_filtered}", file=sys.stderr)
     print(f"Per-source entry counts:", file=sys.stderr)
     for source_key in args.sources:
         count = per_source_counts.get(source_key, 0)
         zone_name = SOURCE_ZONE_NAMES.get(source_key, source_key)
-        print(f"  {zone_name}: {count}", file=sys.stderr)
+        tag = " (cached/304)" if source_key in not_modified_sources else ""
+        print(f"  {zone_name}: {count}{tag}", file=sys.stderr)
     if args.allowlist:
         _al_count = len(allowlist_domains) if 'allowlist_domains' in locals() else 0
         print(f"  allowlist.rpz: {_al_count}", file=sys.stderr)

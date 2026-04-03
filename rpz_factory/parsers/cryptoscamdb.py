@@ -12,8 +12,8 @@ from urllib.parse import urlparse
 
 import yaml
 
-from rpz_factory.fetcher import fetch_url
-from rpz_factory.models import EntryType, FetchResult, SourceName, ThreatEntry
+from rpz_factory.fetcher import NotModified, fetch_url, get_last_fetch_meta
+from rpz_factory.models import EntryType, FetchResult, HttpMeta, SourceName, ThreatEntry
 
 logger = logging.getLogger(__name__)
 
@@ -70,12 +70,19 @@ def _is_valid_domain(domain: str) -> bool:
     return True
 
 
-def fetch_and_parse() -> FetchResult:
+def fetch_and_parse(
+    *,
+    etag: str | None = None,
+    last_modified: str | None = None,
+) -> FetchResult:
     """Fetch CryptoScamDB YAML blacklist and extract domain entries."""
     result = FetchResult(source=SourceName.CRYPTOSCAMDB)
     try:
-        text = fetch_url(CRYPTOSCAMDB_URL)
+        text = fetch_url(CRYPTOSCAMDB_URL, etag=etag, last_modified=last_modified)
         assert isinstance(text, str)
+    except NotModified:
+        result.not_modified = True
+        return result
     except Exception as exc:
         logger.error("Failed to fetch CryptoScamDB blacklist: %s", exc)
         result.error = str(exc)

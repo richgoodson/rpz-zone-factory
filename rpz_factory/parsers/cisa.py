@@ -16,8 +16,8 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
-from rpz_factory.fetcher import fetch_url
-from rpz_factory.models import EntryType, FetchResult, SourceName, ThreatEntry
+from rpz_factory.fetcher import NotModified, fetch_url, get_last_fetch_meta
+from rpz_factory.models import EntryType, FetchResult, HttpMeta, SourceName, ThreatEntry
 
 logger = logging.getLogger(__name__)
 
@@ -92,11 +92,18 @@ def _extract_domains_from_text(text: str) -> list[str]:
     return domains
 
 
-def fetch_and_parse() -> FetchResult:
+def fetch_and_parse(
+    *,
+    etag: str | None = None,
+    last_modified: str | None = None,
+) -> FetchResult:
     """Fetch CISA KEV JSON and extract domain/IP indicators."""
     result = FetchResult(source=SourceName.CISA_KEV)
     try:
-        data: dict[str, Any] = fetch_url(CISA_KEV_URL, expect_json=True)  # type: ignore[assignment]
+        data: dict[str, Any] = fetch_url(CISA_KEV_URL, expect_json=True, etag=etag, last_modified=last_modified)  # type: ignore[assignment]
+    except NotModified:
+        result.not_modified = True
+        return result
     except Exception as exc:
         logger.error("Failed to fetch CISA KEV: %s", exc)
         result.error = str(exc)

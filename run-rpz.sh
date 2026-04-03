@@ -1,6 +1,6 @@
 #!/bin/sh
 # run-rpz.sh — Cron/interactive wrapper for rpz-zone-factory
-# Version: 0.4.2
+# Version: 0.5.0
 # Portable: Debian, Ubuntu, FreeBSD 13+
 # POSIX sh — no bashisms.
 #
@@ -64,7 +64,7 @@ fi
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION="0.4.2"
+VERSION="0.5.0"
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
@@ -1390,6 +1390,28 @@ run_rpz() {
                 fi
             fi
 
+            # ── Freeze dynamic zones before overwriting zone files ─────────
+            _zones_frozen=0
+            if [ $DO_RELOAD -eq 1 ]; then
+                # Sync and clean journals first — reduces orphaned .jnl risk
+                log_info "Syncing dynamic zones: rndc sync -clean"
+                _sync_output=$($RNDC_BIN sync -clean 2>&1)
+                _sync_rc=$?
+                if [ $_sync_rc -ne 0 ]; then
+                    log_warn "rndc sync -clean failed: $_sync_output"
+                fi
+
+                # Freeze all dynamic zones
+                log_info "Freezing all dynamic zones"
+                _freeze_output=$($RNDC_BIN freeze 2>&1)
+                _freeze_rc=$?
+                if [ $_freeze_rc -ne 0 ]; then
+                    log_warn "rndc freeze failed: $_freeze_output"
+                else
+                    _zones_frozen=1
+                fi
+            fi
+
             for _db_file in "$_tmp_dir"/*.db; do
                 [ ! -f "$_db_file" ] && continue
                 _basename=$(basename "$_db_file")
@@ -1432,6 +1454,15 @@ run_rpz() {
                 fi
             done
 
+            # Remove any orphaned journal files after zone file writes
+            if [ $_zones_frozen -eq 1 ]; then
+                for _jnl_file in "$CONF_OUTPUT_FILE"/*.jnl; do
+                    [ ! -f "$_jnl_file" ] && continue
+                    rm -f "$_jnl_file"
+                    log_info "Removed orphaned journal: $(basename "$_jnl_file")"
+                done
+            fi
+
             # Clean up tmp directory
             rm -rf "$_tmp_dir"
 
@@ -1439,13 +1470,27 @@ run_rpz() {
 
         # Per-source BIND reload
         if [ $DO_RELOAD -eq 1 ]; then
-            for _db_file in "$CONF_OUTPUT_FILE"/*.db; do
-                [ ! -f "$_db_file" ] && continue
-                _basename=$(basename "$_db_file")
-                _zone_name=$(echo "$_basename" | sed 's/\.db$//')
-                RELOAD_ZONE="$_zone_name"
-                reload_bind
-            done
+            # Reload all zones (may warn on frozen dynamic zones — thaw handles those)
+            log_info "Reloading all zones"
+            _reload_output=$($RNDC_BIN reload 2>&1)
+            _reload_rc=$?
+            if [ $_reload_rc -ne 0 ]; then
+                log_warn "rndc reload: $_reload_output"
+            else
+                log_info "All zones reloaded"
+            fi
+
+            # Thaw dynamic zones — reloads from disk and resumes dynamic updates
+            if [ $_zones_frozen -eq 1 ]; then
+                log_info "Thawing all dynamic zones"
+                _thaw_output=$($RNDC_BIN thaw 2>&1)
+                _thaw_rc=$?
+                if [ $_thaw_rc -ne 0 ]; then
+                    log_err "rndc thaw failed: $_thaw_output"
+                else
+                    log_info "All dynamic zones thawed"
+                fi
+            fi
         fi
 
         return 0

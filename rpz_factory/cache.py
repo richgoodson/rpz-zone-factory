@@ -12,13 +12,51 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from rpz_factory.models import EntryType, FetchResult, SourceName, ThreatEntry
+from rpz_factory.models import EntryType, FetchResult, HttpMeta, SourceName, ThreatEntry
 
 logger = logging.getLogger(__name__)
 
 
 def _cache_path(cache_dir: str, source_name: str) -> Path:
     return Path(cache_dir) / f"{source_name}.json"
+
+
+def _meta_path(cache_dir: str, source_name: str) -> Path:
+    return Path(cache_dir) / f"{source_name}.meta.json"
+
+
+def write_http_meta(cache_dir: str, source: SourceName, meta: HttpMeta) -> None:
+    """Persist HTTP conditional-request metadata for a source."""
+    if not meta.etag and not meta.last_modified:
+        return
+    path = _meta_path(cache_dir, source.value)
+    os.makedirs(cache_dir, exist_ok=True)
+    data = {
+        "source": source.value,
+        "etag": meta.etag,
+        "last_modified": meta.last_modified,
+        "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        logger.debug("HTTP meta written: %s", path)
+    except OSError as exc:
+        logger.warning("Failed to write HTTP meta for %s: %s", source.value, exc)
+
+
+def load_http_meta(cache_dir: str, source: SourceName) -> HttpMeta | None:
+    """Load persisted HTTP conditional-request metadata for a source."""
+    path = _meta_path(cache_dir, source.value)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return HttpMeta(etag=data.get("etag"), last_modified=data.get("last_modified"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to read HTTP meta for %s: %s", source.value, exc)
+        return None
 
 
 def write_cache(cache_dir: str, result: FetchResult) -> None:
@@ -88,8 +126,8 @@ def load_cache(cache_dir: str, source: SourceName) -> FetchResult | None:
             continue
 
     result.raw_count = len(result.entries)
-    logger.warning(
-        "Source %s failed, using cached data from %s (%d entries)",
+    logger.info(
+        "Source %s: using cached data from %s (%d entries)",
         source.value,
         cached_at,
         len(result.entries),

@@ -45,3 +45,12 @@ class FetchResult:
     entries: list[ThreatEntry] = field(default_factory=list)
     error: str | None = None
     raw_count: int = 0
+    not_modified: bool = False
+
+
+@dataclass
+class HttpMeta:
+    """HTTP conditional-request metadata for cache persistence."""
+
+    etag: str | None = None
+    last_modified: str | None = None
