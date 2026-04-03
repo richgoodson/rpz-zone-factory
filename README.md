@@ -177,9 +177,11 @@ Define each zone in `named.conf`:
 
 ```bind
 // Allowlist zone — evaluated first, passthru overrides blocks
+// allow-update is required for allow.sh (TSIG-authenticated dynamic updates)
 zone "allowlist.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/allowlist.rpz.db";
+    allow-update { key "rpz-update"; };
     allow-query { localhost; };
     allow-transfer { none; };
 };
@@ -261,8 +263,22 @@ options {
 
 ### Deployment
 
+Use `run-rpz.sh` for automated deployment — it handles venv management, zone validation, and BIND reload:
+
+```sh
+# First time: run the setup wizard
+./run-rpz.sh --setup
+
+# Subsequent runs (cron or interactive)
+./run-rpz.sh
+```
+
+See the [Quick Start](#quick-start) above and [README-runner.md](README-runner.md) for full details.
+
+For manual one-off runs or debugging, you can invoke the Python CLI directly:
+
 ```bash
-# Per-source: generate all zone files
+# Generate all zone files
 python run.py --per-source --output-file /etc/namedb/master/rpz/ -v
 
 # Validate a zone
@@ -272,10 +288,8 @@ named-checkzone urlhaus.rpz /etc/namedb/master/rpz/urlhaus.rpz.db
 rndc reconfig
 
 # Subsequent updates only need reload
-rndc reload urlhaus.rpz
+rndc reload
 ```
-
-For automated deployment via cron, see the [Quick Start](#quick-start) above and [README-runner.md](README-runner.md) for full `run-rpz.sh` details.
 
 ## Pi-hole Configuration
 
@@ -283,6 +297,10 @@ To use the generated blocklist with Pi-hole:
 
 1. Generate the blocklist file:
    ```bash
+   # Via run-rpz.sh (recommended — configure with --setup)
+   ./run-rpz.sh -- --output pihole --output-file /tmp/rpz-blocklist.txt
+
+   # Or directly via Python
    python run.py --output pihole --output-file /tmp/rpz-blocklist.txt
    ```
 
@@ -331,6 +349,7 @@ rpz-zone-factory/
 │       ├── __init__.py
 │       ├── rpz.py      # RFC 5782 zone file renderer
 │       └── pihole.py   # Flat domain list renderer
-├── .cache/             # Per-source cached entries + HTTP metadata (auto-created)
-└── allow-audit.log     # Append-only audit log from allow.sh (auto-created)
+└── .cache/             # Per-source cached entries + HTTP metadata (auto-created)
 ```
+
+`allow.sh` also creates `allow-audit.log` in the zone output directory (next to `allowlist.txt`), not in the project directory. See [README-runner.md](README-runner.md#audit-log) for details.

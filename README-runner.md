@@ -37,7 +37,7 @@ After running `--setup`, the script reads `.run-rpz.conf` automatically — no C
 
 ### Pi-hole flat file (daily at 3:05 AM)
 ```
-5 3 * * * /opt/rpz-zone-factory/run-rpz.sh -- --output pihole --output-file /usr/local/www/rpz-zone-factory/block.txt
+5 3 * * * /opt/rpz-zone-factory/run-rpz.sh -- --output pihole --output-file /var/www/rpz/block.txt
 ```
 
 ## Modes
@@ -86,6 +86,10 @@ The `--setup` wizard saves all choices to `.run-rpz.conf` in the project directo
 | `CONF_COMPILE_ZONE` | `yes` or `no` — compile to binary (raw) format |
 | `CONF_SOURCES` | Space-separated source list, or `all` |
 | `CONF_VERBOSITY` | `0` (quiet), `1` (`-v`), `2` (`-vv`) |
+| `CONF_TSIG_KEY_FILE` | Path to TSIG key file (for `allow.sh`) |
+| `CONF_ALLOW_SERVER` | Server for nsupdate (default: `localhost`) |
+| `CONF_ALLOW_ZONE` | Allowlist zone name (default: `allowlist.rpz`) |
+| `CONF_AUDIT_LOG` | Path to audit log file (default: `allow-audit.log` next to allowlist) |
 
 Edit `.run-rpz.conf` directly or re-run `--setup` to reconfigure.
 
@@ -131,7 +135,7 @@ rndc reads this automatically. Ensure the cron user can read the file.
 ### 3. Run cron as the named/bind user
 
 ```
-15 */4 * * * sudo -u named RPZ_DIR=/opt/rpz-zone-factory /usr/local/sbin/run-rpz.sh --reload-bind block.rpz -- --output rpz --zone-name block.rpz --output-file /var/named/rpz/block.rpz.db
+15 */4 * * * sudo -u named RPZ_DIR=/opt/rpz-zone-factory /opt/rpz-zone-factory/run-rpz.sh --reload-bind block.rpz -- --output rpz --zone-name block.rpz --output-file /var/named/rpz/block.rpz.db
 ```
 
 The user also needs write access to the output file directory.
@@ -143,7 +147,7 @@ In `/etc/sudoers.d/rpz-rndc`:
 rpzuser ALL=(ALL) NOPASSWD: /usr/sbin/rndc reload *
 ```
 
-Then: `RNDC_BIN="sudo rndc" /usr/local/sbin/run-rpz.sh --reload-bind block.rpz -- ...`
+Then: `RNDC_BIN="sudo rndc" ./run-rpz.sh --reload-bind block.rpz -- ...`
 
 ## Running as a Non-Root User
 
