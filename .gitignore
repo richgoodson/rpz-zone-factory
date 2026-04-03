@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 block-combined.rpz.db
 .cache/
+.run-rpz.conf
+allow-audit.log

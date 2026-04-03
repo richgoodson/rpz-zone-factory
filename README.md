@@ -1,6 +1,59 @@
 # rpz-zone-factory
 
-A CLI pipeline that fetches threat intelligence from multiple sources and outputs either RFC 5782 RPZ zone files (for BIND/authoritative DNS servers) or Pi-hole flat blocklist format.
+Threat intelligence pipeline for DNS. Fetches from 5 public feeds, builds RFC 5782 RPZ zone files for BIND, and optionally outputs Pi-hole flat blocklists.
+
+## How It Works
+
+Two shell scripts handle all operations:
+
+- **`run-rpz.sh`** — the main orchestrator. Manages the Python venv, runs the pipeline, validates zones with `named-checkzone`, and reloads BIND. Run it from cron or interactively. One-time `--setup` wizard configures everything.
+- **`allow.sh`** — real-time allowlist management. Adds or removes domains from the RPZ allowlist zone via TSIG-authenticated `nsupdate`, with an append-only audit log.
+
+The Python engine (`rpz_factory/`) does the actual fetching, parsing, filtering, and zone rendering. The shell scripts call it — you don't need to invoke Python directly.
+
+See [README-runner.md](README-runner.md) for full `run-rpz.sh` and `allow.sh` documentation.
+
+## Quick Start
+
+```sh
+# Clone
+git clone https://github.com/richgoodson/rpz-zone-factory.git
+cd rpz-zone-factory
+
+# Run the setup wizard (creates venv, installs deps, configures output/reload/validation)
+./run-rpz.sh --setup
+
+# Test interactively
+./run-rpz.sh -i
+
+# Add to cron (the wizard generates the entry for you)
+crontab -e
+```
+
+### Cron examples
+
+```cron
+# Per-source RPZ zones for BIND, every 4 hours
+15 */4 * * * /opt/rpz-zone-factory/run-rpz.sh
+
+# Pi-hole flat file, daily at 3:05 AM
+5 3 * * * /opt/rpz-zone-factory/run-rpz.sh -- --output pihole --output-file /var/www/rpz/block.txt
+```
+
+### Dynamic allowlist
+
+```sh
+# Allow a domain through RPZ (immediate, TSIG-authenticated)
+./allow.sh example.com
+
+# Remove it
+./allow.sh -r example.com
+
+# View the audit log
+./allow.sh --audit
+```
+
+See `./allow.sh --setup` for TSIG key configuration.
 
 ## Sources
 
@@ -14,15 +67,13 @@ A CLI pipeline that fetches threat intelligence from multiple sources and output
 
 ## Requirements
 
-- Python 3.9+
-- `requests` library
-- `pyyaml` library (for CryptoScamDB YAML feed)
+- POSIX shell (`sh`), `cron`, `rndc`, `nsupdate` (for `allow.sh`)
+- Python 3.9+ (managed automatically by `run-rpz.sh`)
+- `requests` and `pyyaml` (installed into a venv by `run-rpz.sh --setup`)
 
-```bash
-pip install -r requirements.txt
-```
+## Python Engine Reference
 
-## Usage
+You don't normally invoke the Python CLI directly — `run-rpz.sh` handles it. These are here for reference and debugging.
 
 ### Generate RPZ zone file (default)
 
@@ -48,7 +99,7 @@ python run.py --sources urlhaus drop scamsniffer --output rpz
 python run.py --per-source --output-file /etc/namedb/master/rpz/ -v
 ```
 
-This creates separate zone files: `urlhaus.rpz.db`, `cisa-kev.rpz.db`, `spamhaus-drop.rpz.db`, `scamsniffer.rpz.db`, `cryptoscamdb.rpz.db`. BIND logs then show which threat list triggered each block.
+Creates separate zone files: `urlhaus.rpz.db`, `cisa-kev.rpz.db`, `spamhaus-drop.rpz.db`, `scamsniffer.rpz.db`, `cryptoscamdb.rpz.db`. BIND logs then show which threat list triggered each block.
 
 ### Per-source with allowlist
 
@@ -78,7 +129,13 @@ usage: rpz-zone-factory [-h] [--output {rpz,pihole}] [--zone-name ZONE_NAME]
   -v, --verbose             Increase verbosity (-v INFO, -vv DEBUG)
 ```
 
-## Source Caching
+## Features
+
+### Conditional HTTP
+
+All 5 feeds use `If-Modified-Since` / `ETag` headers. When upstream data hasn't changed, the pipeline skips the download and uses cached entries. Metadata is stored in `.cache/*.meta.json`.
+
+### Source Caching
 
 rpz-zone-factory maintains a per-source cache so that if a source is temporarily unavailable, its last-known-good data is preserved instead of being lost entirely.
 
@@ -100,7 +157,7 @@ Cache files are JSON with metadata for auditability:
 }
 ```
 
-## False Positive Filtering
+### False Positive Filtering
 
 The pipeline applies rule-based filtering to reduce false positives:
 
@@ -216,13 +273,7 @@ rndc reconfig
 rndc reload urlhaus.rpz
 ```
 
-For automated deployment, use `run-rpz.sh` (see [README-runner.md](README-runner.md)):
-
-```cron
-15 */4 * * * /opt/rpz-zone-factory/run-rpz.sh
-```
-
-`run-rpz.sh` handles venv management, per-zone `named-checkzone` validation, and `rndc reload` for each zone automatically. Run `./run-rpz.sh --setup` for interactive configuration.
+For automated deployment via cron, see the [Quick Start](#quick-start) above and [README-runner.md](README-runner.md) for full `run-rpz.sh` details.
 
 ## Pi-hole Configuration
 
@@ -253,18 +304,20 @@ To use the generated blocklist with Pi-hole:
 
 ```
 rpz-zone-factory/
+├── run-rpz.sh          # Main orchestrator (cron/interactive wrapper)
+├── allow.sh            # Dynamic allowlist management (TSIG + nsupdate)
+├── run.py              # Python CLI entrypoint
 ├── README.md
-├── README-runner.md
+├── README-runner.md    # Full run-rpz.sh and allow.sh documentation
 ├── requirements.txt
-├── run.py
-├── run-rpz.sh
+├── .run-rpz.conf       # Generated by --setup (not in repo)
 ├── rpz_factory/
 │   ├── __init__.py
-│   ├── cli.py          # argparse CLI entrypoint
-│   ├── cache.py        # per-source cache for stale-data preservation
-│   ├── fetcher.py      # HTTP fetch with retry/timeout per source
+│   ├── cli.py          # argparse CLI, conditional HTTP, summary output
+│   ├── cache.py        # Per-source cache + HTTP metadata persistence
+│   ├── fetcher.py      # HTTP fetch with retry/timeout, If-Modified-Since/ETag
 │   ├── filters.py      # False positive filtering logic
-│   ├── models.py       # Dataclasses: ThreatEntry, FetchResult, etc.
+│   ├── models.py       # Dataclasses: ThreatEntry, FetchResult, HttpMeta, etc.
 │   ├── parsers/
 │   │   ├── __init__.py
 │   │   ├── abusech.py       # Abuse.ch URLhaus RPZ feed parser
@@ -276,5 +329,6 @@ rpz-zone-factory/
 │       ├── __init__.py
 │       ├── rpz.py      # RFC 5782 zone file renderer
 │       └── pihole.py   # Flat domain list renderer
-└── .cache/             # per-source cached entries (auto-created)
+├── .cache/             # Per-source cached entries + HTTP metadata (auto-created)
+└── allow-audit.log     # Append-only audit log from allow.sh (auto-created)
 ```
