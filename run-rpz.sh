@@ -83,6 +83,7 @@ MODE="cron"       # "cron" or "interactive"
 DO_SETUP=0
 DO_RELOAD=0
 DO_FULL_REBUILD=0  # force full rebuild path even for incremental zones
+DO_FORCE=0         # bypass v0.7.0 "all sources unchanged" fast-path
 RELOAD_ZONE=""
 RPZ_ARGS=""
 EXIT_CODE=0
@@ -220,6 +221,9 @@ OPTIONS:
   --full-rebuild      Force full rebuild path (freeze/reload/thaw) for all
                       zones, bypassing the incremental IXFR update path.
                       Use for recovery or after BIND/zone config changes.
+  --force             Bypass the v0.7.0 fast-path that exits early when
+                      every upstream source returns 304 Not Modified.
+                      Use after manual zone edits or for debugging.
   --rpz-dir DIR       Override RPZ_DIR
   --python BIN        Override PYTHON_BIN
 
@@ -311,6 +315,10 @@ parse_args() {
                 ;;
             --full-rebuild)
                 DO_FULL_REBUILD=1
+                shift
+                ;;
+            --force)
+                DO_FORCE=1
                 shift
                 ;;
             --rpz-dir)
@@ -1379,6 +1387,12 @@ build_args_from_config() {
         2) RPZ_ARGS="$RPZ_ARGS -vv" ;;
     esac
 
+    # Pass --force through to rpz-zone-factory to bypass the v0.7.0
+    # all-sources-unchanged fast-path.
+    if [ $DO_FORCE -eq 1 ]; then
+        RPZ_ARGS="$RPZ_ARGS --force"
+    fi
+
     # Apply reload from config if not set via CLI
     # In per-source mode, skip single-zone reload (handled separately)
     if [ $DO_RELOAD -eq 0 ] && [ "$CONF_RELOAD" = "yes" ]; then
@@ -1818,6 +1832,14 @@ run_rpz() {
             done < "$_stderr_tmp"
         fi
         rm -f "$_stderr_tmp"
+    fi
+
+    # Exit code 2 from rpz-zone-factory means "no upstream changes; nothing
+    # rendered" (the v0.7.0 fast-path). Treat as a successful no-op and skip
+    # the entire post-processing pipeline (validation, IXFR, reload, seed).
+    if [ $EXIT_CODE -eq 2 ]; then
+        log_info "rpz-zone-factory: no upstream changes — skipping post-processing"
+        return 0
     fi
 
     if [ $EXIT_CODE -ne 0 ]; then

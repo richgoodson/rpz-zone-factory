@@ -16,6 +16,12 @@ from rpz_factory.parsers import abusech, cisa, cryptoscamdb, scamsniffer, spamha
 from rpz_factory.renderers import pihole, rpz
 from rpz_factory.renderers.rpz import compute_next_serial
 
+# Exit code 2 signals "no upstream changes; nothing rendered". Distinct
+# from 0 (success, output written) and 1 (error). run-rpz.sh treats this
+# as a successful no-op and skips post-processing (validation, IXFR,
+# reload, seeding).
+EXIT_NO_CHANGES = 2
+
 ALL_SOURCES = ["urlhaus", "cisa", "drop", "scamsniffer", "cryptoscamdb"]
 
 # Per-source RPZ zone names (used with --per-source)
@@ -76,6 +82,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--allowlist",
         default=None,
         help="Path to allowlist file (one domain per line). Generates rpz-allowlist.db in per-source mode.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Bypass the 'all sources unchanged (304)' fast-path and always "
+             "render. Useful after manual zone edits or for debugging.",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -225,6 +238,9 @@ def main(argv: list[str] | None = None) -> int:
     all_entries: list[ThreatEntry] = []
     errors: list[str] = []
     not_modified_sources: list[str] = []
+    # Track sources that hit an error (or exception) so the all-304
+    # fast-path doesn't fire when something genuinely went wrong upstream.
+    errored_sources: set[str] = set()
 
     for source_key in args.sources:
         fetcher = SOURCE_FETCHERS[source_key]
@@ -272,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
                         pass
             elif result.error:
                 errors.append(f"{source_key}: {result.error}")
+                errored_sources.add(source_key)
                 logger.warning("Source %s had error: %s", source_key, result.error)
                 # Try cache fallback on error
                 cached = load_cache(cache_dir, result.source)
@@ -312,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
                         )
         except Exception as exc:
             errors.append(f"{source_key}: {exc}")
+            errored_sources.add(source_key)
             logger.error("Source %s failed: %s", source_key, exc)
             # Try cache fallback on exception
             if source_enum_value:
@@ -336,26 +354,66 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  - {e}", file=sys.stderr)
         return 1
 
+    # ── All-sources-unchanged fast-path detection ─────────────────────────
+    # If every requested source returned 304, no source errored out, and
+    # there's an existing live zone we can leave in place, we can skip
+    # rendering entirely. --force bypasses this.
+    all_unchanged = (
+        not args.force
+        and len(args.sources) > 0
+        and all(s in not_modified_sources for s in args.sources)
+        and not errored_sources
+    )
+
     # ── Per-source mode ───────────────────────────────────────────────────
     if args.per_source:
-        return _run_per_source(args, all_entries, errors, logger, not_modified_sources)
+        return _run_per_source(
+            args,
+            all_entries,
+            errors,
+            logger,
+            not_modified_sources,
+            errored_sources,
+        )
 
     # ── Combined mode (original behavior) ─────────────────────────────────
+    # Compute live zone path early — we need it for both the all-unchanged
+    # fast-path check and the serial computation below.
+    _live_path = None
+    if args.output_file:
+        if args.output_file.endswith(".tmp"):
+            _live_path = args.output_file[:-4]
+        else:
+            _live_path = args.output_file
+
+    # All-unchanged fast-path: only valid for rpz output to a real file
+    # whose live zone already exists. Stdout / pihole / first-run cases
+    # fall through to normal render.
+    if (
+        all_unchanged
+        and args.output == "rpz"
+        and _live_path
+        and os.path.isfile(_live_path)
+        and os.path.getsize(_live_path) > 0
+    ):
+        logger.info(
+            "All %d sources returned 304; live zone %s exists — skipping render",
+            len(args.sources),
+            _live_path,
+        )
+        print(
+            f"\n--- rpz-zone-factory summary ---\n"
+            f"All {len(args.sources)} sources unchanged (304); no rendering needed",
+            file=sys.stderr,
+        )
+        return EXIT_NO_CHANGES
+
     # Filter (cross-source dedup)
     filtered = filter_entries(all_entries)
     logger.info("After filtering: %d entries", len(filtered))
 
     # Render
     if args.output == "rpz":
-        # Compute next serial based on the live zone file. In combined mode
-        # with checkzone/compilezone enabled, output_file ends in ".tmp" and
-        # the live file is at the same path without the suffix.
-        _live_path = None
-        if args.output_file:
-            if args.output_file.endswith(".tmp"):
-                _live_path = args.output_file[:-4]
-            else:
-                _live_path = args.output_file
         _serial = compute_next_serial(_live_path)
         logger.info("Combined mode: serial=%d zone=%s", _serial, args.zone_name)
         output_text = rpz.render(filtered, zone_name=args.zone_name, serial=_serial)
@@ -392,12 +450,21 @@ def _run_per_source(
     errors: list[str],
     logger: logging.Logger,
     not_modified_sources: list[str] | None = None,
+    errored_sources: set[str] | None = None,
 ) -> int:
-    """Per-source mode: group entries by source, filter each independently, write separate zone files."""
+    """Per-source mode: group entries by source, filter each independently, write separate zone files.
+
+    Per-zone fast-path: if a source returned 304 and didn't error out,
+    skip rendering that zone entirely. The shell side iterates `*.db`
+    files in the staging directory, so an absent file means "no work" —
+    no validation, no IXFR, no seed, no reload. --force bypasses this.
+    """
     from collections import defaultdict
 
     if not_modified_sources is None:
         not_modified_sources = []
+    if errored_sources is None:
+        errored_sources = set()
 
     # Group entries by source key
     entries_by_source: dict[str, list[ThreatEntry]] = defaultdict(list)
@@ -416,8 +483,29 @@ def _run_per_source(
 
     total_filtered = 0
     per_source_counts: dict[str, int] = {}
+    skipped_sources: list[str] = []
+    rendered_zone_count = 0
 
     for source_key in args.sources:
+        zone_name = SOURCE_ZONE_NAMES.get(source_key, source_key)
+
+        # Per-zone fast-path: 304 + no error + live zone exists → skip render.
+        if (
+            not args.force
+            and source_key in not_modified_sources
+            and source_key not in errored_sources
+        ):
+            _live_path = _resolve_live_zone_path(output_dir, f"{zone_name}.db")
+            if os.path.isfile(_live_path) and os.path.getsize(_live_path) > 0:
+                logger.info(
+                    "Source %s: 304 unchanged and live %s exists — skipping render",
+                    source_key,
+                    _live_path,
+                )
+                skipped_sources.append(source_key)
+                per_source_counts[source_key] = -1  # sentinel: skipped
+                continue
+
         source_entries = entries_by_source.get(source_key, [])
         if not source_entries:
             logger.info("Source %s: no entries, skipping zone file", source_key)
@@ -432,8 +520,6 @@ def _run_per_source(
         if not filtered:
             logger.info("Source %s: all entries filtered out", source_key)
             continue
-
-        zone_name = SOURCE_ZONE_NAMES[source_key]
         # Compute next serial from the live zone file. In per-source mode with
         # checkzone enabled, output_dir is <real>/.tmp and the live file is at
         # <real>/<zone>.db. Otherwise output_dir IS <real> and the same-name
@@ -448,47 +534,96 @@ def _run_per_source(
         with open(zone_file, "w", encoding="utf-8") as f:
             f.write(output_text)
         logger.info("Source %s: %d entries → %s", source_key, len(filtered), zone_file)
+        rendered_zone_count += 1
 
-    # Write allowlist zone if provided
+    # Write allowlist zone if provided.
+    #
+    # Allowlist fast-path: the source is a local text file, not HTTP, so
+    # there's no 304 to leverage. Instead compare mtimes — if the .txt
+    # hasn't been touched since the live .db was last written, the zone
+    # is already in sync (allow.sh nsupdates touch the .db on every
+    # change, and run-rpz.sh seeds the .db after a render). --force
+    # bypasses this.
+    allowlist_skipped = False
+    allowlist_domains: list[str] | None = None
     if args.allowlist:
         if not os.path.isfile(args.allowlist):
             print(f"ERROR: Allowlist file not found: {args.allowlist}", file=sys.stderr)
             return 1
 
-        allowlist_domains = _parse_allowlist_file(args.allowlist)
-        if allowlist_domains:
-            _live_allowlist = _resolve_live_zone_path(output_dir, "allowlist.rpz.db")
-            _allow_serial = compute_next_serial(_live_allowlist)
-            logger.info("Allowlist: serial=%d", _allow_serial)
-            allowlist_text = _render_allowlist_zone(allowlist_domains, serial=_allow_serial)
-            allowlist_file = os.path.join(output_dir, "allowlist.rpz.db")
-            with open(allowlist_file, "w", encoding="utf-8") as f:
-                f.write(allowlist_text)
-            logger.info("Allowlist: %d domains → %s", len(allowlist_domains), allowlist_file)
+        _live_allowlist = _resolve_live_zone_path(output_dir, "allowlist.rpz.db")
+        if (
+            not args.force
+            and os.path.isfile(_live_allowlist)
+            and os.path.getsize(_live_allowlist) > 0
+            and os.path.getmtime(args.allowlist) <= os.path.getmtime(_live_allowlist)
+        ):
+            logger.info(
+                "Allowlist: %s unchanged since live %s — skipping render",
+                args.allowlist,
+                _live_allowlist,
+            )
+            allowlist_skipped = True
         else:
-            logger.warning("Allowlist file is empty or contains no valid entries: %s", args.allowlist)
+            allowlist_domains = _parse_allowlist_file(args.allowlist)
+            if allowlist_domains:
+                _allow_serial = compute_next_serial(_live_allowlist)
+                logger.info("Allowlist: serial=%d", _allow_serial)
+                allowlist_text = _render_allowlist_zone(allowlist_domains, serial=_allow_serial)
+                allowlist_file = os.path.join(output_dir, "allowlist.rpz.db")
+                with open(allowlist_file, "w", encoding="utf-8") as f:
+                    f.write(allowlist_text)
+                logger.info("Allowlist: %d domains → %s", len(allowlist_domains), allowlist_file)
+                rendered_zone_count += 1
+            else:
+                logger.warning("Allowlist file is empty or contains no valid entries: %s", args.allowlist)
 
     # Summary to stderr
     print(f"\n--- rpz-zone-factory summary (per-source mode) ---", file=sys.stderr)
     print(f"Sources fetched: {len(args.sources)}", file=sys.stderr)
     if not_modified_sources:
         print(f"Not modified (304): {', '.join(not_modified_sources)}", file=sys.stderr)
+    if skipped_sources:
+        print(f"Skipped (304 + live exists): {', '.join(skipped_sources)}", file=sys.stderr)
     print(f"Total raw entries: {len(all_entries)}", file=sys.stderr)
     print(f"Total after filtering: {total_filtered}", file=sys.stderr)
     print(f"Per-source entry counts:", file=sys.stderr)
     for source_key in args.sources:
         count = per_source_counts.get(source_key, 0)
         zone_name = SOURCE_ZONE_NAMES.get(source_key, source_key)
-        tag = " (cached/304)" if source_key in not_modified_sources else ""
-        print(f"  {zone_name}: {count}{tag}", file=sys.stderr)
+        if source_key in skipped_sources:
+            tag = " (skipped)"
+            count_str = "—"
+        elif source_key in not_modified_sources:
+            tag = " (cached/304)"
+            count_str = str(count)
+        else:
+            tag = ""
+            count_str = str(count)
+        print(f"  {zone_name}: {count_str}{tag}", file=sys.stderr)
     if args.allowlist:
-        _al_count = len(allowlist_domains) if 'allowlist_domains' in locals() else 0
-        print(f"  allowlist.rpz: {_al_count}", file=sys.stderr)
+        if allowlist_skipped:
+            print(f"  allowlist.rpz: — (skipped)", file=sys.stderr)
+        else:
+            _al_count = len(allowlist_domains) if allowlist_domains else 0
+            print(f"  allowlist.rpz: {_al_count}", file=sys.stderr)
     if errors:
         print(f"Source errors ({len(errors)}):", file=sys.stderr)
         for e in errors:
             print(f"  - {e}", file=sys.stderr)
     print(f"Output directory: {args.output_file}", file=sys.stderr)
+
+    # If nothing was rendered at all (every source skipped + allowlist
+    # skipped or absent), signal EXIT_NO_CHANGES so the shell skips its
+    # entire post-processing pipeline. If even one zone was rendered, we
+    # return 0 and let the shell process whatever .db files exist.
+    if rendered_zone_count == 0 and (skipped_sources or allowlist_skipped):
+        logger.info(
+            "All %d sources unchanged; no zones rendered — exiting with code %d",
+            len(skipped_sources) + (1 if allowlist_skipped else 0),
+            EXIT_NO_CHANGES,
+        )
+        return EXIT_NO_CHANGES
 
     return 0
 
