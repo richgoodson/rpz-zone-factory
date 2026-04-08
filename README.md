@@ -281,8 +281,9 @@ If you prefer a single combined zone:
 zone "block.rpz" {
     type primary;
     file "/etc/namedb/master/block.rpz.db";
-    allow-query { localhost; };
-    allow-transfer { none; };
+    allow-query { localhost; slaves; };
+    allow-transfer { slaves; };
+    also-notify { /* slave IPs */ };
 };
 
 options {
@@ -291,6 +292,8 @@ options {
     };
 };
 ```
+
+> **Combined mode is AXFR-only.** Unlike per-source mode, combined mode rewrites the entire zone file every run instead of using `nsupdate`. There's no journal for slaves to pull deltas from, so every refresh transfers the whole zone. `allow-update` is therefore not needed (and not useful) on the combined zone. If you want IXFR support, switch to per-source mode.
 
 ### Deployment
 

@@ -1197,13 +1197,18 @@ CONF
                 printf "  include \"%s\";\n\n" "$CONF_TSIG_KEY_FILE"
             fi
 
-            # Show each source zone
+            # Show each source zone. If TSIG is configured AND the zone is
+            # in CONF_INCREMENTAL_ZONES, include allow-update so run-rpz.sh
+            # can deliver IXFR-style incremental updates via nsupdate.
             for _src_zone in urlhaus.rpz cisa-kev.rpz spamhaus-drop.rpz scamsniffer.rpz cryptoscamdb.rpz; do
                 printf "  zone \"%s\" {\n" "$_src_zone"
                 printf "      type primary;\n"
                 printf "      file \"%s/%s.db\";\n" "$_ex_dir" "$_src_zone"
                 if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
                     printf "      masterfile-format raw;\n"
+                fi
+                if [ -n "$CONF_TSIG_KEY_FILE" ] && is_incremental_zone "$_src_zone"; then
+                    printf "      allow-update { key \"%s\"; };  // v0.6.0+ incremental updates\n" "$_tsig_keyname"
                 fi
                 printf "      allow-query { localhost; };\n"
                 printf "      allow-transfer { none; };\n"
