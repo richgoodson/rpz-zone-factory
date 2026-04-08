@@ -19,7 +19,7 @@ cd /opt/rpz-zone-factory
 crontab -e
 ```
 
-The `--setup` wizard walks through output format, per-source mode, zone names, BIND reload, `named-checkzone` validation, and optionally `named-compilezone`. All choices are saved to `.run-rpz.conf` so subsequent runs (including cron) need zero arguments.
+The `--setup` wizard walks through output format, per-source mode, zone names, BIND reload, `named-checkzone` validation, optionally `named-compilezone`, and (v0.6.0+) TSIG key configuration, the feeds directory, and which zones should use the incremental IXFR update path. All choices are saved to `.run-rpz.conf` so subsequent runs (including cron) need zero arguments.
 
 ## Cron Examples
 
@@ -55,8 +55,10 @@ After running `--setup`, the script reads `.run-rpz.conf` automatically — no C
 | `-h`, `--help` | Show usage and exit |
 | `-i`, `--interactive` | Force interactive mode |
 | `-c`, `--cron` | Force cron mode |
-| `--setup` | Interactive setup wizard: configure output, sources, BIND reload, zone validation/compilation, and generate cron entries |
-| `--reload-bind ZONE` | After successful run, call `rndc reload ZONE` |
+| `--setup` | Interactive setup wizard: configure output, sources, BIND reload, zone validation/compilation, TSIG keys, incremental zones, and generate cron entries |
+| `--reload-bind ZONE` | (Combined mode only.) After a successful run, call `rndc reload ZONE`. In per-source mode, run-rpz.sh handles per-zone reload/thaw internally and this flag is unused. |
+| `--full-rebuild` | Force the full rebuild path (per-zone freeze → file replace → thaw) for every zone, bypassing the incremental IXFR path. Use for recovery, after BIND/zone config changes, or to force a clean re-seed of `.list.previous` snapshots. (v0.6.0+) |
+| `--force` | Bypass the v0.7.0 fast-path that exits early when every upstream source returns 304 Not Modified. Use after manual zone edits or for debugging. (v0.7.0+) |
 | `--rpz-dir DIR` | Override RPZ_DIR (can also set via environment) |
 | `--python BIN` | Override Python binary (default: `python3.11`) |
 | `-- ARGS...` | Everything after `--` is passed to rpz-zone-factory |
@@ -86,12 +88,71 @@ The `--setup` wizard saves all choices to `.run-rpz.conf` in the project directo
 | `CONF_COMPILE_ZONE` | `yes` or `no` — compile to binary (raw) format |
 | `CONF_SOURCES` | Space-separated source list, or `all` |
 | `CONF_VERBOSITY` | `0` (quiet), `1` (`-v`), `2` (`-vv`) |
-| `CONF_TSIG_KEY_FILE` | Path to TSIG key file (for `allow.sh`) |
+| `CONF_TSIG_KEY_FILE` | Path to TSIG key file (shared by `allow.sh` and the v0.6.0 incremental update path) |
 | `CONF_ALLOW_SERVER` | Server for nsupdate (default: `localhost`) |
 | `CONF_ALLOW_ZONE` | Allowlist zone name (default: `allowlist.rpz`) |
 | `CONF_AUDIT_LOG` | Path to audit log file (default: `allow-audit.log` next to allowlist) |
+| `CONF_FEEDS_DIR` | (v0.6.0+) Directory holding `.list.previous` baseline snapshots for the incremental update path. Default: `<output>/feeds`. The allowlist `.txt` source file lives here too. |
+| `CONF_INCREMENTAL_ZONES` | (v0.6.0+) Space-separated list of zones that should use the IXFR-based incremental update path. Zones not listed here go through the full rebuild path. Empty = no zones use incremental updates. |
 
 Edit `.run-rpz.conf` directly or re-run `--setup` to reconfigure.
+
+## Incremental Updates (IXFR) — v0.6.0+
+
+Per-source zones listed in `CONF_INCREMENTAL_ZONES` are updated by **diffing the previously-fetched feed against the freshly generated zone** and sending only the additions/deletions via TSIG-authenticated `nsupdate`. BIND writes the delta to the zone's journal, bumps the SOA serial, and slaves receive **NOTIFY → IXFR** instead of re-AXFR'ing the whole zone — turning megabyte transfers into hundred-byte deltas.
+
+### How a zone goes from cold to incremental
+
+1. **First run for a zone:** no `.list.previous` baseline exists yet, so the zone takes the full rebuild path (per-zone freeze → file replace → thaw). After the rebuild, run-rpz.sh extracts the domain list from the freshly rendered `.db` and writes it to `<feeds>/<zone>.list.previous`. This is the **seed**.
+2. **Subsequent runs:** the script diffs the new feed against `.list.previous`. If `adds=0 dels=0`, nothing happens (no nsupdate, no journal entry, no slave traffic). If there are real diffs, a single `nsupdate` transaction adds and removes only the changed records, BIND auto-bumps the serial and writes a journal entry, and slaves pick up the delta via IXFR.
+3. **`.list.previous` is refreshed** after each successful incremental run so the next diff is computed against the current state.
+
+### Falling back to full rebuild
+
+A zone configured for incremental updates will silently drop back to the full rebuild path if any of the following are true:
+
+- The zone has no `.list.previous` snapshot (first-ever run, or `--full-rebuild` was used)
+- TSIG is not configured (`CONF_TSIG_KEY_FILE` missing or unreadable)
+- `nsupdate` itself fails for any reason
+- You explicitly pass `--full-rebuild`
+
+A full rebuild always re-seeds `.list.previous` afterward, so a zone can flip back to incremental on the next run.
+
+### BIND configuration requirements
+
+**Every zone in `CONF_INCREMENTAL_ZONES` must have `allow-update { key "rpz-update"; };` in its `named.conf` definition** — including the per-source threat zones, not just the allowlist. Without this, `nsupdate` will be REFUSED and the zone falls back to full rebuild on every run. See the BIND configuration example in [README.md](README.md#bind-configuration).
+
+### Per-zone freeze/thaw (full rebuild path)
+
+When a zone IS in the full rebuild bucket (seed run, fallback, or `--full-rebuild`), run-rpz.sh handles it via **per-zone** `rndc freeze <zone>` → atomic file replace → `rndc thaw <zone>`, not a global freeze/thaw. This is required for dynamic zones (zones with `allow-update`) because:
+
+- `rndc reload <zone>` flatly fails on dynamic zones with `'reload' failed: dynamic zone`
+- A global `rndc thaw` is asynchronous and races against the freshly-replaced file, producing `zone serial has gone backwards` warnings
+- Per-zone `rndc thaw <zone>` re-reads the file synchronously, eliminating the race
+
+Static (non-dynamic) zones in the full bucket use plain `rndc reload <zone>` instead.
+
+### Verifying IXFR is working
+
+On a slave, look for transfer log entries with a small record count:
+
+```
+zone urlhaus.rpz/IN: Transfer started.
+transfer of 'urlhaus.rpz/IN' from <master>#53: Transfer completed: 1 messages, 6 records, 229 bytes (serial 2026040827)
+```
+
+`6 records` is the IXFR delta for a single domain add (old SOA, new SOA, two CNAMEs for `domain` and `*.domain`). If you instead see hundreds or thousands of records for what should have been a small change, the slave is doing AXFR — check that the master has `allow-update` on the zone and that `nsupdate` is succeeding.
+
+## Fast-path: skip when nothing changed — v0.7.0+
+
+When every requested source returns `304 Not Modified`, run-rpz.sh exits in roughly the time it takes to make the conditional HTTP requests (~5s for 5 sources) instead of running the full pipeline (~30s in steady state). The fast-path applies in both per-source mode (per-zone — only zones whose source returned 304 are skipped) and combined mode (whole-zone — only triggers if every source is 304).
+
+- **Per-source mode:** any zone whose source returned 304 with no error and whose live `.db` exists is skipped entirely (no parse, no filter, no render, no diff, no IXFR, no seed, no reload). Zones with new content render normally on the same run.
+- **Combined mode:** if every source returned 304 and the live combined zone exists, run-rpz.sh exits with code 2 and the entire post-processing pipeline is skipped.
+- **Allowlist:** the allowlist source is a local text file, not HTTP, so the fast-path uses an mtime check instead. If `allowlist.txt` hasn't been modified since the live `allowlist.rpz.db` was last written, the allowlist render is skipped.
+- **`--force`** bypasses all of this and forces a full pipeline run. Use after manual zone edits or for debugging.
+
+The fast-path is safe: 304 means upstream content is unchanged, the cached `.previous` snapshot still matches, and BIND's in-memory state is already correct. There's nothing to do.
 
 ## BIND Reload Permissions
 
@@ -265,7 +326,7 @@ which named-checkzone && ls -la $(which named-checkzone)
 
 - TSIG key configured for the allowlist zone (see `./allow.sh --setup` for full walkthrough)
 - `nsupdate` and `rndc` available in PATH
-- BIND zone configured with `allow-update { key "rpz-update"; };`
+- The allowlist zone (and, in v0.6.0+, every zone in `CONF_INCREMENTAL_ZONES`) configured with `allow-update { key "rpz-update"; };`
 
 ### Configuration
 
@@ -286,7 +347,7 @@ All settings can be overridden with flags. Run `./allow.sh -h` for the full flag
 1. Validates the domain name
 2. Appends/removes the domain in the allowlist text file (race condition safe — file is updated before the dynamic update)
 3. Sends `nsupdate` with TSIG key to add/remove RPZ passthru records
-4. Runs `rndc sync -clean <zone>` to flush the journal and remove the `.jnl` file
+4. Runs `rndc sync <zone>` to flush in-memory state to the `.db` file. **The journal (`.jnl`) is preserved** so slaves can pull the change via IXFR instead of re-AXFR'ing the whole zone. (Pre-v0.6.0 this used `rndc sync -clean`, which removed the journal — that was a v0.4.x-era behavior carried over from when run-rpz.sh always wrote full zone files. Fixed in v0.7.0.)
 5. Writes an entry to the audit log (success or failure)
 
 ### Audit log

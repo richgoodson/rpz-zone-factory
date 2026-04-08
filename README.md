@@ -2,16 +2,18 @@
 
 Threat intelligence pipeline for DNS. Fetches from 5 public feeds, builds RFC 5782 RPZ zone files for BIND, and optionally outputs Pi-hole flat blocklists.
 
+Per-source zones support **incremental updates via TSIG-authenticated `nsupdate`** so slaves receive **NOTIFY → IXFR** with only the changed records, instead of re-AXFR'ing the whole zone on every refresh. Steady-state runs (no upstream changes) exit in seconds via a 304-aware fast-path.
+
 ## How It Works
 
 Two shell scripts handle all operations:
 
-- **`run-rpz.sh`** — the main orchestrator. Manages the Python venv, runs the pipeline, validates zones with `named-checkzone`, and reloads BIND. Run it from cron or interactively. One-time `--setup` wizard configures everything.
-- **`allow.sh`** — real-time allowlist management. Adds or removes domains from the RPZ allowlist zone via TSIG-authenticated `nsupdate`, with an append-only audit log.
+- **`run-rpz.sh`** — the main orchestrator. Manages the Python venv, runs the pipeline, validates zones with `named-checkzone`, applies incremental updates via `nsupdate`, falls back to per-zone freeze/replace/thaw on full rebuilds, and (when nothing has changed) skips the entire pipeline via the v0.7.0 fast-path. Run it from cron or interactively. One-time `--setup` wizard configures everything.
+- **`allow.sh`** — real-time allowlist management. Adds or removes domains from the RPZ allowlist zone via TSIG-authenticated `nsupdate`, with an append-only audit log. Preserves the journal so slaves see the change as an IXFR delta.
 
 The Python engine (`rpz_factory/`) does the actual fetching, parsing, filtering, and zone rendering. The shell scripts call it — you don't need to invoke Python directly.
 
-See [README-runner.md](README-runner.md) for full `run-rpz.sh` and `allow.sh` documentation.
+See [README-runner.md](README-runner.md) for full `run-rpz.sh` and `allow.sh` documentation, and [ARCHITECTURE.md](ARCHITECTURE.md) for the developer reference.
 
 ## Quick Start
 
@@ -39,6 +41,8 @@ crontab -e
 # Pi-hole flat file, daily at 3:05 AM
 5 3 * * * /opt/rpz-zone-factory/run-rpz.sh -- --output pihole --output-file /var/www/rpz/block.txt
 ```
+
+> With the v0.7.0 fast-path, runs that find no upstream changes complete in roughly the time it takes to make 5 conditional GETs (~5s) instead of running the full pipeline. Hourly cron schedules are reasonable if your upstream feeds publish frequently.
 
 ### Dynamic allowlist
 
@@ -113,29 +117,42 @@ The allowlist is a plain text file (one domain per line, `#` comments). It gener
 
 ### All options
 
-```
-usage: rpz-zone-factory [-h] [--output {rpz,pihole}] [--zone-name ZONE_NAME]
-                        [--output-file OUTPUT_FILE]
-                        [--sources {urlhaus,cisa,drop,scamsniffer,cryptoscamdb} ...]
-                        [--cache-dir CACHE_DIR] [--per-source]
-                        [--allowlist ALLOWLIST]
-                        [-v]
+Run `python run.py --help` for the canonical list. Current flags:
 
-  --output {rpz,pihole}     Output format (default: rpz)
-  --zone-name ZONE_NAME     RPZ zone name for combined mode (default: rpz.local)
-  --output-file OUTPUT_FILE Output file (combined) or directory (per-source)
-  --sources                 Sources to fetch (default: all 5)
-  --cache-dir CACHE_DIR     Cache directory for stale-data preservation
-  --per-source              Output one zone file per source (RPZ only)
-  --allowlist ALLOWLIST      Path to allowlist file (generates allowlist.rpz zone)
-  -v, --verbose             Increase verbosity (-v INFO, -vv DEBUG)
-```
+| Flag | Description |
+|------|-------------|
+| `--output {rpz,pihole}` | Output format (default: `rpz`) |
+| `--zone-name NAME` | RPZ zone name for combined mode (default: `rpz.local`) |
+| `--output-file PATH` | Output file (combined mode) or directory (per-source mode) |
+| `--sources …` | Subset of sources to fetch (default: all 5) |
+| `--cache-dir DIR` | Cache directory for stale-data preservation (default: `<project>/.cache`) |
+| `--per-source` | Output one zone file per source (RPZ only) |
+| `--allowlist PATH` | Allowlist text file → generates `allowlist.rpz.db` (per-source mode) |
+| `--force` | Bypass the v0.7.0 304-aware fast-path and always render |
+| `-v`, `--verbose` | Increase verbosity (`-v` INFO, `-vv` DEBUG) |
+| `--version` | Print version and exit |
+
+**Exit codes:** `0` = success and output written, `1` = error, `2` = success but no output written (all sources returned 304 — the v0.7.0 fast-path). `run-rpz.sh` treats exit code 2 as a successful no-op and skips its post-processing pipeline.
 
 ## Features
 
-### Conditional HTTP
+### Conditional HTTP + 304 fast-path (v0.7.0+)
 
-All 5 feeds use `If-Modified-Since` / `ETag` headers. When upstream data hasn't changed, the pipeline skips the download and uses cached entries. Metadata is stored in `.cache/*.meta.json`.
+All 5 feeds use `If-Modified-Since` / `ETag` headers. When upstream data hasn't changed, the server returns `304 Not Modified` and the pipeline:
+
+- **In per-source mode:** skips the entire render pipeline (parse, filter, dedup, render, diff, IXFR, seed, reload) for any zone whose source returned 304 with no error and whose live `.db` already exists. Zones with new content still render normally on the same run.
+- **In combined mode:** if every source returned 304, exits with code 2 and run-rpz.sh skips its entire post-processing pipeline.
+- **Allowlist:** uses an mtime check (no HTTP source). If `allowlist.txt` hasn't been modified since the live `allowlist.rpz.db` was written, the allowlist render is skipped.
+
+In a steady state where nothing upstream has changed, the run completes in roughly the time it takes to make 5 conditional GETs (~5s) instead of the full pipeline (~30s). HTTP metadata is stored in `.cache/*.meta.json`. Pass `--force` to bypass the fast-path.
+
+### Incremental updates / IXFR (v0.6.0+)
+
+Per-source zones listed in `CONF_INCREMENTAL_ZONES` are updated by **diffing the previously-fetched feed against the freshly generated zone** and sending only the additions/deletions via TSIG-authenticated `nsupdate`. BIND writes the delta to the zone's journal, bumps the SOA serial, and slaves receive **NOTIFY → IXFR** instead of re-AXFR'ing the whole zone.
+
+For a typical day where upstream feeds add/remove a handful of domains, this turns megabyte-sized AXFRs into hundred-byte IXFR deltas. A single domain add transfers as 6 records (~230 bytes) instead of the full zone (~5000+ records / ~150KB for `urlhaus.rpz`).
+
+See [README-runner.md § Incremental Updates](README-runner.md#incremental-updates-ixfr--v060) for the full per-zone state machine, fallback rules, and BIND configuration requirements.
 
 ### Source Caching
 
@@ -173,55 +190,69 @@ The pipeline applies rule-based filtering to reduce false positives:
 
 ### Per-source mode (recommended)
 
-Define each zone in `named.conf`:
+Define each zone in `named.conf`. **Every zone you want updated incrementally needs `allow-update { key "rpz-update"; };`** so that `nsupdate` (run-rpz.sh's incremental path, and `allow.sh`) can deliver TSIG-authenticated dynamic updates. Without `allow-update`, `nsupdate` will be REFUSED and the zone silently falls back to a full rebuild on every run, forcing slaves to AXFR.
+
+Adjust `allow-transfer` to permit your slave nameservers (shown here as a placeholder ACL `slaves`) and add `also-notify` so they're notified of changes.
 
 ```bind
 // Allowlist zone — evaluated first, passthru overrides blocks
-// allow-update is required for allow.sh (TSIG-authenticated dynamic updates)
 zone "allowlist.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/allowlist.rpz.db";
     allow-update { key "rpz-update"; };
-    allow-query { localhost; };
-    allow-transfer { none; };
+    allow-query { localhost; slaves; };
+    allow-transfer { slaves; };
+    also-notify { /* slave IPs */ };
 };
 
-// Threat source zones
+// Threat source zones — all need allow-update for v0.6.0 incremental updates
 zone "urlhaus.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/urlhaus.rpz.db";
-    allow-query { localhost; };
-    allow-transfer { none; };
+    allow-update { key "rpz-update"; };
+    allow-query { localhost; slaves; };
+    allow-transfer { slaves; };
+    also-notify { /* slave IPs */ };
 };
 
 zone "cisa-kev.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/cisa-kev.rpz.db";
-    allow-query { localhost; };
-    allow-transfer { none; };
+    allow-update { key "rpz-update"; };
+    allow-query { localhost; slaves; };
+    allow-transfer { slaves; };
+    also-notify { /* slave IPs */ };
 };
 
 zone "spamhaus-drop.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/spamhaus-drop.rpz.db";
-    allow-query { localhost; };
-    allow-transfer { none; };
+    allow-update { key "rpz-update"; };
+    allow-query { localhost; slaves; };
+    allow-transfer { slaves; };
+    also-notify { /* slave IPs */ };
 };
 
 zone "scamsniffer.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/scamsniffer.rpz.db";
-    allow-query { localhost; };
-    allow-transfer { none; };
+    allow-update { key "rpz-update"; };
+    allow-query { localhost; slaves; };
+    allow-transfer { slaves; };
+    also-notify { /* slave IPs */ };
 };
 
 zone "cryptoscamdb.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/cryptoscamdb.rpz.db";
-    allow-query { localhost; };
-    allow-transfer { none; };
+    allow-update { key "rpz-update"; };
+    allow-query { localhost; slaves; };
+    allow-transfer { slaves; };
+    also-notify { /* slave IPs */ };
 };
 ```
+
+The TSIG key referenced by `allow-update` must be defined elsewhere in `named.conf` (typically via `include "/etc/bind/tsig/rpz-update.key";` at the top level). See `./allow.sh --setup` for the full key generation walkthrough.
 
 Enable the response policy (inside `options {}`):
 
@@ -327,13 +358,15 @@ rpz-zone-factory/
 ├── run-rpz.sh          # Main orchestrator (cron/interactive wrapper)
 ├── allow.sh            # Dynamic allowlist management (TSIG + nsupdate)
 ├── run.py              # Python CLI entrypoint
+├── Makefile            # `make deploy` → rsync to remote BIND host
 ├── README.md
 ├── README-runner.md    # Full run-rpz.sh and allow.sh documentation
+├── ARCHITECTURE.md     # Developer reference (per-zone state machine, IXFR design)
 ├── requirements.txt
 ├── .run-rpz.conf       # Generated by --setup (not in repo)
 ├── rpz_factory/
-│   ├── __init__.py
-│   ├── cli.py          # argparse CLI, conditional HTTP, summary output
+│   ├── __init__.py     # __version__
+│   ├── cli.py          # argparse CLI, conditional HTTP, fast-path, summary output
 │   ├── cache.py        # Per-source cache + HTTP metadata persistence
 │   ├── fetcher.py      # HTTP fetch with retry/timeout, If-Modified-Since/ETag
 │   ├── filters.py      # False positive filtering logic
@@ -347,9 +380,12 @@ rpz-zone-factory/
 │   │   └── spamhaus.py      # Spamhaus DROP parser
 │   └── renderers/
 │       ├── __init__.py
-│       ├── rpz.py      # RFC 5782 zone file renderer
+│       ├── rpz.py      # RFC 5782 zone file renderer + monotonic serial
 │       └── pihole.py   # Flat domain list renderer
-└── .cache/             # Per-source cached entries + HTTP metadata (auto-created)
+├── scripts/            # Legacy reference scripts (unused, kept for context)
+├── .cache/             # Per-source cached entries + HTTP metadata (auto-created)
+└── feeds/              # `.list.previous` baseline snapshots for incremental
+                        #   diffs (auto-created next to the zone output dir)
 ```
 
 `allow.sh` also creates `allow-audit.log` in the zone output directory (next to `allowlist.txt`), not in the project directory. See [README-runner.md](README-runner.md#audit-log) for details.

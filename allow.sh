@@ -176,7 +176,8 @@ HOW IT WORKS:
   1. Validates the domain name
   2. Appends/removes the domain in the allowlist text file (persistent store)
   3. Sends nsupdate with TSIG key to add/remove RPZ passthru records
-  4. Runs 'rndc sync -clean <zone>' to flush the journal and remove the .jnl file
+  4. Runs 'rndc sync <zone>' to flush in-memory state to the .db file,
+     PRESERVING the journal so slaves can pull the change via IXFR
 
   The allowlist text file is modified BEFORE the dynamic update to avoid a
   race condition where a scheduled rpz-zone-factory run could overwrite the
@@ -261,8 +262,14 @@ signed dynamic updates on the allowlist zone, and verifying the setup.
       allow-transfer { none; };
   };
 
-  Only the allowlist zone needs allow-update. The threat source zones
-  (urlhaus.rpz, scamsniffer.rpz, etc.) should NOT accept dynamic updates.
+  NOTE: As of v0.6.0, every zone listed in CONF_INCREMENTAL_ZONES also
+  needs 'allow-update { key "rpz-update"; };' so that run-rpz.sh can
+  apply incremental diffs via TSIG-authenticated nsupdate. Add the same
+  allow-update line to each per-source threat zone you want to update
+  incrementally (urlhaus.rpz, cisa-kev.rpz, spamhaus-drop.rpz,
+  scamsniffer.rpz, cryptoscamdb.rpz). Without this, the incremental
+  path silently falls back to a full rebuild for that zone and slaves
+  pull a full AXFR instead of an IXFR delta.
 
 ─── 6. Reload BIND ────────────────────────────────────────────────────
 
@@ -504,7 +511,7 @@ preflight() {
         done
     fi
     if [ $_rndc_found -eq 0 ]; then
-        printf "ERROR: rndc not found. Required for 'rndc sync -clean'.\n" >&2
+        printf "ERROR: rndc not found. Required for 'rndc sync'.\n" >&2
         printf "  Install BIND utilities or set RNDC_BIN.\n" >&2
         _errors=$(( _errors + 1 ))
     fi
@@ -673,22 +680,30 @@ audit_show() {
 
 # ─── rndc sync ────────────────────────────────────────────────────────────────
 
-rndc_sync_clean() {
+# Flush BIND's in-memory state for the zone to its .db file but PRESERVE the
+# journal (.jnl). This is critical for IXFR: slaves use the journal to pull
+# only the delta we just nsupdate'd, instead of re-AXFR'ing the whole zone.
+#
+# Pre-v0.6.0 this function used `rndc sync -clean` (which deletes the .jnl
+# after writing), but that was a v0.4.0-era behavior from when run-rpz.sh
+# always wrote full zone files. With v0.6.0+ IXFR support, removing the
+# journal after every nsupdate would force every slave refresh to AXFR.
+rndc_sync() {
     _zone="$1"
 
-    printf "  Syncing zone and removing journal: %s\n" "$_zone"
+    printf "  Syncing zone (preserving journal for IXFR): %s\n" "$_zone"
     # RNDC_BIN may contain "sudo rndc", so don't quote as single token
-    _output=$(eval "$RNDC_BIN sync -clean $_zone" 2>&1)
+    _output=$(eval "$RNDC_BIN sync $_zone" 2>&1)
     _rc=$?
 
     if [ $_rc -ne 0 ]; then
-        printf "WARNING: rndc sync -clean failed (exit %d): %s\n" "$_rc" "$_output" >&2
-        printf "  The dynamic update was applied but the journal was not cleaned.\n" >&2
+        printf "WARNING: rndc sync failed (exit %d): %s\n" "$_rc" "$_output" >&2
+        printf "  The dynamic update was applied but the journal was not flushed to disk.\n" >&2
         printf "  This is not critical — BIND will resolve the journal on next reload.\n" >&2
         return 1
     fi
 
-    printf "  Zone synced, journal removed.\n"
+    printf "  Zone synced; journal preserved for IXFR.\n"
     return 0
 }
 
@@ -753,8 +768,8 @@ main() {
         fi
         printf "  nsupdate succeeded.\n"
 
-        # Step 3: Sync and clean journal
-        rndc_sync_clean "$ALLOW_ZONE"
+        # Step 3: Flush in-memory state to .db (preserving journal for IXFR)
+        rndc_sync "$ALLOW_ZONE"
 
         # Step 4: Audit log
         audit_write "add" "$DOMAIN" "OK"
@@ -795,8 +810,8 @@ main() {
         fi
         printf "  nsupdate succeeded.\n"
 
-        # Step 3: Sync and clean journal
-        rndc_sync_clean "$ALLOW_ZONE"
+        # Step 3: Flush in-memory state to .db (preserving journal for IXFR)
+        rndc_sync "$ALLOW_ZONE"
 
         # Step 4: Audit log
         audit_write "remove" "$DOMAIN" "OK"
