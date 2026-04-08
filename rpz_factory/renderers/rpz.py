@@ -8,11 +8,81 @@ from __future__ import annotations
 
 import datetime
 import logging
+import os
+import re
 from io import StringIO
 
 from rpz_factory.models import EntryType, ThreatEntry
 
 logger = logging.getLogger(__name__)
+
+# Matches a plaintext zone file SOA serial line produced by this renderer,
+# e.g. "    2026040803  ; serial".
+_SERIAL_LINE_RE = re.compile(r"^\s*(\d+)\s*;\s*serial\b", re.IGNORECASE)
+
+
+def read_serial_from_zone_file(path: str) -> int | None:
+    """Return the SOA serial from a text RPZ zone file, or None if unreadable.
+
+    Only reads the first ~50 lines — the SOA is always near the top. Returns
+    None for missing files, unparseable files, or binary (raw) zone files
+    where the SOA is not ASCII text.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 50:
+                    break
+                m = _SERIAL_LINE_RE.match(line)
+                if m:
+                    return int(m.group(1))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def compute_next_serial(existing_path: str | None = None) -> int:
+    """Compute the next SOA serial in YYYYMMDDNN format.
+
+    NN is a 2-digit revision counter (00-99) that increments every time we
+    render on the same UTC day. Rolls over to 00 on a new day.
+
+    If `existing_path` is provided and points to a readable text zone file,
+    its current serial is parsed and used as the baseline. Otherwise we start
+    at NN=00 for today.
+
+    Behavior:
+      * existing=None or unreadable       → YYYYMMDD00 for today
+      * existing date != today            → YYYYMMDD00 for today
+      * existing date == today, NN < 99   → existing+1
+      * existing date == today, NN == 99  → existing+1 = YYYYMMDD100 (overflow)
+      * existing > today (e.g. BIND auto-bumped past us) → existing+1
+
+    The "existing > today" case matters for incremental zones: BIND may have
+    auto-incremented the serial via nsupdate since our last run. We always
+    produce a serial strictly greater than what's on disk so BIND never sees
+    a regression.
+    """
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+    today_base = int(today) * 100  # YYYYMMDD00
+
+    existing = None
+    if existing_path:
+        existing = read_serial_from_zone_file(existing_path)
+
+    if existing is None:
+        return today_base
+
+    # If the existing serial is from an earlier day, reset NN to 00 for today.
+    # Compare date portion (first 8 digits).
+    existing_date = existing // 100
+    today_date = int(today)
+
+    if existing_date < today_date:
+        return today_base
+
+    # Same day or future (BIND bumped past us) — always return existing+1.
+    return existing + 1
 
 
 def render(
@@ -23,9 +93,17 @@ def render(
     soa_retry: int = 600,
     soa_expire: int = 604800,
     soa_minimum: int = 60,
+    serial: int | str | None = None,
 ) -> str:
-    """Render a list of ThreatEntry objects as an RFC 5782 RPZ zone file."""
-    serial = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H")
+    """Render a list of ThreatEntry objects as an RFC 5782 RPZ zone file.
+
+    If `serial` is provided (as int or string of digits), it is used verbatim.
+    Otherwise falls back to YYYYMMDDHH from the current UTC time. Callers that
+    need monotonic serials (e.g. for IXFR) should compute the next serial via
+    `compute_next_serial()` and pass it in.
+    """
+    if serial is None:
+        serial = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H")
     buf = StringIO()
 
     # Header comment

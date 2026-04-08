@@ -1,8 +1,16 @@
 #!/bin/sh
 # run-rpz.sh — Cron/interactive wrapper for rpz-zone-factory
-# Version: 0.5.0
+# Version: 0.6.0
 # Portable: Debian, Ubuntu, FreeBSD 13+
 # POSIX sh — no bashisms.
+#
+# v0.6.0: Incremental zone updates via nsupdate/TSIG for IXFR support.
+#         Zones listed in CONF_INCREMENTAL_ZONES are updated by diffing
+#         the previous feed against the newly generated zone and applying
+#         only the additions/deletions via TSIG-authenticated nsupdate.
+#         BIND writes the delta to the journal and bumps the SOA serial,
+#         which allows slaves to IXFR only the changes instead of AXFR'ing
+#         the entire zone on every scheduled run.
 #
 # Usage:
 #   ./run-rpz.sh --setup             Interactive setup wizard
@@ -51,9 +59,12 @@ CONF_COMPILE_ZONE=""    # yes or no — use named-compilezone for binary (raw) f
 CONF_CHECKZONE=""       # yes or no — validate with named-checkzone before deploying
 CONF_PER_SOURCE=""      # yes or no — output one zone file per source
 CONF_ALLOWLIST_FILE=""  # path to allowlist file (used with per-source mode)
-CONF_TSIG_KEY_FILE=""  # path to TSIG key file for allow.sh dynamic updates
-CONF_ALLOW_SERVER=""   # server for allow.sh nsupdate (default: localhost)
-CONF_ALLOW_ZONE=""     # zone name for allow.sh (default: allowlist.rpz)
+CONF_TSIG_KEY_FILE=""  # path to TSIG key file for nsupdate (shared by allow.sh and incremental updates)
+CONF_ALLOW_SERVER=""   # server for nsupdate (default: localhost)
+CONF_ALLOW_ZONE=""     # allowlist zone name (default: allowlist.rpz)
+CONF_FEEDS_DIR=""      # directory holding previous/current feed snapshots for incremental diffs
+CONF_INCREMENTAL_ZONES=""  # space-separated zones that use the incremental (IXFR) update path
+CONF_INCREMENTAL_TTL="300" # TTL for nsupdate records (matches zone default)
 
 # Source config file if it exists (overrides defaults above)
 _conf_file="${RPZ_DIR}/.run-rpz.conf"
@@ -64,13 +75,14 @@ fi
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
 MODE="cron"       # "cron" or "interactive"
 DO_SETUP=0
 DO_RELOAD=0
+DO_FULL_REBUILD=0  # force full rebuild path even for incremental zones
 RELOAD_ZONE=""
 RPZ_ARGS=""
 EXIT_CODE=0
@@ -205,8 +217,22 @@ OPTIONS:
                       generate a cron entry and BIND config example.
   --reload-bind ZONE  After successful run, execute: rndc reload ZONE
                       Requires rndc access (see --setup for help).
+  --full-rebuild      Force full rebuild path (freeze/reload/thaw) for all
+                      zones, bypassing the incremental IXFR update path.
+                      Use for recovery or after BIND/zone config changes.
   --rpz-dir DIR       Override RPZ_DIR
   --python BIN        Override PYTHON_BIN
+
+INCREMENTAL UPDATES (v0.6.0+):
+  Zones listed in CONF_INCREMENTAL_ZONES (set via --setup) are updated
+  by diffing the previously-fetched feed against the newly generated zone
+  and sending only the additions/deletions via TSIG-authenticated nsupdate.
+  BIND writes the delta to the zone's journal file, bumps the SOA serial,
+  and slaves receive NOTIFY → IXFR instead of re-AXFR'ing the whole zone.
+
+  Feed snapshots live in CONF_FEEDS_DIR (default:
+  /usr/local/etc/namedb/master/rpz/feeds). The allowlist source file also
+  lives there and is treated as just another feed.
 
 ARGS:
   Everything after "--" is passed directly to rpz-zone-factory.
@@ -282,6 +308,10 @@ parse_args() {
                 DO_RELOAD=1
                 RELOAD_ZONE="$2"
                 shift 2
+                ;;
+            --full-rebuild)
+                DO_FULL_REBUILD=1
+                shift
                 ;;
             --rpz-dir)
                 if [ -z "$2" ]; then
@@ -642,20 +672,58 @@ run_setup() {
             _def_outdir="${CONF_OUTPUT_FILE:-/usr/local/etc/namedb/master/rpz}"
             CONF_OUTPUT_FILE=$(prompt_value "Output directory path" "$_def_outdir")
 
-            # Allowlist file
-            printf "\n  An allowlist zone (rpz-allowlist) provides BIND-level override\n"
-            printf "  for domains that appear in threat zones but should be allowed.\n"
-            printf "\n"
-            printf "  Point this to a plain text file with one domain per line.\n"
-            printf "  Lines starting with # are comments. Example:\n"
-            printf "\n"
+            # Feeds directory: holds previous/current feed snapshots for
+            # incremental diffs, and the canonical allowlist.txt source file.
+            printf "\n  The feeds directory holds snapshots of the domain list for\n"
+            printf "  each zone from the previous run. On the next run, the script\n"
+            printf "  diffs the new feed against the saved snapshot to compute\n"
+            printf "  additions and deletions for incremental (IXFR) updates.\n"
+            printf "  It also holds allowlist.txt, the canonical allowlist source.\n\n"
+            _def_feeds="${CONF_FEEDS_DIR:-${CONF_OUTPUT_FILE}/feeds}"
+            CONF_FEEDS_DIR=$(prompt_value "Feeds directory" "$_def_feeds")
+
+            if [ ! -d "$CONF_FEEDS_DIR" ]; then
+                printf "  \u2717 Feeds directory does not exist: %s\n" "$CONF_FEEDS_DIR"
+                if prompt_yn "Create it now?" "y"; then
+                    if mkdir -p "$CONF_FEEDS_DIR" 2>/dev/null; then
+                        printf "  \u2713 Created: %s\n" "$CONF_FEEDS_DIR"
+                    else
+                        printf "  \u2717 Could not create %s (permission denied?)\n" "$CONF_FEEDS_DIR"
+                        printf "    Create it manually and ensure the rpz-zone-factory user can write to it.\n"
+                    fi
+                fi
+            else
+                printf "  \u2713 Feeds directory exists: %s\n" "$CONF_FEEDS_DIR"
+            fi
+
+            # Allowlist file — now lives inside the feeds directory by default
+            printf "\n  An allowlist zone (allowlist.rpz) provides BIND-level override\n"
+            printf "  for domains that appear in threat zones but should be allowed.\n\n"
+            printf "  The allowlist is a plain text file with one domain per line.\n"
+            printf "  Lines starting with # are comments. Example:\n\n"
             printf "    # False positives\n"
             printf "    bing.com\n"
-            printf "    www.bing.com\n"
-            printf "\n"
-            printf "  rpz-zone-factory will generate the RPZ allowlist zone from this file.\n\n"
-            _def_allowlist="${CONF_ALLOWLIST_FILE:-}"
+            printf "    www.bing.com\n\n"
+            printf "  rpz-zone-factory reads this file and generates the allowlist RPZ zone.\n"
+            printf "  allow.sh reads/writes the same file for interactive management.\n\n"
+            _def_allowlist="${CONF_ALLOWLIST_FILE:-${CONF_FEEDS_DIR}/allowlist.txt}"
             CONF_ALLOWLIST_FILE=$(prompt_value "Allowlist text file path (blank to skip)" "$_def_allowlist")
+
+            if [ -n "$CONF_ALLOWLIST_FILE" ] && [ ! -f "$CONF_ALLOWLIST_FILE" ]; then
+                printf "  \u2717 Allowlist file does not exist: %s\n" "$CONF_ALLOWLIST_FILE"
+                if prompt_yn "Create an empty allowlist file?" "y"; then
+                    _allowlist_dir=$(dirname "$CONF_ALLOWLIST_FILE")
+                    mkdir -p "$_allowlist_dir" 2>/dev/null
+                    if : > "$CONF_ALLOWLIST_FILE" 2>/dev/null; then
+                        printf "  \u2713 Created empty allowlist: %s\n" "$CONF_ALLOWLIST_FILE"
+                    else
+                        printf "  \u2717 Could not create %s\n" "$CONF_ALLOWLIST_FILE"
+                    fi
+                fi
+            elif [ -n "$CONF_ALLOWLIST_FILE" ]; then
+                _allow_count=$(grep -cv '^[[:space:]]*#\|^[[:space:]]*$' "$CONF_ALLOWLIST_FILE" 2>/dev/null || echo 0)
+                printf "  \u2713 Allowlist file exists (%s entries): %s\n" "$_allow_count" "$CONF_ALLOWLIST_FILE"
+            fi
         else
             CONF_PER_SOURCE="no"
             _def_zone="${CONF_ZONE_NAME:-block.rpz}"
@@ -844,28 +912,28 @@ run_setup() {
     fi
 
 
-    # ── Section 3c: TSIG / Dynamic Allowlist ─────────────────────────────
+    # ── Section 3c: TSIG (shared by allow.sh and incremental updates) ────
 
-    if [ "$CONF_PER_SOURCE" = "yes" ] && [ -n "$CONF_ALLOWLIST_FILE" ]; then
-        printf "\n─── Dynamic Allowlist (TSIG) ────────────────────────────────\n\n"
+    if [ "$CONF_PER_SOURCE" = "yes" ]; then
+        printf "\n─── TSIG Key (Dynamic Updates) ──────────────────────────────\n\n"
 
-        printf "  allow.sh lets you add or remove domains from the RPZ allowlist\n"
-        printf "  in real time using TSIG-authenticated nsupdate, without waiting\n"
-        printf "  for the next scheduled rpz-zone-factory run.\n\n"
-        printf "  This requires a TSIG key that BIND trusts for the allowlist zone.\n\n"
+        printf "  A single TSIG key is used for two dynamic-update paths:\n\n"
+        printf "    1. allow.sh — interactive allowlist management\n"
+        printf "    2. Incremental zone updates (IXFR) via run-rpz.sh\n\n"
+        printf "  Both use nsupdate with the same TSIG key. BIND must be configured\n"
+        printf "  with allow-update { key \"<keyname>\"; } on every zone that\n"
+        printf "  accepts dynamic updates (all zones in per-source incremental mode).\n\n"
 
-        if prompt_yn "Configure TSIG key for dynamic allowlist updates?" "y"; then
+        if prompt_yn "Configure TSIG key for dynamic updates?" "y"; then
 
             # Detect platform defaults
             _tsig_os=$(uname -s)
             case "$_tsig_os" in
                 FreeBSD)
                     _def_tsig_dir="/usr/local/etc/namedb/tsig"
-                    _bind_user="bind"
                     ;;
                 *)
                     _def_tsig_dir="/etc/bind/tsig"
-                    _bind_user="bind"
                     ;;
             esac
             _def_tsig_key="${_def_tsig_dir}/rpz-update.key"
@@ -887,16 +955,66 @@ run_setup() {
                 printf "\n  Run './allow.sh --setup' for full TSIG setup instructions.\n"
             fi
 
-            printf "\n  Once configured, use allow.sh to manage the allowlist dynamically:\n\n"
+            printf "\n  allow.sh usage:\n\n"
             printf "    ./allow.sh example.com           # allow domain + *.domain\n"
             printf "    ./allow.sh -n example.com        # allow domain only (no wildcard)\n"
-            printf "    ./allow.sh -r example.com        # remove from allowlist\n"
-            printf "\n"
+            printf "    ./allow.sh -r example.com        # remove from allowlist\n\n"
         else
             CONF_TSIG_KEY_FILE=""
             CONF_ALLOW_SERVER=""
             CONF_ALLOW_ZONE=""
         fi
+    fi
+
+    # ── Section 3d: Incremental (IXFR) zones ─────────────────────────────
+
+    if [ "$CONF_PER_SOURCE" = "yes" ] && [ -n "$CONF_TSIG_KEY_FILE" ]; then
+        printf "\n─── Incremental (IXFR) Zone Updates ─────────────────────────\n\n"
+
+        printf "  With incremental mode enabled for a zone, run-rpz.sh diffs the\n"
+        printf "  previous feed snapshot against the freshly generated zone and\n"
+        printf "  applies only the additions and deletions via nsupdate. BIND\n"
+        printf "  writes the delta to the zone's journal (.jnl) and bumps the\n"
+        printf "  SOA serial. Slaves then receive NOTIFY → IXFR, transferring\n"
+        printf "  only the changes instead of re-AXFR'ing the whole zone.\n\n"
+        printf "  Requirements for each incremental zone:\n"
+        printf "    • BIND zone definition has: allow-update { key \"<keyname>\"; };\n"
+        printf "    • TSIG key is trusted for that zone\n"
+        printf "    • First-ever run for the zone falls back to full rebuild (seed)\n\n"
+
+        printf "  Available per-source zones: allowlist.rpz urlhaus.rpz cisa-kev.rpz\n"
+        printf "                              spamhaus-drop.rpz scamsniffer.rpz cryptoscamdb.rpz\n\n"
+        printf "  Enter a space-separated list of zones to enable, or:\n"
+        printf "    all   = enable incremental for every per-source zone (recommended)\n"
+        printf "    none  = disable incremental, use full rebuild only\n\n"
+
+        _def_incr="${CONF_INCREMENTAL_ZONES:-all}"
+        _incr_choice=$(prompt_value "Incremental zones" "$_def_incr")
+
+        case "$_incr_choice" in
+            all|ALL)
+                CONF_INCREMENTAL_ZONES="allowlist.rpz urlhaus.rpz cisa-kev.rpz spamhaus-drop.rpz scamsniffer.rpz cryptoscamdb.rpz"
+                printf "  ✓ All per-source zones enabled for incremental updates\n"
+                ;;
+            none|NONE|"")
+                CONF_INCREMENTAL_ZONES=""
+                printf "  ✓ Incremental updates disabled (full rebuild only)\n"
+                ;;
+            *)
+                CONF_INCREMENTAL_ZONES="$_incr_choice"
+                printf "  ✓ Incremental zones: %s\n" "$CONF_INCREMENTAL_ZONES"
+                ;;
+        esac
+
+        if [ -n "$CONF_INCREMENTAL_ZONES" ]; then
+            _def_ttl="${CONF_INCREMENTAL_TTL:-300}"
+            CONF_INCREMENTAL_TTL=$(prompt_value "TTL for nsupdate records" "$_def_ttl")
+        fi
+    else
+        if [ "$CONF_PER_SOURCE" = "yes" ] && [ -z "$CONF_TSIG_KEY_FILE" ]; then
+            printf "\n  Incremental updates require a TSIG key — disabled.\n"
+        fi
+        CONF_INCREMENTAL_ZONES=""
     fi
 
     # ── Save configuration ────────────────────────────────────────────────
@@ -935,11 +1053,16 @@ CONF_COMPILE_ZONE="${CONF_COMPILE_ZONE}"
 # Per-source mode
 CONF_PER_SOURCE="${CONF_PER_SOURCE}"
 CONF_ALLOWLIST_FILE="${CONF_ALLOWLIST_FILE}"
+CONF_FEEDS_DIR="${CONF_FEEDS_DIR}"
 
-# Dynamic allowlist (TSIG / allow.sh)
+# Dynamic updates (TSIG) — shared by allow.sh and incremental zone updates
 CONF_TSIG_KEY_FILE="${CONF_TSIG_KEY_FILE}"
 CONF_ALLOW_SERVER="${CONF_ALLOW_SERVER}"
 CONF_ALLOW_ZONE="${CONF_ALLOW_ZONE}"
+
+# Incremental (IXFR) zone updates — see v0.6.0 release notes
+CONF_INCREMENTAL_ZONES="${CONF_INCREMENTAL_ZONES}"
+CONF_INCREMENTAL_TTL="${CONF_INCREMENTAL_TTL}"
 CONF
 
     printf "  ✓ Configuration saved to: %s\n" "$_conf_file"
@@ -1146,6 +1269,15 @@ CONF
         printf "  • 'policy given' uses the action specified in each RPZ record\n"
         printf "    (rpz-zone-factory writes CNAME . records → NXDOMAIN).\n"
         printf "\n"
+        if [ -n "$CONF_INCREMENTAL_ZONES" ]; then
+            printf "  • Incremental (IXFR) zones: %s\n" "$CONF_INCREMENTAL_ZONES"
+            printf "    These zones MUST have 'allow-update { key ... };' in the zone\n"
+            printf "    statement. run-rpz.sh applies diffs via nsupdate; BIND bumps\n"
+            printf "    the SOA serial automatically and slaves IXFR the delta.\n"
+            printf "  • Force a full rebuild (bypassing incremental) with:\n"
+            printf "      %s --full-rebuild\n" "$(basename "$0")"
+            printf "\n"
+        fi
         if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
             printf "  • Zone is compiled to binary (raw) format for faster loading.\n"
             printf "    The 'masterfile-format raw;' directive is REQUIRED in the zone\n"
@@ -1288,6 +1420,341 @@ find_named_tool() {
     return 1
 }
 
+# ─── Incremental (IXFR) zone updates ────────────────────────────
+#
+# Architecture (v0.6.0):
+#
+#   For each zone listed in CONF_INCREMENTAL_ZONES we maintain two feed
+#   snapshots in CONF_FEEDS_DIR:
+#
+#     <feeds>/<zone>.list.previous   domains from last successful run
+#     <feeds>/<zone>.list.current    domains from this run (extracted from .db)
+#
+#   On each run:
+#     1. Python renders a fresh zone file to <output>/.tmp/<zone>.db
+#     2. For each incremental zone:
+#          a. If .previous is missing → seed path:
+#               - full rebuild (checkzone, compilezone, freeze/reload/thaw)
+#               - extract .current from the new .db, rename to .previous
+#          b. If .previous exists → incremental path:
+#               - rndc sync <zone>    flush journal to .db (reconcile state)
+#               - extract .current from the new .db
+#               - diff .previous vs .current → additions + deletions
+#               - empty diff → no-op, discard .current, skip zone
+#               - non-empty → send nsupdate batch with TSIG, BIND bumps serial
+#                 and writes to journal; slaves receive NOTIFY and IXFR
+#               - on success: rename .current → .previous
+#               - on failure: fall back to full rebuild for this zone
+#
+# CNAME target:
+#     allowlist.rpz     → CNAME rpz-passthru.   (policy passthru)
+#     all other zones   → CNAME .               (NXDOMAIN block)
+
+# Echo the CNAME target for a given zone name.
+incremental_cname_target() {
+    case "$1" in
+        allowlist.rpz|allowlist)
+            echo "rpz-passthru."
+            ;;
+        *)
+            echo "."
+            ;;
+    esac
+}
+
+# Check if a zone name is listed in CONF_INCREMENTAL_ZONES.
+# Returns 0 if yes, 1 if no.
+is_incremental_zone() {
+    _zone="$1"
+    [ -z "$CONF_INCREMENTAL_ZONES" ] && return 1
+    case " $CONF_INCREMENTAL_ZONES " in
+        *\ "$_zone"\ *) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Extract sorted unique bare domain names from a rendered RPZ zone file.
+# Input:  path to a .db file containing "<domain>.<zone>. CNAME ." lines
+#         (or "rpz-passthru." for the allowlist zone).
+# Output: one bare domain per line, sorted, unique. Wildcard twins are
+#         stripped. SOA, NS, comments, and TTL directives are ignored.
+#
+# Args: <db_file> <zone_name>
+extract_domains_from_zone() {
+    _zone_file="$1"
+    _zone="$2"
+
+    if [ ! -f "$_zone_file" ]; then
+        return 1
+    fi
+
+    # Match lines like: example.com.<zone>. CNAME .
+    # Capture everything before .<zone>. and skip the wildcard (*.) twin lines
+    # which produce duplicates after we strip the leading "*.".
+    # RPZ IP triggers (N.reversed-ip.rpz-ip.<zone>.) are passed through
+    # verbatim as bare keys so they round-trip through the diff/nsupdate path.
+    awk -v z="$_zone" '
+        BEGIN { suffix = "." z "." }
+        /^[[:space:]]*;/   { next }   # comments
+        /^[[:space:]]*\$/  { next }   # directives ($TTL)
+        /^[[:space:]]*@/   { next }   # SOA/NS apex records
+        /CNAME/ {
+            # Field 1 is the left-hand side including trailing dot
+            name = $1
+            # Strip trailing dot if present
+            sub(/\.$/, "", name)
+            # Must end with the zone suffix (minus trailing dot)
+            zs = z
+            sub(/\.$/, "", zs)
+            n = length(name) - length(zs) - 1
+            if (n < 0) next
+            # Check the suffix matches
+            if (substr(name, n + 2) != zs) next
+            bare = substr(name, 1, n)
+            # Skip wildcard twins — we only want one row per domain
+            if (substr(bare, 1, 2) == "*.") next
+            print bare
+        }
+    ' "$_zone_file" | LC_ALL=C sort -u
+}
+
+# Build an nsupdate input file for the given zone from additions/deletions.
+#
+# Args: <zone_name> <additions_file> <deletions_file> <out_nsupdate_file>
+build_nsupdate_batch() {
+    _zone="$1"
+    _adds="$2"
+    _dels="$3"
+    _out="$4"
+
+    _target=$(incremental_cname_target "$_zone")
+    _ttl="${CONF_INCREMENTAL_TTL:-300}"
+    _server="${CONF_ALLOW_SERVER:-localhost}"
+
+    # Domain names ending in ".rpz-ip" are IP triggers — they never have
+    # a wildcard twin in the rendered zone, so skip emitting one.
+    _emit_update() {
+        _op="$1"          # "add" or "delete"
+        _bare="$2"
+        _is_iptrig=0
+        case "$_bare" in
+            *.rpz-ip) _is_iptrig=1 ;;
+        esac
+
+        if [ "$_op" = "add" ]; then
+            printf 'update add %s.%s. %s IN CNAME %s\n' "$_bare" "$_zone" "$_ttl" "$_target"
+            if [ $_is_iptrig -eq 0 ]; then
+                printf 'update add *.%s.%s. %s IN CNAME %s\n' "$_bare" "$_zone" "$_ttl" "$_target"
+            fi
+        else
+            printf 'update delete %s.%s. CNAME\n' "$_bare" "$_zone"
+            if [ $_is_iptrig -eq 0 ]; then
+                printf 'update delete *.%s.%s. CNAME\n' "$_bare" "$_zone"
+            fi
+        fi
+    }
+
+    {
+        printf 'server %s\n' "$_server"
+        printf 'zone %s\n' "$_zone"
+
+        # Deletions first — if a domain is re-added we want the delete+add to
+        # register as a net change in the journal.
+        if [ -s "$_dels" ]; then
+            while IFS= read -r _d; do
+                [ -z "$_d" ] && continue
+                _emit_update "delete" "$_d"
+            done < "$_dels"
+        fi
+
+        if [ -s "$_adds" ]; then
+            while IFS= read -r _d; do
+                [ -z "$_d" ] && continue
+                _emit_update "add" "$_d"
+            done < "$_adds"
+        fi
+
+        printf 'send\n'
+    } > "$_out"
+}
+
+# Apply an incremental update for a single zone.
+#
+# Args: <zone_name> <new_db_file>
+#
+# Returns:
+#   0 = success (nsupdate applied or no-op)
+#   1 = fatal — caller should fall back to full rebuild for this zone
+#   2 = seed required — .previous missing, caller should full-rebuild and seed
+run_incremental_for_zone() {
+    _zone="$1"
+    _new_db="$2"
+
+    _feeds_dir="${CONF_FEEDS_DIR}"
+    if [ -z "$_feeds_dir" ]; then
+        log_err "CONF_FEEDS_DIR is not set — cannot run incremental update for $_zone"
+        return 1
+    fi
+
+    if [ ! -d "$_feeds_dir" ]; then
+        if ! mkdir -p "$_feeds_dir" 2>/dev/null; then
+            log_err "Cannot create feeds dir: $_feeds_dir"
+            return 1
+        fi
+    fi
+
+    _prev="${_feeds_dir}/${_zone}.list.previous"
+    _curr="${_feeds_dir}/${_zone}.list.current"
+
+    # Seed path: no previous snapshot, caller should full-rebuild and then
+    # write <zone>.list.previous from the rendered .db.
+    if [ ! -f "$_prev" ]; then
+        log_info "Incremental: no previous snapshot for $_zone — seed required"
+        return 2
+    fi
+
+    if [ ! -f "$_new_db" ] || [ ! -s "$_new_db" ]; then
+        log_err "Incremental: new zone file missing or empty for $_zone: $_new_db"
+        return 1
+    fi
+
+    # Preflight: TSIG key, nsupdate binary
+    if [ -z "$CONF_TSIG_KEY_FILE" ] || [ ! -f "$CONF_TSIG_KEY_FILE" ]; then
+        log_err "Incremental: TSIG key file missing: $CONF_TSIG_KEY_FILE"
+        return 1
+    fi
+    if ! command -v nsupdate >/dev/null 2>&1; then
+        log_err "Incremental: nsupdate not found in PATH"
+        return 1
+    fi
+
+    # Reconcile on-disk .db with BIND's in-memory state by flushing the
+    # journal to disk. Any dynamic changes made since the last scheduled
+    # run (e.g. via allow.sh) are now reflected in the .previous snapshot
+    # via the next seed, but for the running zone we rely on nsupdate's
+    # idempotent behavior to handle overlap.
+    log_info "Incremental[$_zone]: rndc sync \u2192 flushing journal to .db"
+    _sync_output=$($RNDC_BIN sync "$_zone" 2>&1)
+    _sync_rc=$?
+    if [ $_sync_rc -ne 0 ]; then
+        log_warn "Incremental[$_zone]: rndc sync failed ($_sync_rc): $_sync_output"
+        # Not fatal — nsupdate can still proceed, diff may just be noisier.
+    fi
+
+    # Extract fresh domain list from the new zone
+    if ! extract_domains_from_zone "$_new_db" "$_zone" > "$_curr"; then
+        log_err "Incremental[$_zone]: failed to extract domains from $_new_db"
+        rm -f "$_curr"
+        return 1
+    fi
+
+    _new_count=$(wc -l < "$_curr" | tr -d ' ')
+    _old_count=$(wc -l < "$_prev" | tr -d ' ')
+
+    if [ "$_new_count" = "0" ]; then
+        log_warn "Incremental[$_zone]: extracted zero domains from new zone — skipping (kept .previous)"
+        rm -f "$_curr"
+        return 1
+    fi
+
+    # Compute additions (in new not old) and deletions (in old not new)
+    _adds=$(mktemp "/tmp/rpz-adds-${_zone}.XXXXXX" 2>/dev/null || echo "/tmp/rpz-adds-${_zone}.$$")
+    _dels=$(mktemp "/tmp/rpz-dels-${_zone}.XXXXXX" 2>/dev/null || echo "/tmp/rpz-dels-${_zone}.$$")
+
+    LC_ALL=C comm -13 "$_prev" "$_curr" > "$_adds"
+    LC_ALL=C comm -23 "$_prev" "$_curr" > "$_dels"
+
+    _add_count=$(wc -l < "$_adds" | tr -d ' ')
+    _del_count=$(wc -l < "$_dels" | tr -d ' ')
+
+    log_info "Incremental[$_zone]: prev=$_old_count curr=$_new_count adds=$_add_count dels=$_del_count"
+
+    # No changes — no-op, keep .previous as-is, discard .current
+    if [ "$_add_count" = "0" ] && [ "$_del_count" = "0" ]; then
+        log_info "Incremental[$_zone]: no changes, skipping nsupdate"
+        rm -f "$_adds" "$_dels" "$_curr"
+        return 0
+    fi
+
+    # Build nsupdate batch
+    _batch=$(mktemp "/tmp/rpz-nsupdate-${_zone}.XXXXXX" 2>/dev/null || echo "/tmp/rpz-nsupdate-${_zone}.$$")
+    build_nsupdate_batch "$_zone" "$_adds" "$_dels" "$_batch"
+
+    # Apply
+    log_info "Incremental[$_zone]: applying nsupdate (+$_add_count -$_del_count)"
+    _nsupd_output=$(nsupdate -k "$CONF_TSIG_KEY_FILE" < "$_batch" 2>&1)
+    _nsupd_rc=$?
+
+    if [ $_nsupd_rc -ne 0 ]; then
+        log_err "Incremental[$_zone]: nsupdate failed (rc=$_nsupd_rc): $_nsupd_output"
+        # Keep intermediate files for post-mortem
+        log_err "Incremental[$_zone]: kept for debugging: adds=$_adds dels=$_dels batch=$_batch"
+        rm -f "$_curr"
+        return 1
+    fi
+
+    log_info "Incremental[$_zone]: nsupdate succeeded"
+
+    # Rotate: current becomes the new previous
+    if ! mv "$_curr" "$_prev"; then
+        log_warn "Incremental[$_zone]: failed to rotate $_curr → $_prev"
+    fi
+
+    # Flush journal to disk so .db stays in sync
+    _sync_output=$($RNDC_BIN sync "$_zone" 2>&1)
+    _sync_rc=$?
+    if [ $_sync_rc -ne 0 ]; then
+        log_warn "Incremental[$_zone]: post-update rndc sync failed ($_sync_rc): $_sync_output"
+    fi
+
+    # Clean up tmp files on success
+    rm -f "$_adds" "$_dels" "$_batch"
+
+    return 0
+}
+
+# Seed (or re-seed) the previous feed snapshot for a zone from its .db file.
+# Called after a full rebuild for a zone that is managed incrementally, so
+# the next scheduled run has a baseline to diff against.
+#
+# Args: <zone_name> <db_file>
+seed_feed_snapshot() {
+    _zone="$1"
+    _db_file="$2"
+
+    if [ -z "$CONF_FEEDS_DIR" ]; then
+        return 0  # nothing to do
+    fi
+    if [ ! -d "$CONF_FEEDS_DIR" ]; then
+        mkdir -p "$CONF_FEEDS_DIR" 2>/dev/null || return 1
+    fi
+
+    _prev="${CONF_FEEDS_DIR}/${_zone}.list.previous"
+    _curr="${CONF_FEEDS_DIR}/${_zone}.list.current"
+
+    if ! extract_domains_from_zone "$_db_file" "$_zone" > "$_curr"; then
+        log_warn "Seed[$_zone]: failed to extract domains from $_db_file"
+        rm -f "$_curr"
+        return 1
+    fi
+
+    _count=$(wc -l < "$_curr" | tr -d ' ')
+    if [ "$_count" = "0" ]; then
+        log_warn "Seed[$_zone]: extracted zero domains from $_db_file"
+        rm -f "$_curr"
+        return 1
+    fi
+
+    if ! mv "$_curr" "$_prev"; then
+        log_warn "Seed[$_zone]: failed to move $_curr → $_prev"
+        rm -f "$_curr"
+        return 1
+    fi
+
+    log_info "Seed[$_zone]: saved baseline snapshot ($_count domains)"
+    return 0
+}
+
 # ─── Main run ─────────────────────────────────────────────────────────────────
 
 run_rpz() {
@@ -1360,139 +1827,321 @@ run_rpz() {
 
     log_info "rpz-zone-factory completed successfully"
 
-    # ── Per-source mode: validation, compilation, reload ──────────────────
+    # ── Per-source mode: incremental (IXFR) and/or full rebuild ───────────
+    #
+    # Per-zone decision:
+    #   • Zone listed in CONF_INCREMENTAL_ZONES + .previous exists + TSIG ok
+    #     → apply diff via nsupdate (no freeze, zone stays live)
+    #   • Otherwise (seed, fallback, or not configured for incremental)
+    #     → freeze/write/reload/thaw full-rebuild path
+    #
+    # --full-rebuild on the CLI forces every zone through the full path.
 
     if [ "$CONF_PER_SOURCE" = "yes" ] && [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_OUTPUT_FILE" ]; then
 
-        if [ "$CONF_CHECKZONE" = "yes" ] || [ "$CONF_COMPILE_ZONE" = "yes" ]; then
-            # Python wrote to .tmp subdirectory; validate each and move to final dir
-            _tmp_dir="${CONF_OUTPUT_FILE}/.tmp"
-            mkdir -p "$CONF_OUTPUT_FILE"
+        _tmp_dir="${CONF_OUTPUT_FILE}/.tmp"
+        mkdir -p "$CONF_OUTPUT_FILE"
 
-            if [ ! -d "$_tmp_dir" ]; then
-                log_err "Temp directory missing: $_tmp_dir — aborting"
-                return 1
+        if [ ! -d "$_tmp_dir" ]; then
+            log_err "Temp directory missing: $_tmp_dir — aborting"
+            return 1
+        fi
+
+        _checkzone_bin=""
+        if [ "$CONF_CHECKZONE" = "yes" ]; then
+            _checkzone_bin=$(find_named_tool "named-checkzone")
+            if [ -z "$_checkzone_bin" ]; then
+                log_warn "named-checkzone not found — skipping validation"
+            fi
+        fi
+
+        _compilezone_bin=""
+        if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
+            _compilezone_bin=$(find_named_tool "named-compilezone")
+            if [ -z "$_compilezone_bin" ]; then
+                log_warn "named-compilezone not found — will use text format"
+            fi
+        fi
+
+        # Phase 1: validate every fresh .db with named-checkzone.
+        # If a zone fails validation, we skip it entirely (leave the live
+        # zone untouched). Build a list of zones that pass.
+        _valid_zones=""
+        _any_failed=0
+        for _db_file in "$_tmp_dir"/*.db; do
+            [ ! -f "$_db_file" ] && continue
+            _basename=$(basename "$_db_file")
+            _zone_name=$(echo "$_basename" | sed 's/\.db$//')
+
+            if [ ! -s "$_db_file" ]; then
+                log_warn "Zone file is empty, skipping: $_db_file"
+                _any_failed=1
+                continue
             fi
 
-            _checkzone_bin=""
-            if [ "$CONF_CHECKZONE" = "yes" ]; then
-                _checkzone_bin=$(find_named_tool "named-checkzone")
-                if [ -z "$_checkzone_bin" ]; then
-                    log_warn "named-checkzone not found — skipping validation"
+            if [ -n "$_checkzone_bin" ]; then
+                log_info "Validating $_zone_name with named-checkzone..."
+                _cz_output=$("$_checkzone_bin" "$_zone_name" "$_db_file" 2>&1)
+                _cz_rc=$?
+                if [ $_cz_rc -ne 0 ]; then
+                    log_err "named-checkzone failed for $_zone_name (rc=$_cz_rc): $_cz_output"
+                    log_err "Keeping previous zone file intact for $_zone_name."
+                    _any_failed=1
+                    continue
                 fi
+                log_info "named-checkzone passed for $_zone_name"
             fi
 
-            _compilezone_bin=""
-            if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
-                _compilezone_bin=$(find_named_tool "named-compilezone")
-                if [ -z "$_compilezone_bin" ]; then
-                    log_warn "named-compilezone not found — will use text format"
-                fi
+            _valid_zones="${_valid_zones} ${_zone_name}"
+        done
+
+        # Phase 2: sort valid zones into two buckets — incremental and full.
+        _incremental_bucket=""
+        _full_bucket=""
+        for _zone_name in $_valid_zones; do
+            _db_file="${_tmp_dir}/${_zone_name}.db"
+
+            # --full-rebuild flag forces full path for every zone
+            if [ $DO_FULL_REBUILD -eq 1 ]; then
+                _full_bucket="${_full_bucket} ${_zone_name}"
+                continue
             fi
 
-            # ── Freeze dynamic zones before overwriting zone files ─────────
-            _zones_frozen=0
-            if [ $DO_RELOAD -eq 1 ]; then
-                # Sync and clean journals first — reduces orphaned .jnl risk
-                log_info "Syncing dynamic zones: rndc sync -clean"
-                _sync_output=$($RNDC_BIN sync -clean 2>&1)
-                _sync_rc=$?
-                if [ $_sync_rc -ne 0 ]; then
-                    log_warn "rndc sync -clean failed: $_sync_output"
-                fi
-
-                # Freeze all dynamic zones
-                log_info "Freezing all dynamic zones"
-                _freeze_output=$($RNDC_BIN freeze 2>&1)
-                _freeze_rc=$?
-                if [ $_freeze_rc -ne 0 ]; then
-                    log_warn "rndc freeze failed: $_freeze_output"
-                else
-                    _zones_frozen=1
-                fi
+            # Not listed for incremental → full
+            if ! is_incremental_zone "$_zone_name"; then
+                _full_bucket="${_full_bucket} ${_zone_name}"
+                continue
             fi
 
-            for _db_file in "$_tmp_dir"/*.db; do
-                [ ! -f "$_db_file" ] && continue
-                _basename=$(basename "$_db_file")
-                _zone_name=$(echo "$_basename" | sed 's/\.db$//')
-                _final_file="${CONF_OUTPUT_FILE}/${_basename}"
+            # Needs TSIG configuration
+            if [ -z "$CONF_TSIG_KEY_FILE" ] || [ ! -f "$CONF_TSIG_KEY_FILE" ]; then
+                log_warn "Incremental[$_zone_name]: TSIG key missing — falling back to full rebuild"
+                _full_bucket="${_full_bucket} ${_zone_name}"
+                continue
+            fi
+
+            # Needs .previous snapshot (otherwise it's a seed → full rebuild)
+            if [ -z "$CONF_FEEDS_DIR" ] || [ ! -f "${CONF_FEEDS_DIR}/${_zone_name}.list.previous" ]; then
+                log_info "Incremental[$_zone_name]: no previous snapshot — seeding via full rebuild"
+                _full_bucket="${_full_bucket} ${_zone_name}"
+                continue
+            fi
+
+            _incremental_bucket="${_incremental_bucket} ${_zone_name}"
+        done
+
+        # Phase 3: incremental zones — apply while BIND is live.
+        # On nsupdate failure, push the zone into the full-rebuild bucket.
+        _incr_applied_count=0
+        for _zone_name in $_incremental_bucket; do
+            _db_file="${_tmp_dir}/${_zone_name}.db"
+
+            run_incremental_for_zone "$_zone_name" "$_db_file"
+            _incr_rc=$?
+
+            case $_incr_rc in
+                0)
+                    _incr_applied_count=$(( _incr_applied_count + 1 ))
+                    # Successful incremental: BIND owns the zone file now.
+                    # run_incremental_for_zone already called 'rndc sync' so
+                    # the on-disk .db reflects BIND's authoritative state
+                    # including the nsupdate deltas and the bumped serial.
+                    #
+                    # Do NOT overwrite the .db with our freshly Python-rendered
+                    # copy from .tmp — it has a stale Python-computed serial
+                    # (hour-based) that would regress BIND's state and produce
+                    # "serial has gone backwards" errors, potentially breaking
+                    # IXFR for slaves.
+                    #
+                    # The .tmp/.db file is still useful as the input to the
+                    # next scheduled run's diff (via .list.current vs
+                    # .list.previous extraction) but it does NOT go to the
+                    # final zone location.
+                    log_info "Incremental[$_zone_name]: BIND owns the .db file; skipping post-copy"
+                    ;;
+                2)
+                    # Seed required — shouldn't happen (we pre-checked .previous
+                    # above) but handle defensively by routing to full rebuild.
+                    log_info "Incremental[$_zone_name]: seed required at apply time — routing to full rebuild"
+                    _full_bucket="${_full_bucket} ${_zone_name}"
+                    ;;
+                *)
+                    log_warn "Incremental[$_zone_name]: failed — falling back to full rebuild"
+                    _full_bucket="${_full_bucket} ${_zone_name}"
+                    ;;
+            esac
+        done
+
+        # Phase 4+5: full-rebuild zones — per-zone freeze/replace/thaw.
+        #
+        # For each zone in the full bucket we:
+        #   1. Try `rndc freeze <zone>`. Success (or "already frozen") means
+        #      the zone is dynamic — we'll thaw it at the end to re-read the
+        #      file synchronously. "not dynamic" means it's a static zone and
+        #      we'll use `rndc reload <zone>` instead.
+        #   2. Stage the new .db to <final>.new.$$, atomic mv into place.
+        #   3. Remove any orphaned journal (safe now: dyn zone is frozen,
+        #      static zone has no journal).
+        #   4. Per-zone thaw (dyn) or reload (static) to activate.
+        #
+        # Per-zone thaw is required for dynamic zones because:
+        #   • `rndc reload <zone>` flatly fails on a dynamic zone
+        #     ("rndc: 'reload' failed: dynamic zone").
+        #   • A global `rndc thaw` is asynchronous and races against the
+        #     freshly-replaced file, producing "zone serial has gone
+        #     backwards" warnings as BIND catches up out-of-order.
+        #   • Per-zone `rndc thaw <zone>` re-reads the file synchronously
+        #     for that zone alone, eliminating the race.
+        _full_has_work=0
+        for _zone_name in $_full_bucket; do
+            _full_has_work=1
+            break
+        done
+
+        if [ $_full_has_work -eq 1 ] && [ $DO_RELOAD -eq 1 ]; then
+            # Sync journals to disk first so any in-flight dynamic updates
+            # are persisted before we replace files. With -clean BIND also
+            # removes the journal after writing, leaving us a clean slate.
+            log_info "Syncing all dynamic zones: rndc sync -clean"
+            _sync_output=$($RNDC_BIN sync -clean 2>&1)
+            _sync_rc=$?
+            if [ $_sync_rc -ne 0 ]; then
+                log_warn "rndc sync -clean failed: $_sync_output"
+            fi
+
+            for _zone_name in $_full_bucket; do
+                _db_file="${_tmp_dir}/${_zone_name}.db"
+                _final_file="${CONF_OUTPUT_FILE}/${_zone_name}.db"
+                _stage_file="${_final_file}.new.$$"
 
                 if [ ! -s "$_db_file" ]; then
-                    log_warn "Zone file is empty, skipping: $_db_file"
+                    log_warn "Full rebuild: source .db missing or empty for $_zone_name"
                     continue
                 fi
 
-                # named-checkzone
-                if [ -n "$_checkzone_bin" ]; then
-                    log_info "Validating $_zone_name with named-checkzone..."
-                    _cz_output=$("$_checkzone_bin" "$_zone_name" "$_db_file" 2>&1)
-                    _cz_rc=$?
-                    if [ $_cz_rc -ne 0 ]; then
-                        log_err "named-checkzone failed for $_zone_name (exit code: $_cz_rc)"
-                        log_err "$_cz_output"
-                        log_err "Keeping previous zone file intact for $_zone_name."
-                        continue
-                    fi
-                    log_info "named-checkzone passed for $_zone_name: $_cz_output"
+                # Detect dynamic vs static by attempting a per-zone freeze.
+                # Success or "already frozen" → dynamic; "not dynamic" → static.
+                _is_dynamic=0
+                _freeze_output=$($RNDC_BIN freeze "$_zone_name" 2>&1)
+                _freeze_rc=$?
+                if [ $_freeze_rc -eq 0 ]; then
+                    _is_dynamic=1
+                    log_info "Frozen $_zone_name (dynamic)"
+                else
+                    case "$_freeze_output" in
+                        *"already frozen"*)
+                            _is_dynamic=1
+                            log_warn "rndc freeze $_zone_name: already frozen — proceeding"
+                            ;;
+                        *"not dynamic"*|*"not a dynamic"*)
+                            _is_dynamic=0
+                            ;;
+                        *)
+                            log_warn "rndc freeze $_zone_name: $_freeze_output"
+                            ;;
+                    esac
                 fi
 
-                # named-compilezone
+                # Stage to <final>.new.$$ first, then atomic rename. This
+                # only needs dir-write permission, not write access to the
+                # existing file — important because BIND may own a zone file
+                # after dynamic update journal flushes.
                 if [ -n "$_compilezone_bin" ]; then
                     log_info "Compiling $_zone_name to raw format..."
-                    _compile_output=$("$_compilezone_bin" -o "$_final_file" -F raw \
+                    _compile_output=$("$_compilezone_bin" -o "$_stage_file" -F raw \
                         "$_zone_name" "$_db_file" 2>&1)
                     _compile_rc=$?
                     if [ $_compile_rc -ne 0 ]; then
-                        log_err "named-compilezone failed for $_zone_name (exit code: $_compile_rc)"
-                        log_err "$_compile_output"
+                        log_err "named-compilezone failed for $_zone_name (rc=$_compile_rc): $_compile_output"
+                        rm -f "$_stage_file"
+                        if [ $_is_dynamic -eq 1 ]; then
+                            $RNDC_BIN thaw "$_zone_name" >/dev/null 2>&1 || true
+                        fi
                         continue
                     fi
                     log_info "Zone compiled: $_compile_output"
                 else
-                    mv "$_db_file" "$_final_file"
+                    if ! cp "$_db_file" "$_stage_file"; then
+                        log_err "Failed to stage $_db_file → $_stage_file"
+                        rm -f "$_stage_file"
+                        if [ $_is_dynamic -eq 1 ]; then
+                            $RNDC_BIN thaw "$_zone_name" >/dev/null 2>&1 || true
+                        fi
+                        continue
+                    fi
+                fi
+
+                chmod 664 "$_stage_file" 2>/dev/null || true
+                if ! mv "$_stage_file" "$_final_file"; then
+                    log_err "Failed to rename $_stage_file → $_final_file"
+                    rm -f "$_stage_file"
+                    if [ $_is_dynamic -eq 1 ]; then
+                        $RNDC_BIN thaw "$_zone_name" >/dev/null 2>&1 || true
+                    fi
+                    continue
+                fi
+
+                # Remove any orphaned journal — for dyn zones the freeze
+                # ensures no writer holds it; for static zones it shouldn't
+                # exist in the first place.
+                _jnl_file="${_final_file}.jnl"
+                if [ -f "$_jnl_file" ]; then
+                    rm -f "$_jnl_file"
+                    log_info "Removed orphaned journal: ${_zone_name}.db.jnl"
+                fi
+
+                # Activate the new file.
+                if [ $_is_dynamic -eq 1 ]; then
+                    log_info "Thawing $_zone_name (re-read from disk)"
+                    _thaw_output=$($RNDC_BIN thaw "$_zone_name" 2>&1)
+                    _thaw_rc=$?
+                    if [ $_thaw_rc -ne 0 ]; then
+                        log_err "rndc thaw $_zone_name failed: $_thaw_output"
+                    fi
+                else
+                    log_info "Reloading $_zone_name"
+                    _reload_output=$($RNDC_BIN reload "$_zone_name" 2>&1)
+                    _reload_rc=$?
+                    if [ $_reload_rc -ne 0 ]; then
+                        log_warn "rndc reload $_zone_name: $_reload_output"
+                    fi
                 fi
             done
-
-            # Remove any orphaned journal files after zone file writes
-            if [ $_zones_frozen -eq 1 ]; then
-                for _jnl_file in "$CONF_OUTPUT_FILE"/*.jnl; do
-                    [ ! -f "$_jnl_file" ] && continue
-                    rm -f "$_jnl_file"
-                    log_info "Removed orphaned journal: $(basename "$_jnl_file")"
-                done
-            fi
-
-            # Clean up tmp directory
-            rm -rf "$_tmp_dir"
-
         fi
 
-        # Per-source BIND reload
-        if [ $DO_RELOAD -eq 1 ]; then
-            # Reload all zones (may warn on frozen dynamic zones — thaw handles those)
-            log_info "Reloading all zones"
-            _reload_output=$($RNDC_BIN reload 2>&1)
-            _reload_rc=$?
-            if [ $_reload_rc -ne 0 ]; then
-                log_warn "rndc reload: $_reload_output"
-            else
-                log_info "All zones reloaded"
-            fi
-
-            # Thaw dynamic zones — reloads from disk and resumes dynamic updates
-            if [ $_zones_frozen -eq 1 ]; then
-                log_info "Thawing all dynamic zones"
-                _thaw_output=$($RNDC_BIN thaw 2>&1)
-                _thaw_rc=$?
-                if [ $_thaw_rc -ne 0 ]; then
-                    log_err "rndc thaw failed: $_thaw_output"
-                else
-                    log_info "All dynamic zones thawed"
+        # Phase 6: seed feed snapshots for every zone that took the full path
+        # AND is configured as incremental. This gives the next scheduled run
+        # a baseline to diff against — how a zone transitions from seed to
+        # incremental. Extract from the text .db in .tmp (compilezone does
+        # not consume its input so the file is still there).
+        if [ -n "$CONF_FEEDS_DIR" ]; then
+            for _zone_name in $_full_bucket; do
+                if is_incremental_zone "$_zone_name"; then
+                    _seed_src="${_tmp_dir}/${_zone_name}.db"
+                    if [ -f "$_seed_src" ]; then
+                        seed_feed_snapshot "$_zone_name" "$_seed_src" || true
+                    fi
                 fi
-            fi
+            done
         fi
 
+        # Clean up tmp directory
+        rm -rf "$_tmp_dir"
+
+        _total_zones=0
+        for _zone_name in $_valid_zones; do
+            _total_zones=$(( _total_zones + 1 ))
+        done
+        _full_count=0
+        for _zone_name in $_full_bucket; do
+            _full_count=$(( _full_count + 1 ))
+        done
+
+        log_info "Per-source run complete: zones=$_total_zones incremental=$_incr_applied_count full=$_full_count"
+
+        if [ $_any_failed -eq 1 ]; then
+            return 1
+        fi
         return 0
     fi
 

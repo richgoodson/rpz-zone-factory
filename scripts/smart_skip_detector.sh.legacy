@@ -1,0 +1,44 @@
+#!/bin/sh
+# ═════════════════════════════════════════════════════════════════════════
+# LEGACY / UNUSED — kept for reference only.
+#
+# Never wired into run-rpz.sh. Superseded by conditional HTTP support in
+# rpz_factory/cache.py and rpz_factory/fetcher.py (ETag + If-Modified-Since),
+# which is the real skip-if-unchanged mechanism and has been in use since
+# v0.5.0.
+#
+# Do not run this script.
+# ═════════════════════════════════════════════════════════════════════════
+#
+# smart_skip_detector.sh — Detects feed changes to skip unnecessary rebuilds
+# Usage: smart_skip_detector.sh <feed_url> <cache_dir> <feed_name>
+# Returns 0 if feed unchanged (skip), 1 if changed (rebuild)
+
+set -eu
+
+FEED_URL="$1"
+CACHE_DIR="$2"
+FEED_NAME="$3"
+HASH_FILE="${CACHE_DIR}/.hash_${FEED_NAME}"
+
+# Ensure cache directory exists
+mkdir -p "$CACHE_DIR"
+
+# Get current feed hash (sorted content)
+if ! CURRENT_HASH=$(curl -s -L "$FEED_URL" | sort | md5sum 2>/dev/null); then
+    echo "ERROR: Failed to fetch feed: $FEED_URL" >&2
+    exit 4
+fi
+
+# Check if we have a previous hash
+if [ -f "$HASH_FILE" ]; then
+    PREV_HASH=$(cat "$HASH_FILE" 2>/dev/null || echo "")
+    if [ "$PREV_HASH" = "$CURRENT_HASH" ]; then
+        echo "Feed unchanged for $FEED_NAME. Skipping rebuild."
+        exit 0  # No change - skip rebuild
+    fi
+fi
+
+# Feed changed or no previous hash - save new hash and rebuild
+echo "$CURRENT_HASH" > "$HASH_FILE"
+exit 4  # Feed changed - need rebuild

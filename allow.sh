@@ -1,12 +1,16 @@
 #!/bin/sh
 # allow.sh — Dynamic RPZ allowlist management via TSIG-authenticated nsupdate
-# Version: 0.4.1
+# Version: 0.5.0
 # Portable: Debian, Ubuntu, FreeBSD 13+
 # POSIX sh — no bashisms.
 #
 # Adds or removes domains from the RPZ allowlist zone using nsupdate
 # with TSIG authentication, and persists changes to the allowlist text
 # file so they survive rpz-zone-factory regeneration runs.
+#
+# v0.5.0: Allowlist text file now lives in CONF_FEEDS_DIR (alongside the
+#         other feed snapshots). Changes to the text file are reverted on
+#         nsupdate failure to keep the feed and live zone in sync.
 #
 # See usage() below or run with -h/--help.
 
@@ -89,6 +93,11 @@ fi
 if [ -z "$ALLOW_ZONE" ]; then
     ALLOW_ZONE="allowlist.rpz"
 fi
+# Fall back to feeds dir for allowlist file if still unset.
+# v0.5.0+: allowlist.txt lives alongside the per-zone feed snapshots.
+if [ -z "$ALLOWLIST_FILE" ] && [ -n "$CONF_FEEDS_DIR" ]; then
+    ALLOWLIST_FILE="${CONF_FEEDS_DIR}/allowlist.txt"
+fi
 # Audit log default: same directory as allowlist file, or script directory
 if [ -z "$AUDIT_LOG" ]; then
     if [ -n "$ALLOWLIST_FILE" ]; then
@@ -100,7 +109,7 @@ fi
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION="0.4.3"
+VERSION="0.5.0"
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
@@ -285,7 +294,10 @@ signed dynamic updates on the allowlist zone, and verifying the setup.
   Changes lost after rpz-zone-factory runs:
     - Make sure CONF_ALLOWLIST_FILE in .run-rpz.conf points to
       the same allowlist text file that allow.sh is updating
+      (default: \${CONF_FEEDS_DIR}/allowlist.txt)
     - allow.sh persists entries to this file so they survive regeneration
+    - If nsupdate fails, allow.sh reverts the text file edit automatically
+      so the feed and live zone stay in sync (v0.5.0+)
 
 SETUP
     exit "${1:-0}"
@@ -710,7 +722,10 @@ main() {
         fi
         printf "  Zone: %s | Server: %s\n\n" "$ALLOW_ZONE" "$ALLOW_SERVER"
 
-        # Step 1: Persist to allowlist text file FIRST (race condition mitigation)
+        # Step 1: Persist to allowlist text file FIRST.
+        # If nsupdate fails we revert this edit so the text file stays in
+        # sync with the live zone (run-rpz.sh uses the text file to compute
+        # incremental diffs on the next scheduled run).
         if ! allowlist_add "$DOMAIN" "$ALLOWLIST_FILE"; then
             printf "\nERROR: Failed to update allowlist file. Aborting.\n" >&2
             exit 1
@@ -726,9 +741,13 @@ main() {
             if [ -n "$_nsupdate_output" ]; then
                 printf "  %s\n" "$_nsupdate_output" >&2
             fi
-            printf "\n  The domain was added to the allowlist text file but the\n" >&2
-            printf "  dynamic update failed. The domain will take effect on the\n" >&2
-            printf "  next scheduled rpz-zone-factory run.\n" >&2
+            # Revert the allowlist file edit so it matches the live zone.
+            printf "  Reverting allowlist file edit...\n" >&2
+            if allowlist_remove "$DOMAIN" "$ALLOWLIST_FILE" >/dev/null 2>&1; then
+                printf "  Allowlist file reverted.\n" >&2
+            else
+                printf "  WARNING: Failed to revert allowlist file — manual cleanup needed.\n" >&2
+            fi
             audit_write "add" "$DOMAIN" "FAIL:nsupdate-rc${_nsupdate_rc}"
             exit 1
         fi
@@ -747,7 +766,8 @@ main() {
         printf "  Entries: %s + *.%s\n" "$DOMAIN" "$DOMAIN"
         printf "  Zone: %s | Server: %s\n\n" "$ALLOW_ZONE" "$ALLOW_SERVER"
 
-        # Step 1: Remove from allowlist text file FIRST
+        # Step 1: Remove from allowlist text file FIRST.
+        # If nsupdate fails we re-add it so the text file stays in sync.
         if ! allowlist_remove "$DOMAIN" "$ALLOWLIST_FILE"; then
             printf "\nERROR: Failed to update allowlist file. Aborting.\n" >&2
             exit 1
@@ -763,9 +783,13 @@ main() {
             if [ -n "$_nsupdate_output" ]; then
                 printf "  %s\n" "$_nsupdate_output" >&2
             fi
-            printf "\n  The domain was removed from the allowlist text file but the\n" >&2
-            printf "  dynamic update failed. The change will take effect on the\n" >&2
-            printf "  next scheduled rpz-zone-factory run.\n" >&2
+            # Revert the allowlist file edit so it matches the live zone.
+            printf "  Reverting allowlist file edit...\n" >&2
+            if allowlist_add "$DOMAIN" "$ALLOWLIST_FILE" >/dev/null 2>&1; then
+                printf "  Allowlist file reverted.\n" >&2
+            else
+                printf "  WARNING: Failed to revert allowlist file — manual cleanup needed.\n" >&2
+            fi
             audit_write "remove" "$DOMAIN" "FAIL:nsupdate-rc${_nsupdate_rc}"
             exit 1
         fi
