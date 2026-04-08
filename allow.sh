@@ -177,7 +177,7 @@ HOW IT WORKS:
   2. Appends/removes the domain in the allowlist text file (persistent store)
   3. Sends nsupdate with TSIG key to add/remove RPZ passthru records
   4. Runs 'rndc sync <zone>' to flush in-memory state to the .db file,
-     PRESERVING the journal so slaves can pull the change via IXFR
+     PRESERVING the journal so secondaries can pull the change via IXFR
 
   The allowlist text file is modified BEFORE the dynamic update to avoid a
   race condition where a scheduled rpz-zone-factory run could overwrite the
@@ -268,7 +268,7 @@ signed dynamic updates on the allowlist zone, and verifying the setup.
   allow-update line to each per-source threat zone you want to update
   incrementally (urlhaus.rpz, cisa-kev.rpz, spamhaus-drop.rpz,
   scamsniffer.rpz, cryptoscamdb.rpz). Without this, the incremental
-  path silently falls back to a full rebuild for that zone and slaves
+  path silently falls back to a full rebuild for that zone and secondaries
   pull a full AXFR instead of an IXFR delta.
 
 ─── 6. Reload BIND ────────────────────────────────────────────────────
@@ -681,13 +681,13 @@ audit_show() {
 # ─── rndc sync ────────────────────────────────────────────────────────────────
 
 # Flush BIND's in-memory state for the zone to its .db file but PRESERVE the
-# journal (.jnl). This is critical for IXFR: slaves use the journal to pull
+# journal (.jnl). This is critical for IXFR: secondaries use the journal to pull
 # only the delta we just nsupdate'd, instead of re-AXFR'ing the whole zone.
 #
 # Pre-v0.6.0 this function used `rndc sync -clean` (which deletes the .jnl
 # after writing), but that was a v0.4.0-era behavior from when run-rpz.sh
 # always wrote full zone files. With v0.6.0+ IXFR support, removing the
-# journal after every nsupdate would force every slave refresh to AXFR.
+# journal after every nsupdate would force every secondary refresh to AXFR.
 rndc_sync() {
     _zone="$1"
 

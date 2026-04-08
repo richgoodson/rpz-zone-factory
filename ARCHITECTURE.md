@@ -40,9 +40,10 @@ read this first.
          │             │      │  reload →    │
          │ BIND writes │      │  thaw)       │
          │ .jnl, bumps │      │              │
-         │ serial      │      │ Slaves AXFR  │
-         │             │      │              │
-         │ Slaves IXFR │      │              │
+         │ serial      │      │ Secondaries  │
+         │             │      │ AXFR         │
+         │ Secondaries │      │              │
+         │ IXFR        │      │              │
          └─────────────┘      └──────────────┘
 ```
 
@@ -50,7 +51,7 @@ read this first.
 The shell wrapper decides per-zone whether to apply them via full rebuild
 (freeze/reload/thaw) or to diff them against a saved snapshot and apply only
 the changes via TSIG-authenticated `nsupdate` (which makes BIND write to the
-journal file and bump the SOA serial, which enables IXFR from slaves).
+journal file and bump the SOA serial, which enables IXFR to secondaries).
 
 ---
 
@@ -816,7 +817,7 @@ cat /var/log/syslog | grep rpz-zone-factory
 ```
 
 When you're confident, expand `CONF_INCREMENTAL_ZONES` to all zones and
-watch slave IXFR traffic in the BIND query log to confirm they're only
+watch secondary IXFR traffic in the BIND query log to confirm they're only
 transferring deltas.
 
 ---

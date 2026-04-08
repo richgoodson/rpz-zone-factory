@@ -9,7 +9,7 @@
 #         the previous feed against the newly generated zone and applying
 #         only the additions/deletions via TSIG-authenticated nsupdate.
 #         BIND writes the delta to the journal and bumps the SOA serial,
-#         which allows slaves to IXFR only the changes instead of AXFR'ing
+#         which allows secondaries to IXFR only the changes instead of AXFR'ing
 #         the entire zone on every scheduled run.
 #
 # Usage:
@@ -232,7 +232,7 @@ INCREMENTAL UPDATES (v0.6.0+):
   by diffing the previously-fetched feed against the newly generated zone
   and sending only the additions/deletions via TSIG-authenticated nsupdate.
   BIND writes the delta to the zone's journal file, bumps the SOA serial,
-  and slaves receive NOTIFY → IXFR instead of re-AXFR'ing the whole zone.
+  and secondaries receive NOTIFY → IXFR instead of re-AXFR'ing the whole zone.
 
   Feed snapshots live in CONF_FEEDS_DIR (default:
   /usr/local/etc/namedb/master/rpz/feeds). The allowlist source file also
@@ -983,7 +983,7 @@ run_setup() {
         printf "  previous feed snapshot against the freshly generated zone and\n"
         printf "  applies only the additions and deletions via nsupdate. BIND\n"
         printf "  writes the delta to the zone's journal (.jnl) and bumps the\n"
-        printf "  SOA serial. Slaves then receive NOTIFY → IXFR, transferring\n"
+        printf "  SOA serial. Secondaries then receive NOTIFY → IXFR, transferring\n"
         printf "  only the changes instead of re-AXFR'ing the whole zone.\n\n"
         printf "  Requirements for each incremental zone:\n"
         printf "    • BIND zone definition has: allow-update { key \"<keyname>\"; };\n"
@@ -1286,7 +1286,7 @@ CONF
             printf "  • Incremental (IXFR) zones: %s\n" "$CONF_INCREMENTAL_ZONES"
             printf "    These zones MUST have 'allow-update { key ... };' in the zone\n"
             printf "    statement. run-rpz.sh applies diffs via nsupdate; BIND bumps\n"
-            printf "    the SOA serial automatically and slaves IXFR the delta.\n"
+            printf "    the SOA serial automatically and secondaries IXFR the delta.\n"
             printf "  • Force a full rebuild (bypassing incremental) with:\n"
             printf "      %s --full-rebuild\n" "$(basename "$0")"
             printf "\n"
@@ -1461,7 +1461,7 @@ find_named_tool() {
 #               - diff .previous vs .current → additions + deletions
 #               - empty diff → no-op, discard .current, skip zone
 #               - non-empty → send nsupdate batch with TSIG, BIND bumps serial
-#                 and writes to journal; slaves receive NOTIFY and IXFR
+#                 and writes to journal; secondaries receive NOTIFY and IXFR
 #               - on success: rename .current → .previous
 #               - on failure: fall back to full rebuild for this zone
 #
@@ -1978,7 +1978,7 @@ run_rpz() {
                     # copy from .tmp — it has a stale Python-computed serial
                     # (hour-based) that would regress BIND's state and produce
                     # "serial has gone backwards" errors, potentially breaking
-                    # IXFR for slaves.
+                    # IXFR for secondaries.
                     #
                     # The .tmp/.db file is still useful as the input to the
                     # next scheduled run's diff (via .list.current vs

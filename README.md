@@ -2,14 +2,14 @@
 
 Threat intelligence pipeline for DNS. Fetches from 5 public feeds, builds RFC 5782 RPZ zone files for BIND, and optionally outputs Pi-hole flat blocklists.
 
-Per-source zones support **incremental updates via TSIG-authenticated `nsupdate`** so slaves receive **NOTIFY → IXFR** with only the changed records, instead of re-AXFR'ing the whole zone on every refresh. Steady-state runs (no upstream changes) exit in seconds via a 304-aware fast-path.
+Per-source zones support **incremental updates via TSIG-authenticated `nsupdate`** so secondaries receive **NOTIFY → IXFR** with only the changed records, instead of re-AXFR'ing the whole zone on every refresh. Steady-state runs (no upstream changes) exit in seconds via a 304-aware fast-path.
 
 ## How It Works
 
 Two shell scripts handle all operations:
 
 - **`run-rpz.sh`** — the main orchestrator. Manages the Python venv, runs the pipeline, validates zones with `named-checkzone`, applies incremental updates via `nsupdate`, falls back to per-zone freeze/replace/thaw on full rebuilds, and (when nothing has changed) skips the entire pipeline via the v0.7.0 fast-path. Run it from cron or interactively. One-time `--setup` wizard configures everything.
-- **`allow.sh`** — real-time allowlist management. Adds or removes domains from the RPZ allowlist zone via TSIG-authenticated `nsupdate`, with an append-only audit log. Preserves the journal so slaves see the change as an IXFR delta.
+- **`allow.sh`** — real-time allowlist management. Adds or removes domains from the RPZ allowlist zone via TSIG-authenticated `nsupdate`, with an append-only audit log. Preserves the journal so secondaries see the change as an IXFR delta.
 
 The Python engine (`rpz_factory/`) does the actual fetching, parsing, filtering, and zone rendering. The shell scripts call it — you don't need to invoke Python directly.
 
@@ -148,7 +148,7 @@ In a steady state where nothing upstream has changed, the run completes in rough
 
 ### Incremental updates / IXFR (v0.6.0+)
 
-Per-source zones listed in `CONF_INCREMENTAL_ZONES` are updated by **diffing the previously-fetched feed against the freshly generated zone** and sending only the additions/deletions via TSIG-authenticated `nsupdate`. BIND writes the delta to the zone's journal, bumps the SOA serial, and slaves receive **NOTIFY → IXFR** instead of re-AXFR'ing the whole zone.
+Per-source zones listed in `CONF_INCREMENTAL_ZONES` are updated by **diffing the previously-fetched feed against the freshly generated zone** and sending only the additions/deletions via TSIG-authenticated `nsupdate`. BIND writes the delta to the zone's journal, bumps the SOA serial, and secondaries receive **NOTIFY → IXFR** instead of re-AXFR'ing the whole zone.
 
 For a typical day where upstream feeds add/remove a handful of domains, this turns megabyte-sized AXFRs into hundred-byte IXFR deltas. A single domain add transfers as 6 records (~230 bytes) instead of the full zone (~5000+ records / ~150KB for `urlhaus.rpz`).
 
@@ -190,9 +190,9 @@ The pipeline applies rule-based filtering to reduce false positives:
 
 ### Per-source mode (recommended)
 
-Define each zone in `named.conf`. **Every zone you want updated incrementally needs `allow-update { key "rpz-update"; };`** so that `nsupdate` (run-rpz.sh's incremental path, and `allow.sh`) can deliver TSIG-authenticated dynamic updates. Without `allow-update`, `nsupdate` will be REFUSED and the zone silently falls back to a full rebuild on every run, forcing slaves to AXFR.
+Define each zone in `named.conf`. **Every zone you want updated incrementally needs `allow-update { key "rpz-update"; };`** so that `nsupdate` (run-rpz.sh's incremental path, and `allow.sh`) can deliver TSIG-authenticated dynamic updates. Without `allow-update`, `nsupdate` will be REFUSED and the zone silently falls back to a full rebuild on every run, forcing secondaries to AXFR.
 
-Adjust `allow-transfer` to permit your slave nameservers (shown here as a placeholder ACL `slaves`) and add `also-notify` so they're notified of changes.
+Adjust `allow-transfer` to permit your secondary nameservers (shown here as a placeholder ACL `secondaries`) and add `also-notify` so they're notified of changes.
 
 ```bind
 // Allowlist zone — evaluated first, passthru overrides blocks
@@ -200,9 +200,9 @@ zone "allowlist.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/allowlist.rpz.db";
     allow-update { key "rpz-update"; };
-    allow-query { localhost; slaves; };
-    allow-transfer { slaves; };
-    also-notify { /* slave IPs */ };
+    allow-query { localhost; secondaries; };
+    allow-transfer { secondaries; };
+    also-notify { /* secondary IPs */ };
 };
 
 // Threat source zones — all need allow-update for v0.6.0 incremental updates
@@ -210,45 +210,45 @@ zone "urlhaus.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/urlhaus.rpz.db";
     allow-update { key "rpz-update"; };
-    allow-query { localhost; slaves; };
-    allow-transfer { slaves; };
-    also-notify { /* slave IPs */ };
+    allow-query { localhost; secondaries; };
+    allow-transfer { secondaries; };
+    also-notify { /* secondary IPs */ };
 };
 
 zone "cisa-kev.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/cisa-kev.rpz.db";
     allow-update { key "rpz-update"; };
-    allow-query { localhost; slaves; };
-    allow-transfer { slaves; };
-    also-notify { /* slave IPs */ };
+    allow-query { localhost; secondaries; };
+    allow-transfer { secondaries; };
+    also-notify { /* secondary IPs */ };
 };
 
 zone "spamhaus-drop.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/spamhaus-drop.rpz.db";
     allow-update { key "rpz-update"; };
-    allow-query { localhost; slaves; };
-    allow-transfer { slaves; };
-    also-notify { /* slave IPs */ };
+    allow-query { localhost; secondaries; };
+    allow-transfer { secondaries; };
+    also-notify { /* secondary IPs */ };
 };
 
 zone "scamsniffer.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/scamsniffer.rpz.db";
     allow-update { key "rpz-update"; };
-    allow-query { localhost; slaves; };
-    allow-transfer { slaves; };
-    also-notify { /* slave IPs */ };
+    allow-query { localhost; secondaries; };
+    allow-transfer { secondaries; };
+    also-notify { /* secondary IPs */ };
 };
 
 zone "cryptoscamdb.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/cryptoscamdb.rpz.db";
     allow-update { key "rpz-update"; };
-    allow-query { localhost; slaves; };
-    allow-transfer { slaves; };
-    also-notify { /* slave IPs */ };
+    allow-query { localhost; secondaries; };
+    allow-transfer { secondaries; };
+    also-notify { /* secondary IPs */ };
 };
 ```
 
@@ -281,9 +281,9 @@ If you prefer a single combined zone:
 zone "block.rpz" {
     type primary;
     file "/etc/namedb/master/block.rpz.db";
-    allow-query { localhost; slaves; };
-    allow-transfer { slaves; };
-    also-notify { /* slave IPs */ };
+    allow-query { localhost; secondaries; };
+    allow-transfer { secondaries; };
+    also-notify { /* secondary IPs */ };
 };
 
 options {
@@ -293,7 +293,7 @@ options {
 };
 ```
 
-> **Combined mode is AXFR-only.** Unlike per-source mode, combined mode rewrites the entire zone file every run instead of using `nsupdate`. There's no journal for slaves to pull deltas from, so every refresh transfers the whole zone. `allow-update` is therefore not needed (and not useful) on the combined zone. If you want IXFR support, switch to per-source mode.
+> **Combined mode is AXFR-only.** Unlike per-source mode, combined mode rewrites the entire zone file every run instead of using `nsupdate`. There's no journal for secondaries to pull deltas from, so every refresh transfers the whole zone. `allow-update` is therefore not needed (and not useful) on the combined zone. If you want IXFR support, switch to per-source mode.
 
 ### Deployment
 

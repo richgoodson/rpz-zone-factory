@@ -99,12 +99,12 @@ Edit `.run-rpz.conf` directly or re-run `--setup` to reconfigure.
 
 ## Incremental Updates (IXFR) — v0.6.0+
 
-Per-source zones listed in `CONF_INCREMENTAL_ZONES` are updated by **diffing the previously-fetched feed against the freshly generated zone** and sending only the additions/deletions via TSIG-authenticated `nsupdate`. BIND writes the delta to the zone's journal, bumps the SOA serial, and slaves receive **NOTIFY → IXFR** instead of re-AXFR'ing the whole zone — turning megabyte transfers into hundred-byte deltas.
+Per-source zones listed in `CONF_INCREMENTAL_ZONES` are updated by **diffing the previously-fetched feed against the freshly generated zone** and sending only the additions/deletions via TSIG-authenticated `nsupdate`. BIND writes the delta to the zone's journal, bumps the SOA serial, and secondaries receive **NOTIFY → IXFR** instead of re-AXFR'ing the whole zone — turning megabyte transfers into hundred-byte deltas.
 
 ### How a zone goes from cold to incremental
 
 1. **First run for a zone:** no `.list.previous` baseline exists yet, so the zone takes the full rebuild path (per-zone freeze → file replace → thaw). After the rebuild, run-rpz.sh extracts the domain list from the freshly rendered `.db` and writes it to `<feeds>/<zone>.list.previous`. This is the **seed**.
-2. **Subsequent runs:** the script diffs the new feed against `.list.previous`. If `adds=0 dels=0`, nothing happens (no nsupdate, no journal entry, no slave traffic). If there are real diffs, a single `nsupdate` transaction adds and removes only the changed records, BIND auto-bumps the serial and writes a journal entry, and slaves pick up the delta via IXFR.
+2. **Subsequent runs:** the script diffs the new feed against `.list.previous`. If `adds=0 dels=0`, nothing happens (no nsupdate, no journal entry, no secondary traffic). If there are real diffs, a single `nsupdate` transaction adds and removes only the changed records, BIND auto-bumps the serial and writes a journal entry, and secondaries pick up the delta via IXFR.
 3. **`.list.previous` is refreshed** after each successful incremental run so the next diff is computed against the current state.
 
 ### Falling back to full rebuild
@@ -134,14 +134,14 @@ Static (non-dynamic) zones in the full bucket use plain `rndc reload <zone>` ins
 
 ### Verifying IXFR is working
 
-On a slave, look for transfer log entries with a small record count:
+On a secondary, look for transfer log entries with a small record count:
 
 ```
 zone urlhaus.rpz/IN: Transfer started.
-transfer of 'urlhaus.rpz/IN' from <master>#53: Transfer completed: 1 messages, 6 records, 229 bytes (serial 2026040827)
+transfer of 'urlhaus.rpz/IN' from <primary>#53: Transfer completed: 1 messages, 6 records, 229 bytes (serial 2026040827)
 ```
 
-`6 records` is the IXFR delta for a single domain add (old SOA, new SOA, two CNAMEs for `domain` and `*.domain`). If you instead see hundreds or thousands of records for what should have been a small change, the slave is doing AXFR — check that the master has `allow-update` on the zone and that `nsupdate` is succeeding.
+`6 records` is the IXFR delta for a single domain add (old SOA, new SOA, two CNAMEs for `domain` and `*.domain`). If you instead see hundreds or thousands of records for what should have been a small change, the secondary is doing AXFR — check that the primary has `allow-update` on the zone and that `nsupdate` is succeeding.
 
 ## Fast-path: skip when nothing changed — v0.7.0+
 
@@ -347,7 +347,7 @@ All settings can be overridden with flags. Run `./allow.sh -h` for the full flag
 1. Validates the domain name
 2. Appends/removes the domain in the allowlist text file (race condition safe — file is updated before the dynamic update)
 3. Sends `nsupdate` with TSIG key to add/remove RPZ passthru records
-4. Runs `rndc sync <zone>` to flush in-memory state to the `.db` file. **The journal (`.jnl`) is preserved** so slaves can pull the change via IXFR instead of re-AXFR'ing the whole zone. (Pre-v0.6.0 this used `rndc sync -clean`, which removed the journal — that was a v0.4.x-era behavior carried over from when run-rpz.sh always wrote full zone files. Fixed in v0.7.0.)
+4. Runs `rndc sync <zone>` to flush in-memory state to the `.db` file. **The journal (`.jnl`) is preserved** so secondaries can pull the change via IXFR instead of re-AXFR'ing the whole zone. (Pre-v0.6.0 this used `rndc sync -clean`, which removed the journal — that was a v0.4.x-era behavior carried over from when run-rpz.sh always wrote full zone files. Fixed in v0.7.0.)
 5. Writes an entry to the audit log (success or failure)
 
 ### Audit log
