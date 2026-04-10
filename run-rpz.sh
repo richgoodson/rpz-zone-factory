@@ -754,6 +754,7 @@ run_setup() {
 
     printf "    scamsniffer  — Scam Sniffer crypto scam domains\n"
     printf "    cryptoscamdb — CryptoScamDB phishing/scam domains\n"
+    printf "    et-compromised — Emerging Threats compromised IPs (single hosts)\n"
     printf "\n"
     _def_sources="${CONF_SOURCES:-all}"
     CONF_SOURCES=$(prompt_value "Sources (space-separated, or 'all')" "$_def_sources")
@@ -991,7 +992,8 @@ run_setup() {
         printf "    • First-ever run for the zone falls back to full rebuild (seed)\n\n"
 
         printf "  Available per-source zones: allowlist.rpz urlhaus.rpz cisa-kev.rpz\n"
-        printf "                              spamhaus-drop.rpz scamsniffer.rpz cryptoscamdb.rpz\n\n"
+        printf "                              spamhaus-drop.rpz scamsniffer.rpz cryptoscamdb.rpz\n"
+        printf "                              et-compromised.rpz\n\n"
         printf "  Enter a space-separated list of zones to enable, or:\n"
         printf "    all   = enable incremental for every per-source zone (recommended)\n"
         printf "    none  = disable incremental, use full rebuild only\n\n"
@@ -1001,7 +1003,7 @@ run_setup() {
 
         case "$_incr_choice" in
             all|ALL)
-                CONF_INCREMENTAL_ZONES="allowlist.rpz urlhaus.rpz cisa-kev.rpz spamhaus-drop.rpz scamsniffer.rpz cryptoscamdb.rpz"
+                CONF_INCREMENTAL_ZONES="allowlist.rpz urlhaus.rpz cisa-kev.rpz spamhaus-drop.rpz scamsniffer.rpz cryptoscamdb.rpz et-compromised.rpz"
                 printf "  ✓ All per-source zones enabled for incremental updates\n"
                 ;;
             none|NONE|"")
@@ -1200,7 +1202,7 @@ CONF
             # Show each source zone. If TSIG is configured AND the zone is
             # in CONF_INCREMENTAL_ZONES, include allow-update so run-rpz.sh
             # can deliver IXFR-style incremental updates via nsupdate.
-            for _src_zone in urlhaus.rpz cisa-kev.rpz spamhaus-drop.rpz scamsniffer.rpz cryptoscamdb.rpz; do
+            for _src_zone in urlhaus.rpz cisa-kev.rpz spamhaus-drop.rpz scamsniffer.rpz cryptoscamdb.rpz et-compromised.rpz; do
                 printf "  zone \"%s\" {\n" "$_src_zone"
                 printf "      type primary;\n"
                 printf "      file \"%s/%s.db\";\n" "$_ex_dir" "$_src_zone"
@@ -1231,6 +1233,7 @@ CONF
 
             printf "          zone \"scamsniffer.rpz\";\n"
             printf "          zone \"cryptoscamdb.rpz\";\n"
+            printf "          zone \"et-compromised.rpz\";\n"
             printf "      };\n"
             printf "  };\n"
 
@@ -1396,18 +1399,6 @@ build_args_from_config() {
     # all-sources-unchanged fast-path.
     if [ $DO_FORCE -eq 1 ]; then
         RPZ_ARGS="$RPZ_ARGS --force"
-    fi
-
-    # Apply reload from config if not set via CLI
-    # In per-source mode, skip single-zone reload (handled separately)
-    if [ $DO_RELOAD -eq 0 ] && [ "$CONF_RELOAD" = "yes" ]; then
-        if [ "$CONF_PER_SOURCE" = "yes" ]; then
-            DO_RELOAD=1
-            RELOAD_ZONE="__per_source__"
-        elif [ -n "$CONF_RELOAD_ZONE" ]; then
-            DO_RELOAD=1
-            RELOAD_ZONE="$CONF_RELOAD_ZONE"
-        fi
     fi
 
     log_info "Using saved config from .run-rpz.conf"
@@ -1797,6 +1788,36 @@ run_rpz() {
             log_err "No arguments given and no .run-rpz.conf found."
             log_err "Run '$0 --setup' first, or pass arguments after --"
             return 1
+        fi
+    fi
+
+    # Apply reload from config if not set via CLI. This runs regardless of
+    # whether args came from build_args_from_config or from "-- <args>" on
+    # the CLI, so that explicit-arg runs still get BIND reload/freeze/thaw.
+    if [ $DO_RELOAD -eq 0 ] && [ "$CONF_RELOAD" = "yes" ]; then
+        if [ "$CONF_PER_SOURCE" = "yes" ]; then
+            DO_RELOAD=1
+            RELOAD_ZONE="__per_source__"
+        elif [ -n "$CONF_RELOAD_ZONE" ]; then
+            DO_RELOAD=1
+            RELOAD_ZONE="$CONF_RELOAD_ZONE"
+        fi
+    fi
+
+    # Seed-gap detection: if any incremental zone is missing its .list.previous
+    # snapshot, the v0.7.0 fast-path would skip rendering and prevent the shell
+    # from ever seeding. Inject --force so Python renders all zones, letting
+    # the shell seed the new ones. This is a one-time cost per new zone.
+    if [ $DO_FORCE -eq 0 ] && [ -n "$CONF_INCREMENTAL_ZONES" ] && [ -n "$CONF_FEEDS_DIR" ]; then
+        _need_force=0
+        for _iz in $CONF_INCREMENTAL_ZONES; do
+            if [ ! -f "${CONF_FEEDS_DIR}/${_iz}.list.previous" ]; then
+                log_info "Seed-gap: ${_iz} has no .list.previous — adding --force"
+                _need_force=1
+            fi
+        done
+        if [ $_need_force -eq 1 ]; then
+            RPZ_ARGS="$RPZ_ARGS --force"
         fi
     fi
 

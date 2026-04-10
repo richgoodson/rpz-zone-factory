@@ -20,6 +20,7 @@ class SourceName(enum.Enum):
     SPAMHAUS_DBL = "spamhaus_dbl"
     SCAMSNIFFER = "scamsniffer"
     CRYPTOSCAMDB = "cryptoscamdb"
+    ET_COMPROMISED_IPS = "et_compromised_ips"
 
 
 @dataclass(frozen=True)

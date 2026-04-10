@@ -12,7 +12,7 @@ from rpz_factory.cache import load_cache, load_http_meta, write_cache, write_htt
 from rpz_factory.fetcher import get_last_fetch_meta
 from rpz_factory.filters import filter_entries
 from rpz_factory.models import FetchResult, HttpMeta, SourceName, ThreatEntry
-from rpz_factory.parsers import abusech, cisa, cryptoscamdb, scamsniffer, spamhaus
+from rpz_factory.parsers import abusech, cisa, cryptoscamdb, emergingthreats, scamsniffer, spamhaus
 from rpz_factory.renderers import pihole, rpz
 from rpz_factory.renderers.rpz import compute_next_serial
 
@@ -22,7 +22,7 @@ from rpz_factory.renderers.rpz import compute_next_serial
 # reload, seeding).
 EXIT_NO_CHANGES = 2
 
-ALL_SOURCES = ["urlhaus", "cisa", "drop", "scamsniffer", "cryptoscamdb"]
+ALL_SOURCES = ["urlhaus", "cisa", "drop", "scamsniffer", "cryptoscamdb", "et-compromised"]
 
 # Per-source RPZ zone names (used with --per-source)
 SOURCE_ZONE_NAMES = {
@@ -31,6 +31,7 @@ SOURCE_ZONE_NAMES = {
     "drop": "spamhaus-drop.rpz",
     "scamsniffer": "scamsniffer.rpz",
     "cryptoscamdb": "cryptoscamdb.rpz",
+    "et-compromised": "et-compromised.rpz",
 }
 
 
@@ -120,6 +121,7 @@ SOURCE_FETCHERS = {
     "drop": spamhaus.fetch_drop,
     "scamsniffer": scamsniffer.fetch_and_parse,
     "cryptoscamdb": cryptoscamdb.fetch_and_parse,
+    "et-compromised": emergingthreats.fetch_and_parse,
 }
 
 # URLs per source (for HTTP meta lookup after fetch)
@@ -129,6 +131,7 @@ _SOURCE_URLS = {
     "drop": "https://www.spamhaus.org/drop/drop.txt",
     "scamsniffer": "https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/domains.json",
     "cryptoscamdb": "https://raw.githubusercontent.com/CryptoScamDB/blacklist/master/data/urls.yaml",
+    "et-compromised": "https://rules.emergingthreats.net/blockrules/compromised-ips.txt",
 }
 
 # Map source keys to SourceName enum values for cache lookups
@@ -138,6 +141,7 @@ _SOURCE_KEY_TO_NAME = {
     "drop": "spamhaus_drop",
     "scamsniffer": "scamsniffer",
     "cryptoscamdb": "cryptoscamdb",
+    "et-compromised": "et_compromised_ips",
 }
 
 # Reverse mapping: SourceName enum value -> source key
