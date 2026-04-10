@@ -68,6 +68,7 @@ See `./allow.sh --setup` for TSIG key configuration.
 | Spamhaus DROP | IP/CIDR | https://www.spamhaus.org/drop/drop.txt |
 | Scam Sniffer | Domains (crypto scams) | https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/domains.json |
 | CryptoScamDB | Domains (crypto phishing) | https://raw.githubusercontent.com/CryptoScamDB/blacklist/master/data/urls.yaml |
+| Emerging Threats | IPs (compromised hosts) | https://rules.emergingthreats.net/blockrules/compromised-ips.txt |
 
 ## Requirements
 
@@ -105,7 +106,7 @@ python run.py --sources urlhaus drop scamsniffer --output rpz
 python run.py --per-source --output-file /etc/namedb/master/rpz/ -v
 ```
 
-Creates separate zone files: `urlhaus.rpz.db`, `cisa-kev.rpz.db`, `spamhaus-drop.rpz.db`, `scamsniffer.rpz.db`, `cryptoscamdb.rpz.db`. BIND logs then show which threat list triggered each block.
+Creates separate zone files: `urlhaus.rpz.db`, `cisa-kev.rpz.db`, `spamhaus-drop.rpz.db`, `scamsniffer.rpz.db`, `cryptoscamdb.rpz.db`, `et-compromised.rpz.db`. BIND logs then show which threat list triggered each block.
 
 ### Per-source with allowlist
 
@@ -250,6 +251,15 @@ zone "cryptoscamdb.rpz" {
     allow-transfer { secondaries; };
     also-notify { /* secondary IPs */ };
 };
+
+zone "et-compromised.rpz" {
+    type primary;
+    file "/etc/namedb/master/rpz/et-compromised.rpz.db";
+    allow-update { key "rpz-update"; };
+    allow-query { localhost; secondaries; };
+    allow-transfer { secondaries; };
+    also-notify { /* secondary IPs */ };
+};
 ```
 
 The TSIG key referenced by `allow-update` must be defined elsewhere in `named.conf` (typically via `include "/etc/bind/tsig/rpz-update.key";` at the top level). See `./allow.sh --setup` for the full key generation walkthrough.
@@ -267,6 +277,7 @@ options {
         zone "spamhaus-drop.rpz";
         zone "scamsniffer.rpz";
         zone "cryptoscamdb.rpz";
+        zone "et-compromised.rpz";
     };
 };
 ```
@@ -379,6 +390,7 @@ rpz-zone-factory/
 │   │   ├── abusech.py       # Abuse.ch URLhaus RPZ feed parser
 │   │   ├── cisa.py          # CISA KEV JSON parser
 │   │   ├── cryptoscamdb.py  # CryptoScamDB YAML blacklist parser
+│   │   ├── emergingthreats.py # Emerging Threats compromised-IPs parser
 │   │   ├── scamsniffer.py   # Scam Sniffer JSON blacklist parser
 │   │   └── spamhaus.py      # Spamhaus DROP parser
 │   └── renderers/
