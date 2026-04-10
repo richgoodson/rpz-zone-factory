@@ -1,6 +1,6 @@
 # rpz-zone-factory
 
-Threat intelligence pipeline for DNS. Fetches from 5 public feeds, builds RFC 5782 RPZ zone files for BIND, and optionally outputs Pi-hole flat blocklists.
+Threat intelligence pipeline for DNS. Fetches from 5 public feeds, builds RFC 5782 RPZ zone files for BIND, and optionally outputs Pi-hole flat blocklists.  Currently used in a FreeBSD production environment, so it works, but may be a bit confusing to set up as the project has evolved over time.  I've tried to add Linux specific options, but those have not been extensively tested.
 
 Per-source zones support **incremental updates via TSIG-authenticated `nsupdate`** so secondaries receive **NOTIFY → IXFR** with only the changed records, instead of re-AXFR'ing the whole zone on every refresh. Steady-state runs (no upstream changes) exit in seconds via a 304-aware fast-path.
 
@@ -35,7 +35,7 @@ crontab -e
 ### Cron examples
 
 ```cron
-# Per-source RPZ zones for BIND, every 4 hours
+# Per-source RPZ zones for BIND, every 4 hours - change directory to where you have it installed
 15 */4 * * * /opt/rpz-zone-factory/run-rpz.sh
 
 # Pi-hole flat file, daily at 3:05 AM
