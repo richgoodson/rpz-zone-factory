@@ -1,7 +1,8 @@
 # ARCHITECTURE.md — rpz-zone-factory internals
 
-This is a developer/maintainer reference. For user-facing docs see `README.md`
-and `README-runner.md`.
+This is a developer/maintainer reference. For user-facing docs see `README.md`.
+For a focused tour of the Python engine (CLI flags, exit codes, parsers, renderers),
+see `PYTHON.md`.
 
 This file describes every source file, every significant function, the data
 flow, and the design decisions behind them. If you are editing this project,
@@ -60,8 +61,8 @@ journal file and bump the SOA serial, which enables IXFR to secondaries).
 ```
 rpz-zone-factory/
 ├── ARCHITECTURE.md          # this file
-├── README.md                # user-facing overview
-├── README-runner.md         # user-facing run-rpz.sh + allow.sh docs
+├── README.md                # user-facing overview + operator docs
+├── PYTHON.md                # Python engine reference (CLI, parsers, renderers)
 ├── Makefile                 # `make deploy` → rsync to remote BIND host
 ├── requirements.txt         # Python deps (requests, pyyaml)
 │
