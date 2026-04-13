@@ -1,6 +1,6 @@
 #!/bin/sh
 # run-rpz.sh — Cron/interactive wrapper for rpz-zone-factory
-# Version: 0.6.0
+# Version: 0.6.2
 # Portable: Debian, Ubuntu, FreeBSD 13+
 # POSIX sh — no bashisms.
 #
@@ -77,7 +77,7 @@ fi
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION="0.6.1"
+VERSION="0.6.2"
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
