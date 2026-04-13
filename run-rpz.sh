@@ -63,6 +63,8 @@ CONF_TSIG_KEY_FILE=""  # path to TSIG key file for nsupdate (shared by allow.sh 
 CONF_ALLOW_SERVER=""   # server for nsupdate (default: localhost)
 CONF_ALLOW_ZONE=""     # allowlist zone name (default: allowlist.rpz)
 CONF_FEEDS_DIR=""      # directory holding previous/current feed snapshots for incremental diffs
+CONF_FEED_LOG_DIR=""   # per-feed delta log directory (default: sibling "log" dir next to CONF_FEEDS_DIR)
+CONF_LOG_REBUILDS="no" # log full-rebuild domain lists to feed logs (default: no)
 CONF_INCREMENTAL_ZONES=""  # space-separated zones that use the incremental (IXFR) update path
 CONF_INCREMENTAL_TTL="300" # TTL for nsupdate records (matches zone default)
 
@@ -1070,6 +1072,10 @@ CONF_TSIG_KEY_FILE="${CONF_TSIG_KEY_FILE}"
 CONF_ALLOW_SERVER="${CONF_ALLOW_SERVER}"
 CONF_ALLOW_ZONE="${CONF_ALLOW_ZONE}"
 
+# Feed delta logging — per-feed add/del logs for auditing
+CONF_FEED_LOG_DIR="${CONF_FEED_LOG_DIR}"
+CONF_LOG_REBUILDS="${CONF_LOG_REBUILDS}"
+
 # Incremental (IXFR) zone updates — see v0.6.0 release notes
 CONF_INCREMENTAL_ZONES="${CONF_INCREMENTAL_ZONES}"
 CONF_INCREMENTAL_TTL="${CONF_INCREMENTAL_TTL}"
@@ -1588,6 +1594,64 @@ build_nsupdate_batch() {
     } > "$_out"
 }
 
+# ─── Feed delta logging ──────────────────────────────────────────────────────
+#
+# Writes per-feed add/del logs for auditing.  One file per zone, appended to
+# ${CONF_FEED_LOG_DIR}/<zone>.log.
+#
+# Feed logs always record individual domains (+domain / -domain) regardless
+# of CONF_VERBOSITY — they are an audit trail, not console output.
+# CONF_VERBOSITY controls only the no-op case:
+#   0 = no-op runs are not logged (the log only shows actual changes)
+#   1+= no-op runs get a single "no-changes" line
+#
+# Args: <zone_name> <action> <adds_file|""> <dels_file|""> <add_count> <del_count>
+#   action: "incremental" | "seed" | "rebuild" | "no-changes"
+log_feed_delta() {
+    _lfd_zone="$1"
+    _lfd_action="$2"
+    _lfd_adds_file="$3"
+    _lfd_dels_file="$4"
+    _lfd_add_count="$5"
+    _lfd_del_count="$6"
+
+    # Resolve log directory — default is a sibling "log" dir next to CONF_FEEDS_DIR
+    _lfd_dir="${CONF_FEED_LOG_DIR}"
+    if [ -z "$_lfd_dir" ] && [ -n "$CONF_FEEDS_DIR" ]; then
+        _lfd_dir="$(dirname "$CONF_FEEDS_DIR")/log"
+    fi
+    [ -z "$_lfd_dir" ] && return 0
+
+    if [ ! -d "$_lfd_dir" ]; then
+        mkdir -p "$_lfd_dir" 2>/dev/null || {
+            log_warn "Feed log: cannot create directory: $_lfd_dir"
+            return 0
+        }
+    fi
+
+    _lfd_log="${_lfd_dir}/${_lfd_zone}.log"
+    _lfd_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+    # No-changes: only log at verbosity 1+
+    if [ "$_lfd_action" = "no-changes" ]; then
+        _lfd_verb="${CONF_VERBOSITY:-0}"
+        [ "$_lfd_verb" = "0" ] && return 0
+        printf '%s no-changes\n' "$_lfd_ts" >> "$_lfd_log"
+        return 0
+    fi
+
+    # Summary line
+    printf '%s %s +%s -%s\n' "$_lfd_ts" "$_lfd_action" "$_lfd_add_count" "$_lfd_del_count" >> "$_lfd_log"
+
+    # Individual domains — always written for actual changes
+    if [ -n "$_lfd_adds_file" ] && [ -s "$_lfd_adds_file" ]; then
+        sed "s/^/${_lfd_ts} +/" "$_lfd_adds_file" >> "$_lfd_log"
+    fi
+    if [ -n "$_lfd_dels_file" ] && [ -s "$_lfd_dels_file" ]; then
+        sed "s/^/${_lfd_ts} -/" "$_lfd_dels_file" >> "$_lfd_log"
+    fi
+}
+
 # Apply an incremental update for a single zone.
 #
 # Args: <zone_name> <new_db_file>
@@ -1682,9 +1746,13 @@ run_incremental_for_zone() {
     # No changes — no-op, keep .previous as-is, discard .current
     if [ "$_add_count" = "0" ] && [ "$_del_count" = "0" ]; then
         log_info "Incremental[$_zone]: no changes, skipping nsupdate"
+        log_feed_delta "$_zone" "no-changes" "" "" "0" "0"
         rm -f "$_adds" "$_dels" "$_curr"
         return 0
     fi
+
+    # Feed delta log — only when there are actual changes
+    log_feed_delta "$_zone" "incremental" "$_adds" "$_dels" "$_add_count" "$_del_count"
 
     # Build nsupdate batch
     _batch=$(mktemp "/tmp/rpz-nsupdate-${_zone}.XXXXXX" 2>/dev/null || echo "/tmp/rpz-nsupdate-${_zone}.$$")
@@ -1762,6 +1830,10 @@ seed_feed_snapshot() {
     fi
 
     log_info "Seed[$_zone]: saved baseline snapshot ($_count domains)"
+
+    # Feed delta log — all domains are new in a seed
+    log_feed_delta "$_zone" "seed" "$_prev" "" "$_count" "0"
+
     return 0
 }
 
@@ -2153,6 +2225,17 @@ run_rpz() {
                     if [ $_reload_rc -ne 0 ]; then
                         log_warn "rndc reload $_zone_name: $_reload_output"
                     fi
+                fi
+
+                # Feed delta log for full rebuilds (opt-in via CONF_LOG_REBUILDS)
+                if [ "${CONF_LOG_REBUILDS}" = "yes" ]; then
+                    _rebuild_list=$(mktemp "/tmp/rpz-rebuild-${_zone_name}.XXXXXX" 2>/dev/null \
+                        || echo "/tmp/rpz-rebuild-${_zone_name}.$$")
+                    if extract_domains_from_zone "$_db_file" "$_zone_name" > "$_rebuild_list" 2>/dev/null; then
+                        _rebuild_count=$(wc -l < "$_rebuild_list" | tr -d ' ')
+                        log_feed_delta "$_zone_name" "rebuild" "$_rebuild_list" "" "$_rebuild_count" "0"
+                    fi
+                    rm -f "$_rebuild_list"
                 fi
             done
         fi
