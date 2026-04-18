@@ -60,7 +60,7 @@ CONF_CHECKZONE=""       # yes or no — validate with named-checkzone before dep
 CONF_PER_SOURCE=""      # yes or no — output one zone file per source
 CONF_ALLOWLIST_FILE=""  # path to allowlist file (used with per-source mode)
 CONF_TSIG_KEY_FILE=""  # path to TSIG key file for nsupdate (shared by allow.sh and incremental updates)
-CONF_ALLOW_SERVER=""   # server for nsupdate (default: localhost)
+CONF_ALLOW_SERVER=""   # server for nsupdate (default: 127.0.0.1)
 CONF_ALLOW_ZONE=""     # allowlist zone name (default: allowlist.rpz)
 CONF_FEEDS_DIR=""      # directory holding previous/current feed snapshots for incremental diffs
 CONF_FEED_LOG_DIR=""   # per-feed delta log directory (default: sibling "log" dir next to CONF_FEEDS_DIR)
@@ -952,7 +952,7 @@ run_setup() {
             _tsig_key="${CONF_TSIG_KEY_FILE:-$_def_tsig_key}"
             CONF_TSIG_KEY_FILE=$(prompt_value "TSIG key file path" "$_tsig_key")
 
-            _allow_server="${CONF_ALLOW_SERVER:-localhost}"
+            _allow_server="${CONF_ALLOW_SERVER:-127.0.0.1}"
             CONF_ALLOW_SERVER=$(prompt_value "nsupdate server" "$_allow_server")
 
             _allow_zone="${CONF_ALLOW_ZONE:-allowlist.rpz}"
@@ -1545,7 +1545,7 @@ build_nsupdate_batch() {
 
     _target=$(incremental_cname_target "$_zone")
     _ttl="${CONF_INCREMENTAL_TTL:-300}"
-    _server="${CONF_ALLOW_SERVER:-localhost}"
+    _server="${CONF_ALLOW_SERVER:-127.0.0.1}"
 
     # Domain names ending in ".rpz-ip" are IP triggers — they never have
     # a wildcard twin in the rendered zone, so skip emitting one.
@@ -1760,7 +1760,8 @@ run_incremental_for_zone() {
 
     # Apply
     log_info "Incremental[$_zone]: applying nsupdate (+$_add_count -$_del_count)"
-    _nsupd_output=$(nsupdate -k "$CONF_TSIG_KEY_FILE" < "$_batch" 2>&1)
+    # -4 forces IPv4 so hostnames like "localhost" don't try ::1 on v4-only BIND.
+    _nsupd_output=$(nsupdate -4 -k "$CONF_TSIG_KEY_FILE" < "$_batch" 2>&1)
     _nsupd_rc=$?
 
     if [ $_nsupd_rc -ne 0 ]; then

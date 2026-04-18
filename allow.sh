@@ -88,7 +88,9 @@ if [ -z "$TSIG_KEY_FILE" ]; then
     TSIG_KEY_FILE="$_default_tsig_key"
 fi
 if [ -z "$ALLOW_SERVER" ]; then
-    ALLOW_SERVER="localhost"
+    # 127.0.0.1 instead of "localhost" to avoid nsupdate trying ::1 first
+    # on dual-stack hosts where BIND listens v4-only.
+    ALLOW_SERVER="127.0.0.1"
 fi
 if [ -z "$ALLOW_ZONE" ]; then
     ALLOW_ZONE="allowlist.rpz"
@@ -141,7 +143,7 @@ OPTIONS:
   -k, --key FILE        Path to TSIG key file
                         Default: ${_default_tsig_key}
   -s, --server HOST     Server to send nsupdate to
-                        Default: localhost
+                        Default: 127.0.0.1
   -z, --zone ZONE       RPZ allowlist zone name
                         Default: allowlist.rpz
   -a, --allowlist FILE  Path to allowlist text file (for persistence)
@@ -610,7 +612,9 @@ update add *.${_domain}.${_zone}. ${ALLOW_TTL} IN CNAME rpz-passthru."
     _commands="${_commands}
 send"
 
-    printf '%s\n' "$_commands" | nsupdate -k "$TSIG_KEY_FILE" 2>&1
+    # -4 forces IPv4 so "localhost" doesn't resolve to ::1 on hosts where
+    # BIND is listening v4-only.
+    printf '%s\n' "$_commands" | nsupdate -4 -k "$TSIG_KEY_FILE" 2>&1
     return $?
 }
 
@@ -624,7 +628,7 @@ update delete ${_domain}.${_zone}. IN CNAME
 update delete *.${_domain}.${_zone}. IN CNAME
 send"
 
-    printf '%s\n' "$_commands" | nsupdate -k "$TSIG_KEY_FILE" 2>&1
+    printf '%s\n' "$_commands" | nsupdate -4 -k "$TSIG_KEY_FILE" 2>&1
     return $?
 }
 
