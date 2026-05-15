@@ -26,3 +26,9 @@ run-rpz.sh.backup
 
 # tooling output
 .firecrawl/
+
+# agent/IDE local state
+.claude/
+.agents/
+docs/agents/
+skills-lock.json

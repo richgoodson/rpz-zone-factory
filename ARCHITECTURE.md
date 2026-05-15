@@ -766,9 +766,8 @@ disagree with them, that's fine, but know they were deliberate:
    text file (which `run.py` reads on the next scheduled run) always
    matches the live zone state.
 
-9. **Single TSIG key for both allow.sh AND incremental updates.** Rich
-   confirmed all dynamic zones accept the same key. Simpler than tracking
-   per-zone keys.
+9. **Single TSIG key for both allow.sh AND incremental updates.** All
+   dynamic zones accept the same key. Simpler than tracking per-zone keys.
 
 10. **Combined mode is preserved but not used in production.** Don't
     remove it. It simplifies the code path for anyone who wants a single
