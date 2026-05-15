@@ -2542,7 +2542,11 @@ run_rpz() {
                 fi
 
                 chmod 664 "$_stage_file" 2>/dev/null || true
-                if ! mv "$_stage_file" "$_final_file"; then
+                # mv -f: don't prompt on FreeBSD when destination is owned
+                # by bind (e.g., after a prior `rndc sync` rewrote it as
+                # 0644 bind:wheel). Without -f, an unattended cron run
+                # would hang on the override prompt.
+                if ! mv -f "$_stage_file" "$_final_file"; then
                     log_err "Failed to rename $_stage_file → $_final_file"
                     rm -f "$_stage_file"
                     if [ $_is_dynamic -eq 1 ]; then
@@ -2705,11 +2709,11 @@ run_rpz() {
                 fi
             else
                 log_warn "named-compilezone not found — falling back to text format"
-                mv "$_text_file" "$_final_file"
+                mv -f "$_text_file" "$_final_file"
             fi
         elif [ "$CONF_CHECKZONE" = "yes" ]; then
             # Checkzone passed, no compilation — move validated text to final path
-            mv "$_text_file" "$_final_file"
+            mv -f "$_text_file" "$_final_file"
         fi
     fi
 
