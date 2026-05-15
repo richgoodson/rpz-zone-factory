@@ -727,3 +727,7 @@ rpz-zone-factory/
 ```
 
 `allow.sh` creates `allow-audit.log` in the zone output directory (next to `allowlist.txt`), not in the project directory.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
