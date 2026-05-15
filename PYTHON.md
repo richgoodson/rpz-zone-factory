@@ -48,7 +48,7 @@ python run.py --sources urlhaus drop scamsniffer --output rpz
 python run.py --per-source --output-file /etc/namedb/master/rpz/ -v
 ```
 
-Creates separate zone files: `urlhaus.rpz.db`, `cisa-kev.rpz.db`, `spamhaus-drop.rpz.db`, `scamsniffer.rpz.db`, `cryptoscamdb.rpz.db`, `et-compromised.rpz.db`. BIND logs then show which threat list triggered each block.
+Creates separate zone files, one per feed. As of v0.8.0 the filenames include the feed's category — `urlhaus.malware.rpz.db`, `cisa-kev.vulnerabilities.rpz.db`, `spamhaus-drop.ipreputation.rpz.db`, `scamsniffer.scam.rpz.db`, `cryptoscamdb.scam.rpz.db`, `et-compromised.ipreputation.rpz.db`, plus ads/tracking/cryptojacking zones (run `python -m rpz_factory.categories list-zones` for the live list). The category surfaces in the SOA returned with synthesized NXDOMAIN, so BIND logs and `dig` output reveal *which threat category* triggered each block.
 
 ### Per-source with allowlist
 

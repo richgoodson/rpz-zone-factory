@@ -306,12 +306,14 @@ The top-level Python entrypoint. Longest file in the package.
 **Per-source mode is the production path.** Combined mode still exists for
 legacy use but is not what any current deployment uses.
 
-**Key constants in `cli.py`:**
+**Key constants in `cli.py` (all derived from `rpz_factory.categories.REGISTRY` as of v0.8.0):**
 
-- `ALL_SOURCES` — `["urlhaus", "cisa", "drop", "scamsniffer", "cryptoscamdb"]`
+- `ALL_SOURCES` — every feed key the registry knows about.
 - `SOURCE_ZONE_NAMES` — maps source key to the per-source zone filename
-  (e.g., `"urlhaus" → "urlhaus.rpz"`). The shell extractor and the
-  `CONF_INCREMENTAL_ZONES` config use these same zone names.
+  (e.g., `"urlhaus" → "urlhaus.malware.rpz"`). Filenames embed the feed's
+  category so the SOA in synthesized NXDOMAIN responses identifies why a
+  name was blocked. The shell extractor and the `CONF_INCREMENTAL_ZONES`
+  config (or `CONF_INCREMENTAL_CATEGORIES`) use these same zone names.
 - `_SOURCE_URLS` — feed URL per source (for HTTP meta lookup).
 - `_SOURCE_KEY_TO_NAME` / `_SOURCE_NAME_TO_KEY` — bidirectional map between
   CLI source keys (`urlhaus`) and internal `SourceName` enum values
@@ -802,15 +804,16 @@ cd ~/rpz-zone-factory
 ./run-rpz.sh -i                    # should behave like v0.5.0
 
 # Enable incremental for one zone to start
-./run-rpz.sh --setup               # set CONF_INCREMENTAL_ZONES=urlhaus.rpz
+./run-rpz.sh --setup               # set CONF_INCREMENTAL_CATEGORIES=malware
+                                   # (resolves to urlhaus.malware.rpz, antimalware-hosts.malware.rpz)
 
-./run-rpz.sh -i                    # first run: seeds urlhaus.rpz
+./run-rpz.sh -i                    # first run: seeds urlhaus.malware.rpz
 ./run-rpz.sh -i                    # second run: should take incremental path
-                                   # logs: Incremental[urlhaus.rpz]: adds=N dels=M
+                                   # logs: Incremental[urlhaus.malware.rpz]: adds=N dels=M
 
 # Check BIND state
-rndc zonestatus urlhaus.rpz        # serial should NOT bump if diff was empty
-dig @localhost <known-bad>.urlhaus.rpz CNAME
+rndc zonestatus urlhaus.malware.rpz        # serial should NOT bump if diff was empty
+dig @localhost <known-bad>.urlhaus.malware.rpz CNAME
 cat /var/log/syslog | grep rpz-zone-factory
 
 # Force a full rebuild (recovery mode)

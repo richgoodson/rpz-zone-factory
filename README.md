@@ -66,14 +66,31 @@ See `./allow.sh --setup` for TSIG key configuration, or the [allow.sh section](#
 
 ## Sources
 
-| Source | Type | URL |
-|--------|------|-----|
-| Abuse.ch URLhaus | Domains (RPZ feed) | https://urlhaus.abuse.ch/downloads/rpz/ |
-| CISA KEV | Domains from CVE data | https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json |
-| Spamhaus DROP | IP/CIDR | https://www.spamhaus.org/drop/drop.txt |
-| Scam Sniffer | Domains (crypto scams) | https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/domains.json |
-| CryptoScamDB | Domains (crypto phishing) | https://raw.githubusercontent.com/CryptoScamDB/blacklist/master/data/urls.yaml |
-| Emerging Threats | IPs (compromised hosts) | https://rules.emergingthreats.net/blockrules/compromised-ips.txt |
+Each feed produces one RPZ zone. As of v0.8.0, the zone filename encodes
+its category: `<feed>.<category>.rpz`. When BIND synthesizes an NXDOMAIN
+response from RPZ, the SOA in the authority section reveals which category
+caused the block — so an operator looking at `dig` output can immediately
+tell whether the entry is `ads`, `malware`, `ipreputation`, etc.
+
+| Source | Category | Type | Zone | URL |
+|--------|----------|------|------|-----|
+| Abuse.ch URLhaus | malware | Domains (RPZ feed) | `urlhaus.malware.rpz` | https://urlhaus.abuse.ch/downloads/rpz/ |
+| CISA KEV | vulnerabilities | Domains from CVE data | `cisa-kev.vulnerabilities.rpz` | https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json |
+| Spamhaus DROP | ipreputation | IP/CIDR | `spamhaus-drop.ipreputation.rpz` | https://www.spamhaus.org/drop/drop.txt |
+| Scam Sniffer | scam | Domains (crypto scams) | `scamsniffer.scam.rpz` | https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/domains.json |
+| CryptoScamDB | scam | Domains (crypto phishing) | `cryptoscamdb.scam.rpz` | https://raw.githubusercontent.com/CryptoScamDB/blacklist/master/data/urls.yaml |
+| Emerging Threats | ipreputation | IPs (compromised hosts) | `et-compromised.ipreputation.rpz` | https://rules.emergingthreats.net/blockrules/compromised-ips.txt |
+| AdGuard DNS | ads | Domains | `adguard-dns.ads.rpz` | https://v.firebog.net/hosts/AdguardDNS.txt |
+| anudeepND adservers | ads | Domains (hosts file) | `anudeepnd.ads.rpz` | https://raw.githubusercontent.com/anudeepND/blacklist/master/adservers.txt |
+| EasyPrivacy | tracking | Domains | `easyprivacy.tracking.rpz` | https://v.firebog.net/hosts/Easyprivacy.txt |
+| AntiMalwareHosts | malware | Domains (hosts file) | `antimalware-hosts.malware.rpz` | https://raw.githubusercontent.com/DandelionSprout/adfilt/master/Alternate%20versions%20Anti-Malware%20List/AntiMalwareHosts.txt |
+| Prigent Crypto | cryptojacking | Domains | `prigent-crypto.cryptojacking.rpz` | https://v.firebog.net/hosts/Prigent-Crypto.txt |
+| developerdan ads-and-tracking | ads | Domains (hosts file) | `developerdan.ads.rpz` | https://www.github.developerdan.com/hosts/lists/ads-and-tracking-extended.txt |
+
+Categories: `malware`, `ads`, `tracking`, `scam`, `cryptojacking`,
+`ipreputation`, `vulnerabilities`. Pick categories at `--setup` time, or
+edit `CONF_CATEGORIES` in `.run-rpz.conf`. Add or drop individual feeds
+with `CONF_SOURCES_EXTRA` / `CONF_SOURCES_EXCLUDE`.
 
 ## Requirements
 
@@ -173,7 +190,7 @@ grep rpz-zone-factory /var/log/daemon.log
 
 Per-source zones listed in `CONF_INCREMENTAL_ZONES` are updated by **diffing the previously-fetched feed against the freshly generated zone** and sending only the additions/deletions via TSIG-authenticated `nsupdate`. BIND writes the delta to the zone's journal, bumps the SOA serial, and secondaries receive **NOTIFY → IXFR** instead of re-AXFR'ing the whole zone — turning megabyte transfers into hundred-byte deltas.
 
-For a typical day where upstream feeds add/remove a handful of domains, a single domain add transfers as 6 records (~230 bytes) instead of the full zone (~5000+ records / ~150KB for `urlhaus.rpz`).
+For a typical day where upstream feeds add/remove a handful of domains, a single domain add transfers as 6 records (~230 bytes) instead of the full zone (~5000+ records / ~150KB for `urlhaus.malware.rpz`).
 
 ### How a zone goes from cold to incremental
 
@@ -194,7 +211,7 @@ A full rebuild always re-seeds `.list.previous` afterward, so a zone can flip ba
 
 ### BIND configuration requirements
 
-**Every zone in `CONF_INCREMENTAL_ZONES` must have `allow-update { key "rpz-update"; };` in its `named.conf` definition** — including the per-source threat zones, not just the allowlist. Without this, `nsupdate` will be REFUSED and the zone falls back to full rebuild on every run. See the [BIND Configuration](#bind-configuration) section below for complete zone examples.
+**Every zone selected for IXFR (via `CONF_INCREMENTAL_CATEGORIES` or the legacy `CONF_INCREMENTAL_ZONES`) must have `allow-update { key "rpz-update"; };` in its `named.conf` definition** — including the per-source threat zones, not just the allowlist. Without this, `nsupdate` will be REFUSED and the zone falls back to full rebuild on every run. See the [BIND Configuration](#bind-configuration) section below for complete zone examples.
 
 ### Per-zone freeze/thaw (full rebuild path)
 
@@ -211,8 +228,8 @@ Static (non-dynamic) zones in the full bucket use plain `rndc reload <zone>` ins
 On a secondary, look for transfer log entries with a small record count:
 
 ```
-zone urlhaus.rpz/IN: Transfer started.
-transfer of 'urlhaus.rpz/IN' from <primary>#53: Transfer completed: 1 messages, 6 records, 229 bytes (serial 2026040827)
+zone urlhaus.malware.rpz/IN: Transfer started.
+transfer of 'urlhaus.malware.rpz/IN' from <primary>#53: Transfer completed: 1 messages, 6 records, 229 bytes (serial 2026040827)
 ```
 
 `6 records` is the IXFR delta for a single domain add (old SOA, new SOA, two CNAMEs for `domain` and `*.domain`). If you instead see hundreds or thousands of records for what should have been a small change, the secondary is doing AXFR — check that the primary has `allow-update` on the zone and that `nsupdate` is succeeding.
@@ -370,54 +387,54 @@ zone "allowlist.rpz" {
 };
 
 // Threat source zones — all need allow-update for v0.6.0 incremental updates
-zone "urlhaus.rpz" {
+zone "urlhaus.malware.rpz" {
     type primary;
-    file "/etc/namedb/master/rpz/urlhaus.rpz.db";
+    file "/etc/namedb/master/rpz/urlhaus.malware.rpz.db";
     allow-update { key "rpz-update"; };
     allow-query { localhost; secondaries; };
     allow-transfer { secondaries; };
     also-notify { /* secondary IPs */ };
 };
 
-zone "cisa-kev.rpz" {
+zone "cisa-kev.vulnerabilities.rpz" {
     type primary;
-    file "/etc/namedb/master/rpz/cisa-kev.rpz.db";
+    file "/etc/namedb/master/rpz/cisa-kev.vulnerabilities.rpz.db";
     allow-update { key "rpz-update"; };
     allow-query { localhost; secondaries; };
     allow-transfer { secondaries; };
     also-notify { /* secondary IPs */ };
 };
 
-zone "spamhaus-drop.rpz" {
+zone "spamhaus-drop.ipreputation.rpz" {
     type primary;
-    file "/etc/namedb/master/rpz/spamhaus-drop.rpz.db";
+    file "/etc/namedb/master/rpz/spamhaus-drop.ipreputation.rpz.db";
     allow-update { key "rpz-update"; };
     allow-query { localhost; secondaries; };
     allow-transfer { secondaries; };
     also-notify { /* secondary IPs */ };
 };
 
-zone "scamsniffer.rpz" {
+zone "scamsniffer.scam.rpz" {
     type primary;
-    file "/etc/namedb/master/rpz/scamsniffer.rpz.db";
+    file "/etc/namedb/master/rpz/scamsniffer.scam.rpz.db";
     allow-update { key "rpz-update"; };
     allow-query { localhost; secondaries; };
     allow-transfer { secondaries; };
     also-notify { /* secondary IPs */ };
 };
 
-zone "cryptoscamdb.rpz" {
+zone "cryptoscamdb.scam.rpz" {
     type primary;
-    file "/etc/namedb/master/rpz/cryptoscamdb.rpz.db";
+    file "/etc/namedb/master/rpz/cryptoscamdb.scam.rpz.db";
     allow-update { key "rpz-update"; };
     allow-query { localhost; secondaries; };
     allow-transfer { secondaries; };
     also-notify { /* secondary IPs */ };
 };
 
-zone "et-compromised.rpz" {
+zone "et-compromised.ipreputation.rpz" {
     type primary;
-    file "/etc/namedb/master/rpz/et-compromised.rpz.db";
+    file "/etc/namedb/master/rpz/et-compromised.ipreputation.rpz.db";
     allow-update { key "rpz-update"; };
     allow-query { localhost; secondaries; };
     allow-transfer { secondaries; };
@@ -435,12 +452,13 @@ options {
 
     response-policy {
         zone "allowlist.rpz" policy passthru;
-        zone "urlhaus.rpz";
-        zone "cisa-kev.rpz";
-        zone "spamhaus-drop.rpz";
-        zone "scamsniffer.rpz";
-        zone "cryptoscamdb.rpz";
-        zone "et-compromised.rpz";
+        zone "urlhaus.malware.rpz";
+        zone "cisa-kev.vulnerabilities.rpz";
+        zone "spamhaus-drop.ipreputation.rpz";
+        zone "scamsniffer.scam.rpz";
+        zone "cryptoscamdb.scam.rpz";
+        zone "et-compromised.ipreputation.rpz";
+        // ...plus any ads/tracking/cryptojacking zones from the registry
     };
 };
 ```

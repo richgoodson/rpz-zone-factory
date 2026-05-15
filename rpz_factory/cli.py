@@ -9,10 +9,24 @@ import sys
 
 from rpz_factory import __version__
 from rpz_factory.cache import load_cache, load_http_meta, write_cache, write_http_meta
+from rpz_factory.categories import (
+    CATEGORIES,
+    REGISTRY,
+    all_feed_keys,
+    resolve_selection,
+)
 from rpz_factory.fetcher import get_last_fetch_meta
 from rpz_factory.filters import filter_entries
 from rpz_factory.models import FetchResult, HttpMeta, SourceName, ThreatEntry
-from rpz_factory.parsers import abusech, cisa, cryptoscamdb, emergingthreats, scamsniffer, spamhaus
+from rpz_factory.parsers import (
+    abusech,
+    cisa,
+    cryptoscamdb,
+    emergingthreats,
+    plaintext,
+    scamsniffer,
+    spamhaus,
+)
 from rpz_factory.renderers import pihole, rpz
 from rpz_factory.renderers.rpz import compute_next_serial
 
@@ -22,17 +36,11 @@ from rpz_factory.renderers.rpz import compute_next_serial
 # reload, seeding).
 EXIT_NO_CHANGES = 2
 
-ALL_SOURCES = ["urlhaus", "cisa", "drop", "scamsniffer", "cryptoscamdb", "et-compromised"]
+ALL_SOURCES = all_feed_keys()
 
-# Per-source RPZ zone names (used with --per-source)
-SOURCE_ZONE_NAMES = {
-    "urlhaus": "urlhaus.rpz",
-    "cisa": "cisa-kev.rpz",
-    "drop": "spamhaus-drop.rpz",
-    "scamsniffer": "scamsniffer.rpz",
-    "cryptoscamdb": "cryptoscamdb.rpz",
-    "et-compromised": "et-compromised.rpz",
-}
+# Per-source RPZ zone names (used with --per-source). Drops the trailing
+# ".db" — the shell layer adds it. Derived from the categories registry.
+SOURCE_ZONE_NAMES = {key: spec.zone for key, spec in REGISTRY.items()}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -64,9 +72,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sources",
         nargs="+",
-        default=ALL_SOURCES,
+        default=None,
         choices=ALL_SOURCES,
-        help="Sources to fetch (default: all)",
+        metavar="FEED",
+        help=(
+            "Specific feed keys to fetch (default: all, or all feeds in "
+            "categories given via --categories). "
+            f"Available: {' '.join(ALL_SOURCES)}"
+        ),
+    )
+    parser.add_argument(
+        "--categories",
+        nargs="+",
+        default=None,
+        choices=list(CATEGORIES),
+        metavar="CATEGORY",
+        help=(
+            "Fetch all feeds whose category is in this list. Combine with "
+            "--sources to add individual feeds outside the chosen categories. "
+            f"Available: {' '.join(CATEGORIES)}"
+        ),
+    )
+    parser.add_argument(
+        "--exclude-sources",
+        nargs="+",
+        default=None,
+        choices=ALL_SOURCES,
+        metavar="FEED",
+        help="Drop these feed keys from the resolved selection.",
     )
     parser.add_argument(
         "--cache-dir",
@@ -122,27 +155,38 @@ SOURCE_FETCHERS = {
     "scamsniffer": scamsniffer.fetch_and_parse,
     "cryptoscamdb": cryptoscamdb.fetch_and_parse,
     "et-compromised": emergingthreats.fetch_and_parse,
+    "adguard-dns": plaintext.make_fetcher(
+        REGISTRY["adguard-dns"].url, SourceName.ADGUARD_DNS, label="AdGuard DNS"
+    ),
+    "anudeepnd": plaintext.make_fetcher(
+        REGISTRY["anudeepnd"].url, SourceName.ANUDEEPND, label="anudeepND adservers"
+    ),
+    "easyprivacy": plaintext.make_fetcher(
+        REGISTRY["easyprivacy"].url, SourceName.EASYPRIVACY, label="EasyPrivacy"
+    ),
+    "antimalware-hosts": plaintext.make_fetcher(
+        REGISTRY["antimalware-hosts"].url,
+        SourceName.ANTIMALWARE_HOSTS,
+        label="AntiMalwareHosts",
+    ),
+    "prigent-crypto": plaintext.make_fetcher(
+        REGISTRY["prigent-crypto"].url,
+        SourceName.PRIGENT_CRYPTO,
+        label="Prigent Crypto",
+    ),
+    "developerdan": plaintext.make_fetcher(
+        REGISTRY["developerdan"].url,
+        SourceName.DEVELOPERDAN,
+        label="developerdan ads-and-tracking",
+    ),
 }
 
-# URLs per source (for HTTP meta lookup after fetch)
-_SOURCE_URLS = {
-    "urlhaus": "https://urlhaus.abuse.ch/downloads/rpz/",
-    "cisa": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
-    "drop": "https://www.spamhaus.org/drop/drop.txt",
-    "scamsniffer": "https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/domains.json",
-    "cryptoscamdb": "https://raw.githubusercontent.com/CryptoScamDB/blacklist/master/data/urls.yaml",
-    "et-compromised": "https://rules.emergingthreats.net/blockrules/compromised-ips.txt",
-}
+# URLs per source (for HTTP meta lookup after fetch). Derived from registry.
+_SOURCE_URLS = {key: spec.url for key, spec in REGISTRY.items() if spec.url}
 
-# Map source keys to SourceName enum values for cache lookups
-_SOURCE_KEY_TO_NAME = {
-    "urlhaus": "abusech_urlhaus",
-    "cisa": "cisa_kev",
-    "drop": "spamhaus_drop",
-    "scamsniffer": "scamsniffer",
-    "cryptoscamdb": "cryptoscamdb",
-    "et-compromised": "et_compromised_ips",
-}
+# Map source keys to SourceName enum values for cache lookups. Derived
+# from registry.
+_SOURCE_KEY_TO_NAME = {key: spec.enum_value for key, spec in REGISTRY.items()}
 
 # Reverse mapping: SourceName enum value -> source key
 _SOURCE_NAME_TO_KEY = {v: k for k, v in _SOURCE_KEY_TO_NAME.items()}
@@ -231,6 +275,37 @@ def main(argv: list[str] | None = None) -> int:
     if args.per_source and args.output == "pihole":
         print("ERROR: --per-source is not supported with --output pihole", file=sys.stderr)
         return 1
+
+    # Resolve --sources / --categories / --exclude-sources into the final
+    # ordered feed list. Stored back on args.sources for downstream code.
+    # When both --categories and --sources are given, the explicit feed
+    # list adds to the category selection (e.g. "malware category PLUS
+    # this one extra feed"). When only --sources is given, it's the
+    # exact selection. When only --categories is given, that's the
+    # selection.
+    try:
+        if args.categories and args.sources:
+            args.sources = resolve_selection(
+                categories=args.categories,
+                extra=args.sources,
+                exclude=args.exclude_sources,
+            )
+        else:
+            args.sources = resolve_selection(
+                categories=args.categories,
+                sources=args.sources,
+                exclude=args.exclude_sources,
+            )
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    if not args.sources:
+        print(
+            "ERROR: feed selection is empty (after applying --categories/--sources/--exclude-sources)",
+            file=sys.stderr,
+        )
+        return 1
+    logger.info("Resolved feed selection: %s", " ".join(args.sources))
 
     # Resolve cache directory
     cache_dir = args.cache_dir

@@ -21,6 +21,12 @@ class SourceName(enum.Enum):
     SCAMSNIFFER = "scamsniffer"
     CRYPTOSCAMDB = "cryptoscamdb"
     ET_COMPROMISED_IPS = "et_compromised_ips"
+    ADGUARD_DNS = "adguard_dns"
+    ANUDEEPND = "anudeepnd"
+    EASYPRIVACY = "easyprivacy"
+    ANTIMALWARE_HOSTS = "antimalware_hosts"
+    PRIGENT_CRYPTO = "prigent_crypto"
+    DEVELOPERDAN = "developerdan"
 
 
 @dataclass(frozen=True)

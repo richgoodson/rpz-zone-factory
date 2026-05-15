@@ -1,6 +1,6 @@
 #!/bin/sh
 # run-rpz.sh — Cron/interactive wrapper for rpz-zone-factory
-# Version: 0.6.2
+# Version: 0.8.0
 # Portable: Debian, Ubuntu, FreeBSD 13+
 # POSIX sh — no bashisms.
 #
@@ -59,7 +59,8 @@ CONF_COMPILE_ZONE=""    # yes or no — use named-compilezone for binary (raw) f
 CONF_CHECKZONE=""       # yes or no — validate with named-checkzone before deploying
 CONF_PER_SOURCE=""      # yes or no — output one zone file per source
 CONF_ALLOWLIST_FILE=""  # path to allowlist file (used with per-source mode)
-CONF_TSIG_KEY_FILE=""  # path to TSIG key file for nsupdate (shared by allow.sh and incremental updates)
+CONF_TSIG_KEY_FILE=""           # path to TSIG key file for nsupdate (allow.sh + IXFR run-rpz.sh)
+CONF_TRANSFER_TSIG_KEY_FILE=""  # path to TSIG key file for AXFR/IXFR transfers to slaves (optional; least-privilege split)
 CONF_ALLOW_SERVER=""   # server for nsupdate (default: 127.0.0.1)
 CONF_ALLOW_ZONE=""     # allowlist zone name (default: allowlist.rpz)
 CONF_FEEDS_DIR=""      # directory holding previous/current feed snapshots for incremental diffs
@@ -67,6 +68,13 @@ CONF_FEED_LOG_DIR=""   # per-feed delta log directory (default: sibling "log" di
 CONF_LOG_REBUILDS="no" # log full-rebuild domain lists to feed logs (default: no)
 CONF_INCREMENTAL_ZONES=""  # space-separated zones that use the incremental (IXFR) update path
 CONF_INCREMENTAL_TTL="300" # TTL for nsupdate records (matches zone default)
+
+# v0.7.0 category-aware feed selection. The wizard writes these; runtime
+# resolution uses python -m rpz_factory.categories to expand them.
+CONF_CATEGORIES=""             # space-separated categories to fetch (e.g. "malware ads")
+CONF_INCREMENTAL_CATEGORIES="" # space-separated categories whose feeds use the IXFR path
+CONF_SOURCES_EXTRA=""          # extra individual feed keys to add on top of CONF_CATEGORIES
+CONF_SOURCES_EXCLUDE=""        # individual feed keys to drop from the resolved selection
 
 # Source config file if it exists (overrides defaults above)
 _conf_file="${RPZ_DIR}/.run-rpz.conf"
@@ -77,7 +85,7 @@ fi
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION="0.6.2"
+VERSION="0.8.0"
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
@@ -138,6 +146,29 @@ prompt_value() {
     fi
 }
 
+# Normalize a filesystem path: collapse repeated slashes, strip a single
+# trailing slash (except for the root "/"). Used so that paths loaded from
+# old config files or built by string concatenation don't leave cosmetic
+# "//" gunk in user-visible output.
+strip_trailing_slash() {
+    _np=$(printf '%s' "$1" | sed 's|//*|/|g')
+    case "$_np" in
+        /) printf '/\n' ;;
+        */) printf '%s\n' "${_np%/}" ;;
+        *) printf '%s\n' "$_np" ;;
+    esac
+}
+
+# Print a wizard section header that's hard to miss when scrolling. Three
+# lines (rule, title, rule) bracketed by blank lines, using ═ to differ
+# visually from the ─ used elsewhere in the wizard text.
+section_header() {
+    printf "\n\n"
+    printf "═══════════════════════════════════════════════════════════\n"
+    printf "  %s\n" "$1"
+    printf "═══════════════════════════════════════════════════════════\n\n"
+}
+
 # prompt_yn "Question" "y" (or "n")
 # Returns 0 for yes, 1 for no
 prompt_yn() {
@@ -196,6 +227,76 @@ prompt_choice() {
         fi
         _pc_num=$(( _pc_num + 1 ))
     done
+    return 1
+}
+
+# categories_menu "default-spec"
+# Displays numbered category list with feeds, reads space-separated input
+# (numbers, names, 'all', or 'none'), and echoes the resolved space-separated
+# category names. Validates against the registry; returns 1 on bad input.
+categories_menu() {
+    _cm_default="${1:-all}"
+    _cm_cats=$(rpz_registry list-categories | tr '\n' ' ')
+    if [ -z "$_cm_cats" ]; then
+        printf "  [!]  Could not query categories registry. Is the venv set up?\n" >&2
+        return 1
+    fi
+    _cm_n=1
+    printf "\n  Available categories:\n" >&2
+    for _cm_cat in $_cm_cats; do
+        _cm_feeds=$(rpz_registry list-feeds --category "$_cm_cat" 2>/dev/null | tr '\n' ' ')
+        printf "    [%d] %-17s %s\n" "$_cm_n" "$_cm_cat" "$_cm_feeds" >&2
+        _cm_n=$(( _cm_n + 1 ))
+    done
+    printf "\n  Enter numbers, names, 'all', or 'none' [%s]: " "$_cm_default" >&2
+    read -r _cm_input
+    [ -z "$_cm_input" ] && _cm_input="$_cm_default"
+    case "$_cm_input" in
+        all|ALL)
+            echo "$_cm_cats" | xargs
+            return 0
+            ;;
+        none|NONE)
+            echo ""
+            return 0
+            ;;
+    esac
+    # Translate numeric tokens to names; pass through name tokens.
+    _cm_out=""
+    for _tok in $_cm_input; do
+        case "$_tok" in
+            ''|*[!0-9]*)
+                _cm_out="$_cm_out $_tok"
+                ;;
+            *)
+                _cm_n=1
+                _cm_match=""
+                for _cm_cat in $_cm_cats; do
+                    if [ "$_cm_n" = "$_tok" ]; then
+                        _cm_match="$_cm_cat"
+                        break
+                    fi
+                    _cm_n=$(( _cm_n + 1 ))
+                done
+                if [ -z "$_cm_match" ]; then
+                    printf "  [!]  Invalid choice: %s\n" "$_tok" >&2
+                    return 1
+                fi
+                _cm_out="$_cm_out $_cm_match"
+                ;;
+        esac
+    done
+    # Validate each name against registry
+    for _cm_name in $_cm_out; do
+        case " $_cm_cats " in
+            *\ "$_cm_name"\ *) ;;
+            *)
+                printf "  [!]  Unknown category: %s\n" "$_cm_name" >&2
+                return 1
+                ;;
+        esac
+    done
+    echo "$_cm_out" | xargs
 }
 
 # ─── Usage ────────────────────────────────────────────────────────────────────
@@ -431,7 +532,16 @@ create_venv() {
         return 1
     fi
 
-    if ! "$PYTHON_BIN" -m venv "$VENV_DIR"; then
+    # If $VENV_DIR already exists (broken venv from a previous run, or the
+    # user said yes to "Recreate it anyway?"), `python -m venv $dir` re-uses
+    # the existing directory and does NOT re-bootstrap pip. We need --clear
+    # to wipe and re-create. For first-time creation, --clear is a no-op.
+    _venv_args="$VENV_DIR"
+    if [ -d "$VENV_DIR" ]; then
+        _venv_args="--clear $VENV_DIR"
+    fi
+    # shellcheck disable=SC2086
+    if ! "$PYTHON_BIN" -m venv $_venv_args; then
         log_err "Failed to create virtual environment"
         return 1
     fi
@@ -439,12 +549,28 @@ create_venv() {
     log_info "Virtual environment created"
 
     _venv_py="${VENV_DIR}/bin/python"
+    # `python -m venv` is supposed to bootstrap pip via ensurepip, but on
+    # some platforms (notably fresh Python 3.14 builds, some Linux distros
+    # that split python3-pip out of the base package) that step silently
+    # produces a venv without pip. Try once more with an explicit
+    # ensurepip call before giving up.
+    if ! "$_venv_py" -m pip --version >/dev/null 2>&1; then
+        log_warn "pip missing in new venv — retrying with ensurepip"
+        "$_venv_py" -m ensurepip --upgrade --default-pip >/dev/null 2>&1 || true
+    fi
     if ! "$_venv_py" -m pip --version >/dev/null 2>&1; then
         log_err "pip is not available in the new virtual environment"
-        log_err "Fix:"
-        log_err "  FreeBSD:       pkg install py311-pip (adjust for your Python version)"
-        log_err "  Debian/Ubuntu: apt install python3-pip"
-        log_err "Then re-run: $0 --setup"
+        log_err "Diagnosis: python -m venv built the env but ensurepip did"
+        log_err "not deliver pip. Common causes:"
+        log_err "  - Python 3.14 fresh install with broken ensurepip bundle"
+        log_err "  - Linux distro that ships python without pip:"
+        log_err "      Debian/Ubuntu: apt install python3-pip python3-venv"
+        log_err "      FreeBSD:       pkg install py311-pip (adjust version)"
+        log_err "Workarounds:"
+        log_err "  - Re-run with a different Python: PYTHON_BIN=python3.13 $0 --setup"
+        log_err "  - Or bootstrap pip manually inside the venv:"
+        log_err "      $_venv_py -m ensurepip --upgrade"
+        log_err "      curl https://bootstrap.pypa.io/get-pip.py | $_venv_py"
         rm -rf "$VENV_DIR"
         return 1
     fi
@@ -558,7 +684,7 @@ discover_python() {
         _real=$(echo "$_entry" | cut -d: -f4)
         _dir=$(dirname "$_path")
 
-        printf "    %-14s → %s (Python %s)\n" "$_cand" "$_path" "$_ver" >&2
+        printf "    %-14s %s (Python %s)\n" "${_cand}:" "$_path" "$_ver" >&2
     done
 
     # Show what python3 resolves to, if it exists and points to a versioned binary
@@ -571,7 +697,7 @@ discover_python() {
             _py3_real=$(readlink -f "$_py3_path" 2>/dev/null)
         fi
         if [ -n "$_py3_real" ] && [ "$_py3_real" != "$_py3_path" ]; then
-            printf "\n    python3 → %s\n" "$_py3_real" >&2
+            printf "\n    python3 resolves to: %s\n" "$_py3_real" >&2
         fi
     fi
 
@@ -588,7 +714,7 @@ discover_python() {
 run_setup() {
     printf "\n"
     printf "╔══════════════════════════════════════════════════════════════╗\n"
-    printf "║        rpz-zone-factory v%-6s — Interactive Setup        ║\n" "$VERSION"
+    printf "║         rpz-zone-factory v%-6s — Interactive Setup         ║\n" "$VERSION"
     printf "╚══════════════════════════════════════════════════════════════╝\n"
     printf "\n"
     printf "This wizard will walk you through configuration, verify your\n"
@@ -598,9 +724,10 @@ run_setup() {
 
     # ── Section 1: Environment ────────────────────────────────────────────
 
-    printf "\n─── Environment ────────────────────────────────────────────\n\n"
+    section_header "Environment"
 
-    RPZ_DIR=$(prompt_value "Project directory" "$RPZ_DIR")
+    RPZ_DIR=$(prompt_value "Project directory" "$(strip_trailing_slash "$RPZ_DIR")")
+    RPZ_DIR=$(strip_trailing_slash "$RPZ_DIR")
 
     # Validate RPZ_DIR immediately
     if [ ! -d "$RPZ_DIR" ]; then
@@ -628,7 +755,7 @@ run_setup() {
 
     # ── Venv check/create ─────────────────────────────────────────────────
 
-    printf "\n─── Virtual Environment ────────────────────────────────────\n\n"
+    section_header "Virtual Environment"
 
     if check_venv; then
         printf "\n  Existing venv is healthy.\n"
@@ -650,7 +777,7 @@ run_setup() {
     # Quick smoke test
     _venv_py="${RPZ_DIR}/${VENV_NAME}/bin/python"
     if "$_venv_py" "${RPZ_DIR}/run.py" --help >/dev/null 2>&1; then
-        printf "\n  ✓ rpz-zone-factory responds to --help\n"
+        printf "\n  [OK] rpz-zone-factory responds to --help\n"
     else
         log_err "rpz-zone-factory failed --help smoke test"
         return 1
@@ -658,7 +785,7 @@ run_setup() {
 
     # ── Section 2: Output Configuration ───────────────────────────────────
 
-    printf "\n─── Output Configuration ───────────────────────────────────\n\n"
+    section_header "Output Configuration"
 
     _def_output="${CONF_OUTPUT:-rpz}"
     _choice=$(prompt_choice "Output format:" "1" "rpz  — BIND RPZ zone file (RFC 5782)" "pihole — Pi-hole flat blocklist")
@@ -668,98 +795,131 @@ run_setup() {
     esac
 
     if [ "$CONF_OUTPUT" = "rpz" ]; then
-        # Per-source mode question
-        _def_persource="${CONF_PER_SOURCE:-no}"
-        if [ "$_def_persource" = "yes" ]; then _yn_def="y"; else _yn_def="n"; fi
+        # As of v0.8.0, RPZ output is always per-source: one zone file per
+        # feed, named <feed>.<category>.rpz.db. This is the only mode that
+        # supports IXFR and category-encoded SOA responses. Combined-mode
+        # RPZ has been removed.
+        CONF_PER_SOURCE="yes"
+        CONF_ZONE_NAME=""
 
-        printf "\n  Per-source mode outputs one zone file per threat source,\n"
-        printf "  so BIND logs show which threat list triggered each block.\n\n"
+        _def_outdir=$(strip_trailing_slash "${CONF_OUTPUT_FILE:-/usr/local/etc/namedb/master/rpz}")
+        CONF_OUTPUT_FILE=$(prompt_value "Output directory path" "$_def_outdir")
+        CONF_OUTPUT_FILE=$(strip_trailing_slash "$CONF_OUTPUT_FILE")
 
-        if prompt_yn "Enable per-source mode?" "$_yn_def"; then
-            CONF_PER_SOURCE="yes"
-            CONF_ZONE_NAME=""  # ignored in per-source mode
+        # Feeds directory: holds previous/current feed snapshots for
+        # incremental diffs, and the canonical allowlist.txt source file.
+        printf "\n  The feeds directory holds snapshots of the domain list for\n"
+        printf "  each zone from the previous run. On the next run, the script\n"
+        printf "  diffs the new feed against the saved snapshot to compute\n"
+        printf "  additions and deletions for incremental (IXFR) updates.\n"
+        printf "  It also holds allowlist.txt, the canonical allowlist source.\n\n"
+        _def_feeds=$(strip_trailing_slash "${CONF_FEEDS_DIR:-${CONF_OUTPUT_FILE}/feeds}")
+        CONF_FEEDS_DIR=$(prompt_value "Feeds directory" "$_def_feeds")
+        CONF_FEEDS_DIR=$(strip_trailing_slash "$CONF_FEEDS_DIR")
 
-            _def_outdir="${CONF_OUTPUT_FILE:-/usr/local/etc/namedb/master/rpz}"
-            CONF_OUTPUT_FILE=$(prompt_value "Output directory path" "$_def_outdir")
-
-            # Feeds directory: holds previous/current feed snapshots for
-            # incremental diffs, and the canonical allowlist.txt source file.
-            printf "\n  The feeds directory holds snapshots of the domain list for\n"
-            printf "  each zone from the previous run. On the next run, the script\n"
-            printf "  diffs the new feed against the saved snapshot to compute\n"
-            printf "  additions and deletions for incremental (IXFR) updates.\n"
-            printf "  It also holds allowlist.txt, the canonical allowlist source.\n\n"
-            _def_feeds="${CONF_FEEDS_DIR:-${CONF_OUTPUT_FILE}/feeds}"
-            CONF_FEEDS_DIR=$(prompt_value "Feeds directory" "$_def_feeds")
-
-            if [ ! -d "$CONF_FEEDS_DIR" ]; then
-                printf "  \u2717 Feeds directory does not exist: %s\n" "$CONF_FEEDS_DIR"
-                if prompt_yn "Create it now?" "y"; then
-                    if mkdir -p "$CONF_FEEDS_DIR" 2>/dev/null; then
-                        printf "  \u2713 Created: %s\n" "$CONF_FEEDS_DIR"
-                    else
-                        printf "  \u2717 Could not create %s (permission denied?)\n" "$CONF_FEEDS_DIR"
-                        printf "    Create it manually and ensure the rpz-zone-factory user can write to it.\n"
-                    fi
+        if [ ! -d "$CONF_FEEDS_DIR" ]; then
+            printf "  [!]  Feeds directory does not exist: %s\n" "$CONF_FEEDS_DIR"
+            if prompt_yn "Create it now?" "y"; then
+                if mkdir -p "$CONF_FEEDS_DIR" 2>/dev/null; then
+                    printf "  [OK] Created: %s\n" "$CONF_FEEDS_DIR"
+                else
+                    printf "  [!]  Could not create %s (permission denied?)\n" "$CONF_FEEDS_DIR"
+                    printf "       Create it manually and ensure the rpz-zone-factory user can write to it.\n"
                 fi
-            else
-                printf "  \u2713 Feeds directory exists: %s\n" "$CONF_FEEDS_DIR"
-            fi
-
-            # Allowlist file — now lives inside the feeds directory by default
-            printf "\n  An allowlist zone (allowlist.rpz) provides BIND-level override\n"
-            printf "  for domains that appear in threat zones but should be allowed.\n\n"
-            printf "  The allowlist is a plain text file with one domain per line.\n"
-            printf "  Lines starting with # are comments. Example:\n\n"
-            printf "    # False positives\n"
-            printf "    bing.com\n"
-            printf "    www.bing.com\n\n"
-            printf "  rpz-zone-factory reads this file and generates the allowlist RPZ zone.\n"
-            printf "  allow.sh reads/writes the same file for interactive management.\n\n"
-            _def_allowlist="${CONF_ALLOWLIST_FILE:-${CONF_FEEDS_DIR}/allowlist.txt}"
-            CONF_ALLOWLIST_FILE=$(prompt_value "Allowlist text file path (blank to skip)" "$_def_allowlist")
-
-            if [ -n "$CONF_ALLOWLIST_FILE" ] && [ ! -f "$CONF_ALLOWLIST_FILE" ]; then
-                printf "  \u2717 Allowlist file does not exist: %s\n" "$CONF_ALLOWLIST_FILE"
-                if prompt_yn "Create an empty allowlist file?" "y"; then
-                    _allowlist_dir=$(dirname "$CONF_ALLOWLIST_FILE")
-                    mkdir -p "$_allowlist_dir" 2>/dev/null
-                    if : > "$CONF_ALLOWLIST_FILE" 2>/dev/null; then
-                        printf "  \u2713 Created empty allowlist: %s\n" "$CONF_ALLOWLIST_FILE"
-                    else
-                        printf "  \u2717 Could not create %s\n" "$CONF_ALLOWLIST_FILE"
-                    fi
-                fi
-            elif [ -n "$CONF_ALLOWLIST_FILE" ]; then
-                _allow_count=$(grep -cv '^[[:space:]]*#\|^[[:space:]]*$' "$CONF_ALLOWLIST_FILE" 2>/dev/null || echo 0)
-                printf "  \u2713 Allowlist file exists (%s entries): %s\n" "$_allow_count" "$CONF_ALLOWLIST_FILE"
             fi
         else
-            CONF_PER_SOURCE="no"
-            _def_zone="${CONF_ZONE_NAME:-block.rpz}"
-            CONF_ZONE_NAME=$(prompt_value "RPZ zone name" "$_def_zone")
+            printf "  [OK] Feeds directory exists: %s\n" "$CONF_FEEDS_DIR"
+        fi
 
-            _def_outfile="${CONF_OUTPUT_FILE:-/usr/local/etc/namedb/master/block-combined.rpz.db}"
-            CONF_OUTPUT_FILE=$(prompt_value "Output file path" "$_def_outfile")
+        # Allowlist file — now lives inside the feeds directory by default
+        printf "\n  An allowlist zone (allowlist.rpz) provides BIND-level override\n"
+        printf "  for domains that appear in threat zones but should be allowed.\n\n"
+        printf "  The allowlist is a plain text file with one domain per line.\n"
+        printf "  Lines starting with # are comments.\n\n"
+        printf "  By default each entry is rendered with both an apex CNAME and a\n"
+        printf "  '*.<domain>' wildcard CNAME, so listing 'example.com' covers\n"
+        printf "  every subdomain. Use './allow.sh -n <domain>' to allow only the\n"
+        printf "  apex (no wildcard) when you need to be surgical.\n\n"
+        printf "  Example:\n\n"
+        printf "    # False positives reported by ops:\n"
+        printf "    cdn.example-vendor.com\n"
+        printf "    status.example.com\n\n"
+        printf "  rpz-zone-factory reads this file and generates the allowlist RPZ zone.\n"
+        printf "  allow.sh reads/writes the same file for interactive management.\n\n"
+        _def_allowlist="${CONF_ALLOWLIST_FILE:-${CONF_FEEDS_DIR}/allowlist.txt}"
+        CONF_ALLOWLIST_FILE=$(prompt_value "Allowlist text file path (blank to skip)" "$_def_allowlist")
+
+        if [ -n "$CONF_ALLOWLIST_FILE" ] && [ ! -f "$CONF_ALLOWLIST_FILE" ]; then
+            printf "  [!]  Allowlist file does not exist: %s\n" "$CONF_ALLOWLIST_FILE"
+            if prompt_yn "Create an empty allowlist file?" "y"; then
+                _allowlist_dir=$(dirname "$CONF_ALLOWLIST_FILE")
+                mkdir -p "$_allowlist_dir" 2>/dev/null
+                if : > "$CONF_ALLOWLIST_FILE" 2>/dev/null; then
+                    printf "  [OK] Created empty allowlist: %s\n" "$CONF_ALLOWLIST_FILE"
+                else
+                    printf "  [!]  Could not create %s\n" "$CONF_ALLOWLIST_FILE"
+                fi
+            fi
+        elif [ -n "$CONF_ALLOWLIST_FILE" ]; then
+            _allow_count=$(awk 'BEGIN{n=0} !/^[[:space:]]*(#|$)/ {n++} END{print n+0}' "$CONF_ALLOWLIST_FILE" 2>/dev/null)
+            _allow_count=${_allow_count:-0}
+            printf "  [OK] Allowlist file exists (%s entries): %s\n" "$_allow_count" "$CONF_ALLOWLIST_FILE"
         fi
     else
+        # Pi-hole output: single combined flat-file blocklist.
         CONF_PER_SOURCE="no"
         CONF_ZONE_NAME=""
         _def_outfile="${CONF_OUTPUT_FILE:-/usr/local/etc/pihole/custom.list}"
         CONF_OUTPUT_FILE=$(prompt_value "Output file path" "$_def_outfile")
     fi
 
-    printf "\n  Available threat intel sources:\n"
-    printf "    urlhaus      — Abuse.ch URLhaus (malware distribution URLs)\n"
-    printf "    cisa         — CISA Known Exploited Vulnerabilities\n"
-    printf "    drop         — Spamhaus DROP (hijacked IP blocks)\n"
+    section_header "Threat-feed selection"
+    printf "\n  Threat feeds are organized by category. The category appears\n"
+    printf "  in the zone name (e.g. urlhaus.malware.rpz), so when a client\n"
+    printf "  receives NXDOMAIN the SOA reveals why the name was blocked.\n"
 
-    printf "    scamsniffer  — Scam Sniffer crypto scam domains\n"
-    printf "    cryptoscamdb — CryptoScamDB phishing/scam domains\n"
-    printf "    et-compromised — Emerging Threats compromised IPs (single hosts)\n"
-    printf "\n"
-    _def_sources="${CONF_SOURCES:-all}"
-    CONF_SOURCES=$(prompt_value "Sources (space-separated, or 'all')" "$_def_sources")
+    _def_cats="${CONF_CATEGORIES:-all}"
+    if [ -z "$CONF_CATEGORIES" ] && [ -n "$CONF_SOURCES" ] && [ "$CONF_SOURCES" != "all" ]; then
+        # Legacy explicit-source config — surface as default to "all" but
+        # warn the operator that re-running --setup will switch them to
+        # category-based selection.
+        printf "\n  (Legacy CONF_SOURCES detected — switching to category-based selection.)\n"
+        _def_cats="all"
+    fi
+    _cat_pick=$(categories_menu "$_def_cats")
+    if [ $? -ne 0 ]; then
+        printf "  [!]  Invalid category selection. Aborting.\n"
+        return 1
+    fi
+    CONF_CATEGORIES="$_cat_pick"
+    if [ -n "$CONF_CATEGORIES" ]; then
+        printf "  [OK] Categories: %s\n" "$CONF_CATEGORIES"
+        _resolved_feeds=$(rpz_registry resolve --categories $CONF_CATEGORIES 2>/dev/null | tr '\n' ' ')
+        printf "  [OK] Feeds: %s\n" "$_resolved_feeds"
+    else
+        printf "  [OK] No categories selected (no feeds will be fetched)\n"
+    fi
+
+    printf "\n  Optional: include or exclude individual feeds from the registry\n"
+    printf "  (the same feed keys shown above next to each category, e.g.\n"
+    printf "  'urlhaus', 'easyprivacy', 'developerdan'). 'Extra' adds a feed\n"
+    printf "  outside your selected categories; 'Exclude' drops one that's\n"
+    printf "  inside them.\n\n"
+    printf "  Example: chose category 'malware', want to also pull tracking from\n"
+    printf "  EasyPrivacy and skip the noisy AntiMalwareHosts list?\n"
+    printf "    Extra:   easyprivacy\n"
+    printf "    Exclude: antimalware-hosts\n\n"
+    printf "  This prompt does NOT accept arbitrary URLs — feed sources are\n"
+    printf "  defined in 'rpz_factory/categories.py'. To add a brand-new feed\n"
+    printf "  URL, edit that file (FeedSpec entry) and re-run --setup.\n\n"
+    printf "  Run 'python -m rpz_factory.categories list-feeds' to see them all.\n\n"
+    _def_extra="${CONF_SOURCES_EXTRA:-}"
+    CONF_SOURCES_EXTRA=$(prompt_value "Extra feeds to add (blank for none)" "$_def_extra")
+    _def_excl="${CONF_SOURCES_EXCLUDE:-}"
+    CONF_SOURCES_EXCLUDE=$(prompt_value "Feeds to exclude (blank for none)" "$_def_excl")
+    # Clear the legacy CONF_SOURCES so build_args_from_config takes the
+    # category branch unambiguously. The wizard is the source of truth now.
+    CONF_SOURCES=""
 
     _def_verb="${CONF_VERBOSITY:-0}"
     _verb_choice=$(prompt_choice "Verbosity level:" "1" "Quiet (errors only)" "Info (-v)" "Debug (-vv)")
@@ -771,7 +931,19 @@ run_setup() {
 
     # ── Section 3: BIND Reload ────────────────────────────────────────────
 
-    printf "\n─── BIND Reload ────────────────────────────────────────────\n\n"
+    section_header "BIND Reload"
+
+    printf "  After rendering fresh zone files, run-rpz.sh can ask BIND to pick\n"
+    printf "  them up. For full-rebuild zones this means 'rndc reload <zone>'\n"
+    printf "  (or 'rndc thaw' for dynamic zones); for IXFR zones the changes\n"
+    printf "  reach BIND via nsupdate directly, so reload is moot for those.\n\n"
+    printf "  If you say no:\n"
+    printf "    - Full-rebuild .db files are written to disk but BIND keeps\n"
+    printf "      serving the previous in-memory zone until you reload it\n"
+    printf "      manually (or restart named).\n"
+    printf "    - IXFR-managed zones keep updating normally.\n\n"
+    printf "  Recommended: yes, unless you have an external orchestrator that\n"
+    printf "  reloads BIND on its own schedule.\n\n"
 
     _def_reload="${CONF_RELOAD:-yes}"
     if [ "$_def_reload" = "yes" ]; then
@@ -790,9 +962,10 @@ run_setup() {
             # Per-source mode: zone names are derived from source keys,
             # no need to ask. All zones are reloaded automatically.
             CONF_RELOAD_ZONE=""
-            printf "\n  Per-source mode: all source zones will be reloaded\n"
-            printf "  automatically after each update (allowlist.rpz,\n"
-            printf "  urlhaus.rpz, cisa-kev.rpz, spamhaus-drop.rpz, etc.)\n"
+            printf "\n  Per-source mode: every selected zone reloads automatically\n"
+            printf "  after each update (allowlist.rpz plus the per-feed zones\n"
+            printf "  resolved from CONF_CATEGORIES — e.g. urlhaus.malware.rpz,\n"
+            printf "  spamhaus-drop.ipreputation.rpz, scamsniffer.scam.rpz, etc.)\n"
         else
             if [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_ZONE_NAME" ]; then
                 _def_rzone="$CONF_ZONE_NAME"
@@ -820,17 +993,17 @@ run_setup() {
         fi
 
         if [ -z "$_rndc_path" ]; then
-            printf "  ✗ rndc not found in PATH or common locations\n"
+            printf "  [!]  rndc not found in PATH or common locations\n"
             printf "    Install BIND utilities or set RNDC_BIN.\n"
         else
-            printf "  ✓ rndc found: %s\n" "$_rndc_path"
+            printf "  [OK] rndc found: %s\n" "$_rndc_path"
 
             # Test rndc status (non-destructive)
             _rndc_test=$($RNDC_BIN status 2>&1)
             _rndc_rc=$?
 
             if [ $_rndc_rc -eq 0 ]; then
-                printf "  ✓ rndc status succeeded — you have access\n"
+                printf "  [OK] rndc status succeeded — you have access\n"
 
                 # Test reload with a specific zone (skip in per-source mode
                 # since the zones may not exist yet)
@@ -838,15 +1011,15 @@ run_setup() {
                     _rndc_reload=$($RNDC_BIN reload "$CONF_RELOAD_ZONE" 2>&1)
                     _rndc_rrc=$?
                     if [ $_rndc_rrc -eq 0 ]; then
-                        printf "  ✓ rndc reload %s succeeded\n" "$CONF_RELOAD_ZONE"
+                        printf "  [OK] rndc reload %s succeeded\n" "$CONF_RELOAD_ZONE"
                     else
-                        printf "  ✗ rndc reload %s failed: %s\n" "$CONF_RELOAD_ZONE" "$_rndc_reload"
+                        printf "  [!]  rndc reload %s failed: %s\n" "$CONF_RELOAD_ZONE" "$_rndc_reload"
                         printf "    The zone may not exist yet. This is OK if you haven't\n"
                         printf "    added the zone to named.conf yet (see BIND config below).\n"
                     fi
                 fi
             else
-                printf "  ✗ rndc status failed (exit code %d)\n" "$_rndc_rc"
+                printf "  [!]  rndc status failed (exit code %d)\n" "$_rndc_rc"
                 printf "    Output: %s\n" "$_rndc_test"
                 printf "\n"
                 printf "  Common fixes:\n"
@@ -871,9 +1044,19 @@ run_setup() {
     # ── Section 3b: Zone Validation & Compilation ─────────────────────────
 
     if [ "$CONF_OUTPUT" = "rpz" ]; then
-        printf "\n─── Zone Validation & Compilation ──────────────────────────\n\n"
+        section_header "Zone Validation & Compilation"
 
         # named-checkzone
+        printf "  named-checkzone parses each rendered .db file the same way BIND\n"
+        printf "  would and reports any errors (bad RR syntax, illegal owner names,\n"
+        printf "  missing SOA fields, etc.) before the file is moved into place.\n"
+        printf "  If validation fails, the previous .db is left untouched and the\n"
+        printf "  run aborts for that zone.\n\n"
+        printf "  If you skip validation, a malformed render would replace the live\n"
+        printf "  zone file. Next time BIND tries to load it (reload, restart, etc.)\n"
+        printf "  it'll refuse the zone — which can also bring down the whole\n"
+        printf "  response-policy unit. Recommended: yes.\n\n"
+
         _def_checkzone="${CONF_CHECKZONE:-yes}"
         if [ "$_def_checkzone" = "yes" ]; then _yn_def="y"; else _yn_def="n"; fi
 
@@ -881,11 +1064,11 @@ run_setup() {
             CONF_CHECKZONE="yes"
             _cz_path=$(find_named_tool "named-checkzone")
             if [ -n "$_cz_path" ]; then
-                printf "  ✓ named-checkzone found: %s\n" "$_cz_path"
+                printf "  [OK] named-checkzone found: %s\n" "$_cz_path"
             else
-                printf "  ✗ named-checkzone not found in PATH or common locations\n"
-                printf "    Install BIND utilities for zone validation.\n"
-                printf "    Validation will be skipped at runtime if not found.\n"
+                printf "  [!]  named-checkzone not found in PATH or common locations\n"
+                printf "       Install BIND utilities for zone validation.\n"
+                printf "       Validation will be skipped at runtime if not found.\n"
             fi
         else
             CONF_CHECKZONE="no"
@@ -898,21 +1081,24 @@ run_setup() {
 
         printf "  Compiled (raw) zone format loads significantly faster than\n"
         printf "  plain text. BIND skips the text parser and memory-maps the\n"
-        printf "  pre-parsed data. Recommended for large zones (>10K entries).\n"
-        printf "\n"
-        printf "  ⚠  Requires 'masterfile-format raw;' in named.conf zone statement.\n"
-        printf "     The BIND config example below will reflect your choice.\n"
-        printf "\n"
+        printf "  pre-parsed data. Recommended for large zones (>10K entries).\n\n"
+        printf "  Tradeoffs:\n"
+        printf "    - Requires 'masterfile-format raw;' in the named.conf zone\n"
+        printf "      statement. The BIND example below will reflect your choice.\n"
+        printf "    - The .db file becomes a binary blob: cat/grep/diff won't work.\n"
+        printf "      To inspect a raw zone, convert it back to text with:\n\n"
+        printf "        named-compilezone -f raw -F text -o /tmp/zone.txt \\\\\n"
+        printf "            <zone-name> /path/to/zone.db\n\n"
 
         if prompt_yn "Compile zone to binary (raw) format with named-compilezone?" "$_yn_def"; then
             CONF_COMPILE_ZONE="yes"
             _compile_path=$(find_named_tool "named-compilezone")
             if [ -n "$_compile_path" ]; then
-                printf "  ✓ named-compilezone found: %s\n" "$_compile_path"
+                printf "  [OK] named-compilezone found: %s\n" "$_compile_path"
             else
-                printf "  ✗ named-compilezone not found in PATH or common locations\n"
-                printf "    Install BIND utilities for zone compilation.\n"
-                printf "    Will fall back to text format at runtime if not found.\n"
+                printf "  [!]  named-compilezone not found in PATH or common locations\n"
+                printf "       Install BIND utilities for zone compilation.\n"
+                printf "       Will fall back to text format at runtime if not found.\n"
             fi
         else
             CONF_COMPILE_ZONE="no"
@@ -926,61 +1112,159 @@ run_setup() {
     # ── Section 3c: TSIG (shared by allow.sh and incremental updates) ────
 
     if [ "$CONF_PER_SOURCE" = "yes" ]; then
-        printf "\n─── TSIG Key (Dynamic Updates) ──────────────────────────────\n\n"
+        section_header "TSIG Keys"
 
-        printf "  A single TSIG key is used for two dynamic-update paths:\n\n"
-        printf "    1. allow.sh — interactive allowlist management\n"
-        printf "    2. Incremental zone updates (IXFR) via run-rpz.sh\n\n"
-        printf "  Both use nsupdate with the same TSIG key. BIND must be configured\n"
-        printf "  with allow-update { key \"<keyname>\"; } on every zone that\n"
-        printf "  accepts dynamic updates (all zones in per-source incremental mode).\n\n"
+        printf "  TSIG authenticates two distinct paths in this system:\n\n"
+        printf "    1. nsupdate (management) — used by allow.sh for interactive\n"
+        printf "       allowlist edits, and by run-rpz.sh for IXFR-style\n"
+        printf "       incremental zone updates.\n"
+        printf "    2. Zone transfers (AXFR/IXFR) — authenticates slaves that\n"
+        printf "       pull copies of the zones from this primary.\n\n"
+        printf "  You can use a single key for both, or split them. Splitting\n"
+        printf "  is the principle-of-least-privilege choice: the key handed\n"
+        printf "  out to slave nameservers (which may be operated by other\n"
+        printf "  teams) doesn't double as the key that authorizes nsupdate.\n\n"
+        printf "    [1] one key for everything (simpler)\n"
+        printf "    [2] split: nsupdate key + transfer key (recommended)\n"
+        printf "    [3] no TSIG (zones managed only via full rebuild + reload;\n"
+        printf "        no incremental updates, no allow.sh)\n\n"
 
-        if prompt_yn "Configure TSIG key for dynamic updates?" "y"; then
+        _def_tsig_mode="2"
+        if [ -n "$CONF_TSIG_KEY_FILE" ] && [ -z "$CONF_TRANSFER_TSIG_KEY_FILE" ]; then
+            _def_tsig_mode="1"
+        elif [ -z "$CONF_TSIG_KEY_FILE" ] && [ -z "$CONF_TRANSFER_TSIG_KEY_FILE" ]; then
+            _def_tsig_mode="3"
+        fi
 
-            # Detect platform defaults
-            _tsig_os=$(uname -s)
-            case "$_tsig_os" in
-                FreeBSD)
-                    _def_tsig_dir="/usr/local/etc/namedb/tsig"
-                    ;;
-                *)
-                    _def_tsig_dir="/etc/bind/tsig"
-                    ;;
-            esac
-            _def_tsig_key="${_def_tsig_dir}/rpz-update.key"
+        printf "  TSIG mode [%s]: " "$_def_tsig_mode" >&2
+        read -r _tsig_mode_input
+        [ -z "$_tsig_mode_input" ] && _tsig_mode_input="$_def_tsig_mode"
 
-            _tsig_key="${CONF_TSIG_KEY_FILE:-$_def_tsig_key}"
-            CONF_TSIG_KEY_FILE=$(prompt_value "TSIG key file path" "$_tsig_key")
+        # Detect platform defaults
+        _tsig_os=$(uname -s)
+        case "$_tsig_os" in
+            FreeBSD)  _def_tsig_dir="/usr/local/etc/namedb/tsig" ;;
+            *)        _def_tsig_dir="/etc/bind/tsig" ;;
+        esac
 
-            _allow_server="${CONF_ALLOW_SERVER:-127.0.0.1}"
-            CONF_ALLOW_SERVER=$(prompt_value "nsupdate server" "$_allow_server")
+        case "$_tsig_mode_input" in
+            3)
+                CONF_TSIG_KEY_FILE=""
+                CONF_TRANSFER_TSIG_KEY_FILE=""
+                CONF_ALLOW_SERVER=""
+                CONF_ALLOW_ZONE=""
+                printf "  [OK] TSIG disabled. No incremental updates or allow.sh.\n"
+                ;;
+            1)
+                # Single key handles nsupdate AND transfers
+                _def_key="${CONF_TSIG_KEY_FILE:-${_def_tsig_dir}/rpz-update.key}"
+                CONF_TSIG_KEY_FILE=$(prompt_value "TSIG key file (nsupdate + transfers)" "$_def_key")
+                CONF_TRANSFER_TSIG_KEY_FILE=""
 
-            _allow_zone="${CONF_ALLOW_ZONE:-allowlist.rpz}"
-            CONF_ALLOW_ZONE=$(prompt_value "Allowlist zone name" "$_allow_zone")
+                _allow_server="${CONF_ALLOW_SERVER:-127.0.0.1}"
+                CONF_ALLOW_SERVER=$(prompt_value "nsupdate server" "$_allow_server")
+                _allow_zone="${CONF_ALLOW_ZONE:-allowlist.rpz}"
+                CONF_ALLOW_ZONE=$(prompt_value "Allowlist zone name" "$_allow_zone")
 
-            # Check if TSIG key file exists
-            if [ -f "$CONF_TSIG_KEY_FILE" ]; then
-                printf "\n  ✓ TSIG key file found: %s\n" "$CONF_TSIG_KEY_FILE"
-            else
-                printf "\n  ✗ TSIG key file not found: %s\n" "$CONF_TSIG_KEY_FILE"
-                printf "\n  Run './allow.sh --setup' for full TSIG setup instructions.\n"
-            fi
+                if [ -f "$CONF_TSIG_KEY_FILE" ]; then
+                    printf "\n  [OK] TSIG key file found: %s\n" "$CONF_TSIG_KEY_FILE"
+                else
+                    _key_dir=$(dirname "$CONF_TSIG_KEY_FILE")
+                    _key_name=$(basename "$CONF_TSIG_KEY_FILE" | sed 's/\.key$//')
+                    printf "\n  [!]  TSIG key file not found: %s\n\n" "$CONF_TSIG_KEY_FILE"
+                    printf "       Generate it with the BIND tool 'tsig-keygen' (ships with\n"
+                    printf "       BIND utilities; run as root or via sudo so the file lands\n"
+                    printf "       with restrictive perms readable only by named):\n\n"
+                    printf "         sudo mkdir -p %s\n" "$_key_dir"
+                    printf "         sudo tsig-keygen -a hmac-sha256 %s \\\\\n" "$_key_name"
+                    printf "             > %s\n" "$CONF_TSIG_KEY_FILE"
+                    printf "         sudo chown root:<bind-group> %s\n" "$CONF_TSIG_KEY_FILE"
+                    printf "         sudo chmod 640 %s\n\n" "$CONF_TSIG_KEY_FILE"
+                    printf "       Replace <bind-group> with whatever group named runs\n"
+                    printf "       under on this host. Find it with one of:\n"
+                    printf "         ps -o user,group -p \$(pgrep -x named) | tail -n +2\n"
+                    printf "         getent group | grep -E '^(bind|named)'\n"
+                    printf "       Common defaults: 'bind' on FreeBSD and Debian/Ubuntu,\n"
+                    printf "       'named' on RHEL/CentOS/Fedora.\n\n"
+                    printf "       Resulting file looks like:\n"
+                    printf "         key \"%s\" {\n" "$_key_name"
+                    printf "             algorithm hmac-sha256;\n"
+                    printf "             secret \"<base64-encoded-secret>\";\n"
+                    printf "         };\n\n"
+                    printf "       For full setup including BIND wiring, run './allow.sh --setup'.\n"
+                fi
+                ;;
+            2|*)
+                # Split: separate keys for nsupdate vs transfers
+                _def_upd_key="${CONF_TSIG_KEY_FILE:-${_def_tsig_dir}/rpz-update.key}"
+                CONF_TSIG_KEY_FILE=$(prompt_value "nsupdate key file (allow.sh + IXFR)" "$_def_upd_key")
 
+                _def_xfer_key="${CONF_TRANSFER_TSIG_KEY_FILE:-${_def_tsig_dir}/rpz-transfer.key}"
+                CONF_TRANSFER_TSIG_KEY_FILE=$(prompt_value "Transfer key file (AXFR/IXFR to slaves)" "$_def_xfer_key")
+
+                _allow_server="${CONF_ALLOW_SERVER:-127.0.0.1}"
+                CONF_ALLOW_SERVER=$(prompt_value "nsupdate server" "$_allow_server")
+                _allow_zone="${CONF_ALLOW_ZONE:-allowlist.rpz}"
+                CONF_ALLOW_ZONE=$(prompt_value "Allowlist zone name" "$_allow_zone")
+
+                _missing_count=0
+                for _kf in "$CONF_TSIG_KEY_FILE" "$CONF_TRANSFER_TSIG_KEY_FILE"; do
+                    if [ -f "$_kf" ]; then
+                        printf "\n  [OK] TSIG key file found: %s\n" "$_kf"
+                    else
+                        printf "\n  [!]  TSIG key file not found: %s\n" "$_kf"
+                        _missing_count=$(( _missing_count + 1 ))
+                    fi
+                done
+                if [ "$_missing_count" -gt 0 ]; then
+                    _upd_dir=$(dirname "$CONF_TSIG_KEY_FILE")
+                    _upd_name=$(basename "$CONF_TSIG_KEY_FILE" | sed 's/\.key$//')
+                    _xfer_name=$(basename "$CONF_TRANSFER_TSIG_KEY_FILE" | sed 's/\.key$//')
+                    printf "\n       Generate the missing key(s) with the BIND tool\n"
+                    printf "       'tsig-keygen' (ships with BIND utilities). Run as root\n"
+                    printf "       so the files land with restrictive perms:\n\n"
+                    printf "         sudo mkdir -p %s\n" "$_upd_dir"
+                    printf "         sudo tsig-keygen -a hmac-sha256 %s \\\\\n" "$_upd_name"
+                    printf "             > %s\n" "$CONF_TSIG_KEY_FILE"
+                    printf "         sudo tsig-keygen -a hmac-sha256 %s \\\\\n" "$_xfer_name"
+                    printf "             > %s\n" "$CONF_TRANSFER_TSIG_KEY_FILE"
+                    printf "         sudo chown root:<bind-group> %s %s\n" \
+                        "$CONF_TSIG_KEY_FILE" "$CONF_TRANSFER_TSIG_KEY_FILE"
+                    printf "         sudo chmod 640 %s %s\n\n" \
+                        "$CONF_TSIG_KEY_FILE" "$CONF_TRANSFER_TSIG_KEY_FILE"
+                    printf "       Replace <bind-group> with whatever group named runs\n"
+                    printf "       under on this host. Find it with one of:\n"
+                    printf "         ps -o user,group -p \$(pgrep -x named) | tail -n +2\n"
+                    printf "         getent group | grep -E '^(bind|named)'\n"
+                    printf "       Common defaults: 'bind' on FreeBSD and Debian/Ubuntu,\n"
+                    printf "       'named' on RHEL/CentOS/Fedora.\n\n"
+                    printf "       Each file ends up like:\n"
+                    printf "         key \"<keyname>\" {\n"
+                    printf "             algorithm hmac-sha256;\n"
+                    printf "             secret \"<base64-encoded-secret>\";\n"
+                    printf "         };\n\n"
+                    printf "       The transfer key needs the same secret on every slave —\n"
+                    printf "       copy %s\n" "$CONF_TRANSFER_TSIG_KEY_FILE"
+                    printf "       to each slave's TSIG include path. The nsupdate key\n"
+                    printf "       (%s)\n" "$CONF_TSIG_KEY_FILE"
+                    printf "       stays on this primary only.\n\n"
+                    printf "       For full setup including BIND wiring, run './allow.sh --setup'.\n"
+                fi
+                ;;
+        esac
+
+        if [ -n "$CONF_TSIG_KEY_FILE" ]; then
             printf "\n  allow.sh usage:\n\n"
             printf "    ./allow.sh example.com           # allow domain + *.domain\n"
             printf "    ./allow.sh -n example.com        # allow domain only (no wildcard)\n"
             printf "    ./allow.sh -r example.com        # remove from allowlist\n\n"
-        else
-            CONF_TSIG_KEY_FILE=""
-            CONF_ALLOW_SERVER=""
-            CONF_ALLOW_ZONE=""
         fi
     fi
 
     # ── Section 3d: Incremental (IXFR) zones ─────────────────────────────
 
     if [ "$CONF_PER_SOURCE" = "yes" ] && [ -n "$CONF_TSIG_KEY_FILE" ]; then
-        printf "\n─── Incremental (IXFR) Zone Updates ─────────────────────────\n\n"
+        section_header "Incremental (IXFR) Zone Updates"
 
         printf "  With incremental mode enabled for a zone, run-rpz.sh diffs the\n"
         printf "  previous feed snapshot against the freshly generated zone and\n"
@@ -993,45 +1277,43 @@ run_setup() {
         printf "    • TSIG key is trusted for that zone\n"
         printf "    • First-ever run for the zone falls back to full rebuild (seed)\n\n"
 
-        printf "  Available per-source zones: allowlist.rpz urlhaus.rpz cisa-kev.rpz\n"
-        printf "                              spamhaus-drop.rpz scamsniffer.rpz cryptoscamdb.rpz\n"
-        printf "                              et-compromised.rpz\n\n"
-        printf "  Enter a space-separated list of zones to enable, or:\n"
-        printf "    all   = enable incremental for every per-source zone (recommended)\n"
-        printf "    none  = disable incremental, use full rebuild only\n\n"
+        printf "  Pick which categories use the IXFR path. Default is the same\n"
+        printf "  set you chose above for fetching. The allowlist zone is always\n"
+        printf "  managed via nsupdate regardless of this selection.\n"
 
-        _def_incr="${CONF_INCREMENTAL_ZONES:-all}"
-        _incr_choice=$(prompt_value "Incremental zones" "$_def_incr")
-
-        case "$_incr_choice" in
-            all|ALL)
-                CONF_INCREMENTAL_ZONES="allowlist.rpz urlhaus.rpz cisa-kev.rpz spamhaus-drop.rpz scamsniffer.rpz cryptoscamdb.rpz et-compromised.rpz"
-                printf "  ✓ All per-source zones enabled for incremental updates\n"
-                ;;
-            none|NONE|"")
-                CONF_INCREMENTAL_ZONES=""
-                printf "  ✓ Incremental updates disabled (full rebuild only)\n"
-                ;;
-            *)
-                CONF_INCREMENTAL_ZONES="$_incr_choice"
-                printf "  ✓ Incremental zones: %s\n" "$CONF_INCREMENTAL_ZONES"
-                ;;
-        esac
-
-        if [ -n "$CONF_INCREMENTAL_ZONES" ]; then
-            _def_ttl="${CONF_INCREMENTAL_TTL:-300}"
-            CONF_INCREMENTAL_TTL=$(prompt_value "TTL for nsupdate records" "$_def_ttl")
+        _def_incr_cats="${CONF_INCREMENTAL_CATEGORIES:-${CONF_CATEGORIES:-all}}"
+        _incr_pick=$(categories_menu "$_def_incr_cats")
+        if [ $? -ne 0 ]; then
+            printf "  [!]  Invalid IXFR category selection. Aborting.\n"
+            return 1
         fi
+        CONF_INCREMENTAL_CATEGORIES="$_incr_pick"
+        if [ -n "$CONF_INCREMENTAL_CATEGORIES" ]; then
+            printf "  [OK] IXFR categories: %s\n" "$CONF_INCREMENTAL_CATEGORIES"
+            # Surface the resolved zone list so the operator can see what
+            # this maps to. Allowlist is always included.
+            _resolved_zones=$(rpz_registry list-zones --categories $CONF_INCREMENTAL_CATEGORIES 2>/dev/null | tr '\n' ' ')
+            printf "  [OK] IXFR zones: allowlist.rpz %s\n" "$_resolved_zones"
+        else
+            printf "  [OK] Incremental updates disabled (full rebuild only)\n"
+        fi
+        # Clear the legacy zone list so resolve_incremental_zones takes
+        # the category branch.
+        CONF_INCREMENTAL_ZONES=""
+        # nsupdate TTL is hardcoded to 300s — same as the zone default — so
+        # we don't risk creating mixed-TTL zones via dynamic updates.
+        CONF_INCREMENTAL_TTL="300"
     else
         if [ "$CONF_PER_SOURCE" = "yes" ] && [ -z "$CONF_TSIG_KEY_FILE" ]; then
             printf "\n  Incremental updates require a TSIG key — disabled.\n"
         fi
         CONF_INCREMENTAL_ZONES=""
+        CONF_INCREMENTAL_CATEGORIES=""
     fi
 
     # ── Save configuration ────────────────────────────────────────────────
 
-    printf "\n─── Saving Configuration ───────────────────────────────────\n\n"
+    section_header "Saving Configuration"
 
     _conf_file="${RPZ_DIR}/.run-rpz.conf"
 
@@ -1051,8 +1333,16 @@ RNDC_BIN="${RNDC_BIN}"
 CONF_OUTPUT="${CONF_OUTPUT}"
 CONF_ZONE_NAME="${CONF_ZONE_NAME}"
 CONF_OUTPUT_FILE="${CONF_OUTPUT_FILE}"
-CONF_SOURCES="${CONF_SOURCES}"
 CONF_VERBOSITY="${CONF_VERBOSITY}"
+
+# Threat-feed selection (v0.7.0 category-based; preferred)
+CONF_CATEGORIES="${CONF_CATEGORIES}"
+CONF_SOURCES_EXTRA="${CONF_SOURCES_EXTRA}"
+CONF_SOURCES_EXCLUDE="${CONF_SOURCES_EXCLUDE}"
+
+# Legacy explicit feed list (cleared by --setup; kept for back-compat with
+# manually-edited configs). Ignored when CONF_CATEGORIES is set.
+CONF_SOURCES="${CONF_SOURCES}"
 
 # BIND reload
 CONF_RELOAD="${CONF_RELOAD}"
@@ -1069,6 +1359,7 @@ CONF_FEEDS_DIR="${CONF_FEEDS_DIR}"
 
 # Dynamic updates (TSIG) — shared by allow.sh and incremental zone updates
 CONF_TSIG_KEY_FILE="${CONF_TSIG_KEY_FILE}"
+CONF_TRANSFER_TSIG_KEY_FILE="${CONF_TRANSFER_TSIG_KEY_FILE}"
 CONF_ALLOW_SERVER="${CONF_ALLOW_SERVER}"
 CONF_ALLOW_ZONE="${CONF_ALLOW_ZONE}"
 
@@ -1077,17 +1368,20 @@ CONF_FEED_LOG_DIR="${CONF_FEED_LOG_DIR}"
 CONF_LOG_REBUILDS="${CONF_LOG_REBUILDS}"
 
 # Incremental (IXFR) zone updates — see v0.6.0 release notes
+# Preferred: CONF_INCREMENTAL_CATEGORIES (category-based). The legacy
+# CONF_INCREMENTAL_ZONES is honored when CONF_INCREMENTAL_CATEGORIES is empty.
+CONF_INCREMENTAL_CATEGORIES="${CONF_INCREMENTAL_CATEGORIES}"
 CONF_INCREMENTAL_ZONES="${CONF_INCREMENTAL_ZONES}"
 CONF_INCREMENTAL_TTL="${CONF_INCREMENTAL_TTL}"
 CONF
 
-    printf "  ✓ Configuration saved to: %s\n" "$_conf_file"
+    printf "  [OK] Configuration saved to: %s\n" "$_conf_file"
     printf "\n  Future runs will use these settings automatically.\n"
     printf "  Override any value with CLI args or environment variables.\n"
 
     # ── Section 4: Cron Setup ─────────────────────────────────────────────
 
-    printf "\n─── Cron Setup ─────────────────────────────────────────────\n\n"
+    section_header "Cron Setup"
 
     if prompt_yn "Generate a cron entry?" "y"; then
 
@@ -1169,130 +1463,126 @@ CONF
 
     # ── Section 5: BIND Configuration Example ─────────────────────────────
 
-    printf "\n─── BIND Configuration ─────────────────────────────────────\n\n"
+    section_header "BIND Configuration"
 
-    if prompt_yn "Show example BIND response-policy configuration?" "y"; then
+    if [ "$CONF_OUTPUT" = "rpz" ] && prompt_yn "Show example BIND response-policy configuration?" "y"; then
 
-        if [ "$CONF_PER_SOURCE" = "yes" ]; then
-            # Per-source BIND config example
-            _ex_dir="${CONF_OUTPUT_FILE:-/usr/local/etc/namedb/master/rpz}"
+        _ex_dir="${CONF_OUTPUT_FILE:-/usr/local/etc/namedb/master/rpz}"
 
-            printf "\n"
-            printf "  ┌─────────────────────────────────────────────────────────┐\n"
-            printf "  │ 1. Zone definitions (named.conf or included file)      │\n"
-            printf "  └─────────────────────────────────────────────────────────┘\n"
-            printf "\n"
+        printf "\n"
+        printf "  ┌─────────────────────────────────────────────────────────┐\n"
+        printf "  │ 1. Zone definitions (named.conf or included file)       │\n"
+        printf "  └─────────────────────────────────────────────────────────┘\n"
+        printf "\n"
 
-            # Show allowlist zone first
-            printf "  // Allowlist zone (passthru overrides)\n"
-            printf "  zone \"allowlist.rpz\" {\n"
+        # Resolve key names from key file paths (strip directory + .key suffix).
+        _tsig_keyname=""
+        _tsig_xfer_keyname=""
+        if [ -n "$CONF_TSIG_KEY_FILE" ]; then
+            _tsig_keyname=$(basename "$CONF_TSIG_KEY_FILE" | sed 's/\.key$//')
+        fi
+        if [ -n "$CONF_TRANSFER_TSIG_KEY_FILE" ]; then
+            _tsig_xfer_keyname=$(basename "$CONF_TRANSFER_TSIG_KEY_FILE" | sed 's/\.key$//')
+        fi
+
+        # Show TSIG key includes if configured
+        if [ -n "$CONF_TSIG_KEY_FILE" ]; then
+            printf "  // nsupdate key (allow.sh + IXFR run-rpz.sh)\n"
+            printf "  include \"%s\";\n" "$CONF_TSIG_KEY_FILE"
+        fi
+        if [ -n "$CONF_TRANSFER_TSIG_KEY_FILE" ]; then
+            printf "  // Zone-transfer key (slave AXFR/IXFR authentication)\n"
+            printf "  include \"%s\";\n" "$CONF_TRANSFER_TSIG_KEY_FILE"
+        fi
+        [ -n "$CONF_TSIG_KEY_FILE" ] || [ -n "$CONF_TRANSFER_TSIG_KEY_FILE" ] && printf "\n"
+
+        # Compute the right-hand side for allow-transfer: keyed if a transfer
+        # key is configured, otherwise the placeholder ACL.
+        if [ -n "$_tsig_xfer_keyname" ]; then
+            _xfer_acl="key \"${_tsig_xfer_keyname}\""
+        else
+            _xfer_acl="secondaries"  # named ACL the operator must define
+        fi
+
+        # Show allowlist zone first
+        printf "  // Allowlist zone (passthru overrides)\n"
+        printf "  zone \"allowlist.rpz\" {\n"
+        printf "      type primary;\n"
+        printf "      file \"%s/allowlist.rpz.db\";\n" "$_ex_dir"
+        if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
+            printf "      masterfile-format raw;\n"
+        fi
+        if [ -n "$_tsig_keyname" ]; then
+            printf "      allow-update { key \"%s\"; };\n" "$_tsig_keyname"
+        fi
+        printf "      allow-query { localhost; };\n"
+        printf "      allow-transfer { %s; };\n" "$_xfer_acl"
+        if [ -n "$_tsig_xfer_keyname" ]; then
+            printf "      also-notify { /* slave IPs */ };\n"
+        fi
+        printf "  };\n\n"
+
+        # Show each source zone. If TSIG is configured AND the zone is
+        # an IXFR zone (resolved via _EFFECTIVE_INCR_ZONES), include
+        # allow-update so run-rpz.sh can deliver IXFR-style incremental
+        # updates via nsupdate. The full zone list comes from the
+        # categories registry — it tracks every feed managed by Python.
+        _src_zones=$(rpz_registry list-zones | tr '\n' ' ')
+        for _src_zone in $_src_zones; do
+            printf "  zone \"%s\" {\n" "$_src_zone"
             printf "      type primary;\n"
-            printf "      file \"%s/allowlist.rpz.db\";\n" "$_ex_dir"
+            printf "      file \"%s/%s.db\";\n" "$_ex_dir" "$_src_zone"
             if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
                 printf "      masterfile-format raw;\n"
             fi
-            if [ -n "$CONF_TSIG_KEY_FILE" ]; then
-                _tsig_keyname=$(basename "$CONF_TSIG_KEY_FILE" | sed 's/\.key$//')
-                printf "      allow-update { key \"%s\"; };\n" "$_tsig_keyname"
+            if [ -n "$_tsig_keyname" ] && is_incremental_zone "$_src_zone"; then
+                printf "      allow-update { key \"%s\"; };  // v0.6.0+ incremental updates\n" "$_tsig_keyname"
             fi
             printf "      allow-query { localhost; };\n"
-            printf "      allow-transfer { none; };\n"
+            printf "      allow-transfer { %s; };\n" "$_xfer_acl"
+            if [ -n "$_tsig_xfer_keyname" ]; then
+                printf "      also-notify { /* slave IPs */ };\n"
+            fi
             printf "  };\n\n"
+        done
 
-            # Show TSIG key include if configured
-            if [ -n "$CONF_TSIG_KEY_FILE" ]; then
-                printf "  // TSIG key for dynamic allowlist updates (allow.sh)\n"
-                printf "  include \"%s\";\n\n" "$CONF_TSIG_KEY_FILE"
-            fi
-
-            # Show each source zone. If TSIG is configured AND the zone is
-            # in CONF_INCREMENTAL_ZONES, include allow-update so run-rpz.sh
-            # can deliver IXFR-style incremental updates via nsupdate.
-            for _src_zone in urlhaus.rpz cisa-kev.rpz spamhaus-drop.rpz scamsniffer.rpz cryptoscamdb.rpz et-compromised.rpz; do
-                printf "  zone \"%s\" {\n" "$_src_zone"
-                printf "      type primary;\n"
-                printf "      file \"%s/%s.db\";\n" "$_ex_dir" "$_src_zone"
-                if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
-                    printf "      masterfile-format raw;\n"
-                fi
-                if [ -n "$CONF_TSIG_KEY_FILE" ] && is_incremental_zone "$_src_zone"; then
-                    printf "      allow-update { key \"%s\"; };  // v0.6.0+ incremental updates\n" "$_tsig_keyname"
-                fi
-                printf "      allow-query { localhost; };\n"
-                printf "      allow-transfer { none; };\n"
-                printf "  };\n\n"
-            done
-
-            printf "  ┌─────────────────────────────────────────────────────────┐\n"
-            printf "  │ 2. Response policy (inside options { } block)          │\n"
-            printf "  └─────────────────────────────────────────────────────────┘\n"
-            printf "\n"
-            printf "  options {\n"
-            printf "      // ... existing options ...\n"
-            printf "\n"
-            printf "      response-policy {\n"
-            printf "          zone \"allowlist.rpz\" policy passthru;\n"
-            printf "          zone \"urlhaus.rpz\";\n"
-            printf "          zone \"cisa-kev.rpz\";\n"
-            printf "          zone \"spamhaus-drop.rpz\";\n"
-
-
-            printf "          zone \"scamsniffer.rpz\";\n"
-            printf "          zone \"cryptoscamdb.rpz\";\n"
-            printf "          zone \"et-compromised.rpz\";\n"
-            printf "      };\n"
-            printf "  };\n"
-
-        else
-            # Combined mode BIND config (original)
-            _ex_zone="${CONF_ZONE_NAME:-block.rpz}"
-            _ex_file="$CONF_OUTPUT_FILE"
-            # Sanity check: if output file looks like a directory or is empty, build a path
-            case "$_ex_file" in
-                "") _ex_file="/usr/local/etc/namedb/master/${_ex_zone}.db" ;;
-                */) _ex_file="${_ex_file}${_ex_zone}.db" ;;
-            esac
-
-            printf "\n"
-            printf "  ┌─────────────────────────────────────────────────────────┐\n"
-            printf "  │ 1. Zone definition (named.conf or included file)       │\n"
-            printf "  └─────────────────────────────────────────────────────────┘\n"
-            printf "\n"
-            printf "  zone \"%s\" {\n" "$_ex_zone"
-            printf "      type primary;\n"
-            printf "      file \"%s\";\n" "$_ex_file"
-            if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
-                printf "      masterfile-format raw;   // compiled binary — faster loading\n"
-            fi
-            printf "      allow-query { localhost; };\n"
-            printf "      allow-transfer { none; };\n"
-            printf "  };\n"
-            printf "\n"
-            printf "  ┌─────────────────────────────────────────────────────────┐\n"
-            printf "  │ 2. Response policy (inside options { } block)          │\n"
-            printf "  └─────────────────────────────────────────────────────────┘\n"
-            printf "\n"
-            printf "  options {\n"
-            printf "      // ... existing options ...\n"
-            printf "\n"
-            printf "      response-policy {\n"
-            printf "          zone \"%s\" policy given;\n" "$_ex_zone"
-            printf "          // Add more RPZ zones here, evaluated in order:\n"
-            printf "          // zone \"whitelist.rpz\" policy passthru;\n"
-            printf "          // zone \"malware.rpz\";\n"
-            printf "      };\n"
-            printf "  };\n"
+        # If transfer key is configured, show the slave-side server { } block
+        # the operator needs on each slave to authenticate inbound transfers.
+        if [ -n "$_tsig_xfer_keyname" ]; then
+            printf "  // On each slave, authenticate inbound transfers from this primary:\n"
+            printf "  //   server <primary-ip> {\n"
+            printf "  //       keys { \"%s\"; };\n" "$_tsig_xfer_keyname"
+            printf "  //   };\n\n"
         fi
+
+        printf "  ┌─────────────────────────────────────────────────────────┐\n"
+        printf "  │ 2. Response policy (inside options { } block)           │\n"
+        printf "  └─────────────────────────────────────────────────────────┘\n"
+        printf "\n"
+        printf "  options {\n"
+        printf "      // ... existing options ...\n"
+        printf "\n"
+        printf "      response-policy {\n"
+        printf "          zone \"allowlist.rpz\" policy passthru;\n"
+        for _src_zone in $_src_zones; do
+            printf "          zone \"%s\";\n" "$_src_zone"
+        done
+        printf "      };\n"
+        printf "  };\n"
         printf "\n"
         printf "  ┌─────────────────────────────────────────────────────────┐\n"
-        printf "  │ Notes                                                  │\n"
+        printf "  │ Notes                                                   │\n"
         printf "  └─────────────────────────────────────────────────────────┘\n"
         printf "\n"
         printf "  • 'policy given' uses the action specified in each RPZ record\n"
         printf "    (rpz-zone-factory writes CNAME . records → NXDOMAIN).\n"
         printf "\n"
-        if [ -n "$CONF_INCREMENTAL_ZONES" ]; then
-            printf "  • Incremental (IXFR) zones: %s\n" "$CONF_INCREMENTAL_ZONES"
+        resolve_incremental_zones
+        if [ -n "$_EFFECTIVE_INCR_ZONES" ]; then
+            if [ -n "$CONF_INCREMENTAL_CATEGORIES" ]; then
+                printf "  • Incremental (IXFR) categories: %s\n" "$CONF_INCREMENTAL_CATEGORIES"
+            fi
+            printf "  • Incremental (IXFR) zones: %s\n" "$_EFFECTIVE_INCR_ZONES"
             printf "    These zones MUST have 'allow-update { key ... };' in the zone\n"
             printf "    statement. run-rpz.sh applies diffs via nsupdate; BIND bumps\n"
             printf "    the SOA serial automatically and secondaries IXFR the delta.\n"
@@ -1317,7 +1607,11 @@ CONF
         printf "  • RPZ zones are evaluated in order. Put whitelists first\n"
         printf "    with 'policy passthru' to override subsequent blocks.\n"
         printf "\n"
-        printf "  • To log RPZ actions, add to the logging section:\n"
+        printf "  • RPZ rewrite events (QNAME redirects, NXDOMAIN synthesis, etc.)\n"
+        printf "    are emitted on BIND's default logging channel by default —\n"
+        printf "    no extra config required. The stanza below routes them to a\n"
+        printf "    dedicated, rotated file so RPZ activity is easier to audit\n"
+        printf "    separately from the rest of named.log:\n"
         printf "\n"
         printf "    channel rpz_log {\n"
         printf "        file \"/var/log/named/rpz.log\" versions 5 size 20m;\n"
@@ -1327,17 +1621,21 @@ CONF
         printf "    };\n"
         printf "    category rpz { rpz_log; };\n"
         printf "\n"
-        printf "  • After adding the zone, run:  rndc reconfig\n"
-        printf "    Subsequent updates only need:  rndc reload %s\n" "$_ex_zone"
+        printf "  • After adding the zones, run:  rndc reconfig\n"
+        printf "    From then on, run-rpz.sh handles updates automatically:\n"
+        printf "    full-rebuild zones use 'rndc reload <zone>'; IXFR zones\n"
+        printf "    use TSIG-authenticated nsupdate, so no manual rndc command\n"
+        printf "    is needed.\n"
         printf "\n"
-        printf "  • Test with:  dig @localhost known-bad-domain.example\n"
-        printf "    Should return NXDOMAIN if the domain is in the blocklist.\n"
+        printf "  • Test with:  dig @localhost <known-bad-domain> CNAME\n"
+        printf "    Should return CNAME '.' (NXDOMAIN synthesis) if the domain\n"
+        printf "    is in any of the active blocklists.\n"
         printf "\n"
     fi
 
     # ── Done ──────────────────────────────────────────────────────────────
 
-    printf "─── Setup Complete ─────────────────────────────────────────\n\n"
+    section_header "Setup Complete"
     printf "  Config saved:  %s/.run-rpz.conf\n" "$RPZ_DIR"
     printf "  Test run:      %s -i\n" "$0"
     printf "  Full help:     %s --help\n" "$0"
@@ -1392,8 +1690,24 @@ build_args_from_config() {
         fi
     fi
 
-    if [ -n "$CONF_SOURCES" ] && [ "$CONF_SOURCES" != "all" ]; then
+    # Feed selection. v0.7.0 supports four config keys, in priority order:
+    #   CONF_CATEGORIES        — categories to include (e.g. "malware ads")
+    #   CONF_SOURCES_EXTRA     — extra individual feeds on top of categories
+    #   CONF_SOURCES_EXCLUDE   — feeds to drop from the resolved selection
+    #   CONF_SOURCES (legacy)  — explicit feed list, overrides categories
+    # When CONF_CATEGORIES is set, --categories + --sources (extra) is passed
+    # to Python and resolution happens there. Legacy CONF_SOURCES is still
+    # honored for users who haven't re-run --setup.
+    if [ -n "$CONF_CATEGORIES" ]; then
+        RPZ_ARGS="$RPZ_ARGS --categories ${CONF_CATEGORIES}"
+        if [ -n "$CONF_SOURCES_EXTRA" ]; then
+            RPZ_ARGS="$RPZ_ARGS --sources ${CONF_SOURCES_EXTRA}"
+        fi
+    elif [ -n "$CONF_SOURCES" ] && [ "$CONF_SOURCES" != "all" ]; then
         RPZ_ARGS="$RPZ_ARGS --sources ${CONF_SOURCES}"
+    fi
+    if [ -n "$CONF_SOURCES_EXCLUDE" ]; then
+        RPZ_ARGS="$RPZ_ARGS --exclude-sources ${CONF_SOURCES_EXCLUDE}"
     fi
 
     case "$CONF_VERBOSITY" in
@@ -1478,12 +1792,46 @@ incremental_cname_target() {
     esac
 }
 
-# Check if a zone name is listed in CONF_INCREMENTAL_ZONES.
+# Query the threat-feed registry. Args are passed through to
+# `python -m rpz_factory.categories`. Falls back to PYTHON_BIN if the
+# venv hasn't been created yet (relevant during --setup before deps are
+# installed).
+rpz_registry() {
+    _vpy="${RPZ_DIR}/${VENV_NAME}/bin/python"
+    if [ -x "$_vpy" ]; then
+        "$_vpy" -m rpz_factory.categories "$@"
+    else
+        "$PYTHON_BIN" -m rpz_factory.categories "$@" 2>/dev/null
+    fi
+}
+
+# Resolve the effective IXFR zone list. Honors (in priority order):
+#   CONF_INCREMENTAL_CATEGORIES — categories whose feeds use IXFR
+#   CONF_INCREMENTAL_ZONES      — explicit zone list (legacy)
+# Stores result in _EFFECTIVE_INCR_ZONES (space-separated zone filenames).
+# Always includes allowlist.rpz when any category is selected, since the
+# allowlist always uses the IXFR path (run-rpz.sh treats it specially).
+resolve_incremental_zones() {
+    if [ -n "$CONF_INCREMENTAL_CATEGORIES" ]; then
+        # shellcheck disable=SC2086
+        _expanded=$(rpz_registry list-zones --categories $CONF_INCREMENTAL_CATEGORIES 2>/dev/null | tr '\n' ' ')
+        if [ -n "$_expanded" ]; then
+            _EFFECTIVE_INCR_ZONES="allowlist.rpz $_expanded"
+        else
+            _EFFECTIVE_INCR_ZONES="$CONF_INCREMENTAL_ZONES"
+        fi
+    else
+        _EFFECTIVE_INCR_ZONES="$CONF_INCREMENTAL_ZONES"
+    fi
+}
+
+# Check if a zone name uses the IXFR update path.
 # Returns 0 if yes, 1 if no.
 is_incremental_zone() {
     _zone="$1"
-    [ -z "$CONF_INCREMENTAL_ZONES" ] && return 1
-    case " $CONF_INCREMENTAL_ZONES " in
+    [ -z "${_EFFECTIVE_INCR_ZONES:-}" ] && resolve_incremental_zones
+    [ -z "$_EFFECTIVE_INCR_ZONES" ] && return 1
+    case " $_EFFECTIVE_INCR_ZONES " in
         *\ "$_zone"\ *) return 0 ;;
         *) return 1 ;;
     esac
@@ -1881,9 +2229,10 @@ run_rpz() {
     # snapshot, the v0.7.0 fast-path would skip rendering and prevent the shell
     # from ever seeding. Inject --force so Python renders all zones, letting
     # the shell seed the new ones. This is a one-time cost per new zone.
-    if [ $DO_FORCE -eq 0 ] && [ -n "$CONF_INCREMENTAL_ZONES" ] && [ -n "$CONF_FEEDS_DIR" ]; then
+    resolve_incremental_zones
+    if [ $DO_FORCE -eq 0 ] && [ -n "$_EFFECTIVE_INCR_ZONES" ] && [ -n "$CONF_FEEDS_DIR" ]; then
         _need_force=0
-        for _iz in $CONF_INCREMENTAL_ZONES; do
+        for _iz in $_EFFECTIVE_INCR_ZONES; do
             if [ ! -f "${CONF_FEEDS_DIR}/${_iz}.list.previous" ]; then
                 log_info "Seed-gap: ${_iz} has no .list.previous — adding --force"
                 _need_force=1

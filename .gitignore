@@ -1,7 +1,28 @@
 .venv/
 __pycache__/
 *.pyc
-block-combined.rpz.db
+
+# generated zone files (per-source mode writes one per feed to OUTPUT_DIR)
+*.rpz.db
+
+# runtime state
 .cache/
+feeds/
+log/
+
+# config + audit (operator-specific)
 .run-rpz.conf
 allow-audit.log
+
+# legacy / personal scratch
+Makefile
+scripts/
+IXFR-LESSONS-LEARNED.md
+CLAUDE.md
+run-rpz.sh.backup
+
+# macOS metadata
+.DS_Store
+
+# tooling output
+.firecrawl/

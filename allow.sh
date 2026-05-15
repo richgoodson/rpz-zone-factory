@@ -264,14 +264,16 @@ signed dynamic updates on the allowlist zone, and verifying the setup.
       allow-transfer { none; };
   };
 
-  NOTE: As of v0.6.0, every zone listed in CONF_INCREMENTAL_ZONES also
+  NOTE: As of v0.6.0, every zone selected for incremental updates (via
+  CONF_INCREMENTAL_CATEGORIES or the legacy CONF_INCREMENTAL_ZONES) also
   needs 'allow-update { key "rpz-update"; };' so that run-rpz.sh can
   apply incremental diffs via TSIG-authenticated nsupdate. Add the same
   allow-update line to each per-source threat zone you want to update
-  incrementally (urlhaus.rpz, cisa-kev.rpz, spamhaus-drop.rpz,
-  scamsniffer.rpz, cryptoscamdb.rpz). Without this, the incremental
-  path silently falls back to a full rebuild for that zone and secondaries
-  pull a full AXFR instead of an IXFR delta.
+  incrementally (e.g. urlhaus.malware.rpz, cisa-kev.vulnerabilities.rpz,
+  spamhaus-drop.ipreputation.rpz, scamsniffer.scam.rpz, etc. — see the
+  "named.conf" sample emitted by `./run-rpz.sh --setup`). Without this,
+  the incremental path silently falls back to a full rebuild for that
+  zone and secondaries pull a full AXFR instead of an IXFR delta.
 
 ─── 6. Reload BIND ────────────────────────────────────────────────────
 
