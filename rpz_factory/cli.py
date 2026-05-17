@@ -60,14 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format (default: rpz)",
     )
     parser.add_argument(
-        "--zone-name",
-        default="rpz.local",
-        help="RPZ zone name (default: rpz.local)",
-    )
-    parser.add_argument(
         "--output-file",
         default=None,
-        help="Write output to file (default: stdout). In --per-source mode, this is a directory.",
+        help="For --output rpz, the directory that will hold one zone file "
+             "per source. For --output pihole, the path of the flat blocklist "
+             "file. Default: stdout (Pi-hole only; RPZ requires a directory).",
     )
     parser.add_argument(
         "--sources",
@@ -107,15 +104,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cache directory for stale-data preservation (default: {RPZ_DIR}/.cache)",
     )
     parser.add_argument(
-        "--per-source",
-        action="store_true",
-        default=False,
-        help="Output one zone file per source instead of a combined file.",
-    )
-    parser.add_argument(
         "--allowlist",
         default=None,
-        help="Path to allowlist file (one domain per line). Generates rpz-allowlist.db in per-source mode.",
+        help="Path to allowlist file (one domain per line). Generates "
+             "allowlist.rpz.db alongside the threat zones (RPZ output only).",
     )
     parser.add_argument(
         "--force",
@@ -270,11 +262,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _configure_logging(args.verbose)
     logger = logging.getLogger("rpz_factory")
-
-    # Validate: --per-source + --output pihole is not supported
-    if args.per_source and args.output == "pihole":
-        print("ERROR: --per-source is not supported with --output pihole", file=sys.stderr)
-        return 1
 
     # Resolve --sources / --categories / --exclude-sources into the final
     # ordered feed list. Stored back on args.sources for downstream code.
@@ -444,8 +431,8 @@ def main(argv: list[str] | None = None) -> int:
         and not errored_sources
     )
 
-    # ── Per-source mode ───────────────────────────────────────────────────
-    if args.per_source:
+    # ── RPZ output: per-source path ───────────────────────────────────────
+    if args.output == "rpz":
         return _run_per_source(
             args,
             all_entries,
@@ -455,9 +442,12 @@ def main(argv: list[str] | None = None) -> int:
             errored_sources,
         )
 
-    # ── Combined mode (original behavior) ─────────────────────────────────
-    # Compute live zone path early — we need it for both the all-unchanged
-    # fast-path check and the serial computation below.
+    # ── Pi-hole output: single combined flat-file ─────────────────────────
+    # Pi-hole consumes one file, so it always renders combined.
+    #
+    # All-unchanged fast-path: if every source returned 304 with no errors
+    # and the live blocklist already exists on disk, skip rendering. Stdout
+    # and first-run cases fall through to a normal render.
     _live_path = None
     if args.output_file:
         if args.output_file.endswith(".tmp"):
@@ -465,18 +455,14 @@ def main(argv: list[str] | None = None) -> int:
         else:
             _live_path = args.output_file
 
-    # All-unchanged fast-path: only valid for rpz output to a real file
-    # whose live zone already exists. Stdout / pihole / first-run cases
-    # fall through to normal render.
     if (
         all_unchanged
-        and args.output == "rpz"
         and _live_path
         and os.path.isfile(_live_path)
         and os.path.getsize(_live_path) > 0
     ):
         logger.info(
-            "All %d sources returned 304; live zone %s exists — skipping render",
+            "All %d sources returned 304; live blocklist %s exists — skipping render",
             len(args.sources),
             _live_path,
         )
@@ -491,13 +477,7 @@ def main(argv: list[str] | None = None) -> int:
     filtered = filter_entries(all_entries)
     logger.info("After filtering: %d entries", len(filtered))
 
-    # Render
-    if args.output == "rpz":
-        _serial = compute_next_serial(_live_path)
-        logger.info("Combined mode: serial=%d zone=%s", _serial, args.zone_name)
-        output_text = rpz.render(filtered, zone_name=args.zone_name, serial=_serial)
-    else:
-        output_text = pihole.render(filtered)
+    output_text = pihole.render(filtered)
 
     # Write output
     if args.output_file:

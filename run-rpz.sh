@@ -41,7 +41,7 @@ LOG_TAG="rpz-zone-factory"
 # Syslog facility
 LOG_FACILITY="daemon"
 
-# rndc binary (for --reload-bind)
+# rndc binary
 RNDC_BIN="${RNDC_BIN:-rndc}"
 
 # ─── Saved config (from --setup wizard) ───────────────────────────────────────
@@ -49,16 +49,13 @@ RNDC_BIN="${RNDC_BIN:-rndc}"
 # They provide defaults for cron runs so no CLI args are needed.
 
 CONF_OUTPUT=""          # rpz or pihole
-CONF_ZONE_NAME=""       # RPZ zone name (e.g., block.rpz)
-CONF_OUTPUT_FILE=""     # Output file path
+CONF_OUTPUT_FILE=""     # Output directory (rpz) or file (pihole)
 CONF_SOURCES=""         # Space-separated source list, or empty for all
 CONF_VERBOSITY=""       # 0=quiet, 1=-v, 2=-vv
 CONF_RELOAD=""          # yes or no
-CONF_RELOAD_ZONE=""     # Zone to reload via rndc
 CONF_COMPILE_ZONE=""    # yes or no — use named-compilezone for binary (raw) format
 CONF_CHECKZONE=""       # yes or no — validate with named-checkzone before deploying
-CONF_PER_SOURCE=""      # yes or no — output one zone file per source
-CONF_ALLOWLIST_FILE=""  # path to allowlist file (used with per-source mode)
+CONF_ALLOWLIST_FILE=""  # path to allowlist file (RPZ output only)
 CONF_TSIG_KEY_FILE=""           # path to TSIG key file for nsupdate (allow.sh + IXFR run-rpz.sh)
 CONF_TRANSFER_TSIG_KEY_FILE=""  # path to TSIG key file for AXFR/IXFR transfers to slaves (optional; least-privilege split)
 CONF_ALLOW_SERVER=""   # server for nsupdate (default: 127.0.0.1)
@@ -85,16 +82,15 @@ fi
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION="0.8.0"
+VERSION="0.9.0"
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
 MODE="cron"       # "cron" or "interactive"
 DO_SETUP=0
-DO_RELOAD=0
+DO_RELOAD=0        # set by run_rpz when CONF_RELOAD=yes; gates per-zone freeze/reload/thaw
 DO_FULL_REBUILD=0  # force full rebuild path even for incremental zones
 DO_FORCE=0         # bypass v0.7.0 "all sources unchanged" fast-path
-RELOAD_ZONE=""
 RPZ_ARGS=""
 EXIT_CODE=0
 
@@ -319,8 +315,6 @@ OPTIONS:
   --setup             Interactive setup wizard: configure all options,
                       verify the environment, test rndc, and optionally
                       generate a cron entry and BIND config example.
-  --reload-bind ZONE  After successful run, execute: rndc reload ZONE
-                      Requires rndc access (see --setup for help).
   --full-rebuild      Force full rebuild path (freeze/reload/thaw) for all
                       zones, bypassing the incremental IXFR update path.
                       Use for recovery or after BIND/zone config changes.
@@ -365,11 +359,10 @@ EXAMPLES:
   ./run-rpz.sh
 
   # Interactive test run with explicit args
-  ./run-rpz.sh -i -- --output rpz --zone-name block.rpz -v
+  ./run-rpz.sh -i -- --output rpz --categories malware ads -v
 
-  # Explicit args override saved config
-  ./run-rpz.sh --reload-bind block.rpz -- --output rpz --zone-name block.rpz \
-    --output-file /usr/local/etc/namedb/master/block.rpz.db
+  # Force a full rebuild of every zone (recovery)
+  ./run-rpz.sh -i --full-rebuild
 
 USAGE
     exit "${1:-0}"
@@ -406,15 +399,6 @@ parse_args() {
                 DO_SETUP=1
                 MODE="interactive"
                 shift
-                ;;
-            --reload-bind)
-                if [ -z "$2" ] || [ "$(printf '%.1s' "$2")" = "-" ]; then
-                    printf "ERROR: --reload-bind requires a zone name argument\n" >&2
-                    usage 1
-                fi
-                DO_RELOAD=1
-                RELOAD_ZONE="$2"
-                shift 2
                 ;;
             --full-rebuild)
                 DO_FULL_REBUILD=1
@@ -795,13 +779,9 @@ run_setup() {
     esac
 
     if [ "$CONF_OUTPUT" = "rpz" ]; then
-        # As of v0.8.0, RPZ output is always per-source: one zone file per
-        # feed, named <feed>.<category>.rpz.db. This is the only mode that
-        # supports IXFR and category-encoded SOA responses. Combined-mode
-        # RPZ has been removed.
-        CONF_PER_SOURCE="yes"
-        CONF_ZONE_NAME=""
-
+        # RPZ output is per-source: one zone file per feed, named
+        # <feed>.<category>.rpz.db. This is the only RPZ mode; it's the only
+        # one that supports IXFR and category-encoded SOA responses.
         _def_outdir=$(strip_trailing_slash "${CONF_OUTPUT_FILE:-/usr/local/etc/namedb/master/rpz}")
         CONF_OUTPUT_FILE=$(prompt_value "Output directory path" "$_def_outdir")
         CONF_OUTPUT_FILE=$(strip_trailing_slash "$CONF_OUTPUT_FILE")
@@ -867,8 +847,6 @@ run_setup() {
         fi
     else
         # Pi-hole output: single combined flat-file blocklist.
-        CONF_PER_SOURCE="no"
-        CONF_ZONE_NAME=""
         _def_outfile="${CONF_OUTPUT_FILE:-/usr/local/etc/pihole/custom.list}"
         CONF_OUTPUT_FILE=$(prompt_value "Output file path" "$_def_outfile")
     fi
@@ -958,22 +936,10 @@ run_setup() {
         _def_rndc="${RNDC_BIN:-rndc}"
         RNDC_BIN=$(prompt_value "rndc binary" "$_def_rndc")
 
-        if [ "$CONF_PER_SOURCE" = "yes" ]; then
-            # Per-source mode: zone names are derived from source keys,
-            # no need to ask. All zones are reloaded automatically.
-            CONF_RELOAD_ZONE=""
-            printf "\n  Per-source mode: every selected zone reloads automatically\n"
-            printf "  after each update (allowlist.rpz plus the per-feed zones\n"
-            printf "  resolved from CONF_CATEGORIES — e.g. urlhaus.malware.rpz,\n"
-            printf "  spamhaus-drop.ipreputation.rpz, scamsniffer.scam.rpz, etc.)\n"
-        else
-            if [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_ZONE_NAME" ]; then
-                _def_rzone="$CONF_ZONE_NAME"
-            else
-                _def_rzone="${CONF_RELOAD_ZONE:-block.rpz}"
-            fi
-            CONF_RELOAD_ZONE=$(prompt_value "Zone to reload" "$_def_rzone")
-        fi
+        printf "\n  Every selected zone reloads automatically after each update\n"
+        printf "  (allowlist.rpz plus the per-feed zones resolved from\n"
+        printf "  CONF_CATEGORIES, e.g. urlhaus.malware.rpz,\n"
+        printf "  spamhaus-drop.ipreputation.rpz, scamsniffer.scam.rpz, etc.)\n"
 
         # Test rndc access
         printf "\n  Testing rndc access...\n"
@@ -1004,20 +970,6 @@ run_setup() {
 
             if [ $_rndc_rc -eq 0 ]; then
                 printf "  [OK] rndc status succeeded — you have access\n"
-
-                # Test reload with a specific zone (skip in per-source mode
-                # since the zones may not exist yet)
-                if [ "$CONF_PER_SOURCE" != "yes" ] && [ -n "$CONF_RELOAD_ZONE" ]; then
-                    _rndc_reload=$($RNDC_BIN reload "$CONF_RELOAD_ZONE" 2>&1)
-                    _rndc_rrc=$?
-                    if [ $_rndc_rrc -eq 0 ]; then
-                        printf "  [OK] rndc reload %s succeeded\n" "$CONF_RELOAD_ZONE"
-                    else
-                        printf "  [!]  rndc reload %s failed: %s\n" "$CONF_RELOAD_ZONE" "$_rndc_reload"
-                        printf "    The zone may not exist yet. This is OK if you haven't\n"
-                        printf "    added the zone to named.conf yet (see BIND config below).\n"
-                    fi
-                fi
             else
                 printf "  [!]  rndc status failed (exit code %d)\n" "$_rndc_rc"
                 printf "    Output: %s\n" "$_rndc_test"
@@ -1038,7 +990,6 @@ run_setup() {
         fi
     else
         CONF_RELOAD="no"
-        CONF_RELOAD_ZONE=""
     fi
 
     # ── Section 3b: Zone Validation & Compilation ─────────────────────────
@@ -1111,7 +1062,7 @@ run_setup() {
 
     # ── Section 3c: TSIG (shared by allow.sh and incremental updates) ────
 
-    if [ "$CONF_PER_SOURCE" = "yes" ]; then
+    if [ "$CONF_OUTPUT" = "rpz" ]; then
         section_header "TSIG Keys"
 
         printf "  TSIG authenticates two distinct paths in this system:\n\n"
@@ -1263,7 +1214,7 @@ run_setup() {
 
     # ── Section 3d: Incremental (IXFR) zones ─────────────────────────────
 
-    if [ "$CONF_PER_SOURCE" = "yes" ] && [ -n "$CONF_TSIG_KEY_FILE" ]; then
+    if [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_TSIG_KEY_FILE" ]; then
         section_header "Incremental (IXFR) Zone Updates"
 
         printf "  With incremental mode enabled for a zone, run-rpz.sh diffs the\n"
@@ -1304,7 +1255,7 @@ run_setup() {
         # we don't risk creating mixed-TTL zones via dynamic updates.
         CONF_INCREMENTAL_TTL="300"
     else
-        if [ "$CONF_PER_SOURCE" = "yes" ] && [ -z "$CONF_TSIG_KEY_FILE" ]; then
+        if [ "$CONF_OUTPUT" = "rpz" ] && [ -z "$CONF_TSIG_KEY_FILE" ]; then
             printf "\n  Incremental updates require a TSIG key — disabled.\n"
         fi
         CONF_INCREMENTAL_ZONES=""
@@ -1331,7 +1282,6 @@ RNDC_BIN="${RNDC_BIN}"
 
 # Output configuration
 CONF_OUTPUT="${CONF_OUTPUT}"
-CONF_ZONE_NAME="${CONF_ZONE_NAME}"
 CONF_OUTPUT_FILE="${CONF_OUTPUT_FILE}"
 CONF_VERBOSITY="${CONF_VERBOSITY}"
 
@@ -1346,14 +1296,12 @@ CONF_SOURCES="${CONF_SOURCES}"
 
 # BIND reload
 CONF_RELOAD="${CONF_RELOAD}"
-CONF_RELOAD_ZONE="${CONF_RELOAD_ZONE}"
 
 # Zone validation and compilation
 CONF_CHECKZONE="${CONF_CHECKZONE}"
 CONF_COMPILE_ZONE="${CONF_COMPILE_ZONE}"
 
-# Per-source mode
-CONF_PER_SOURCE="${CONF_PER_SOURCE}"
+# Allowlist / feed snapshots
 CONF_ALLOWLIST_FILE="${CONF_ALLOWLIST_FILE}"
 CONF_FEEDS_DIR="${CONF_FEEDS_DIR}"
 
@@ -1413,16 +1361,8 @@ CONF
 
         _cron_cmd="$_script_path"
 
-        # Add reload if configured
-        if [ "$CONF_RELOAD" = "yes" ] && [ -n "$CONF_RELOAD_ZONE" ]; then
-            _cron_cmd="$_cron_cmd --reload-bind ${CONF_RELOAD_ZONE}"
-        fi
-
         # Build rpz-zone-factory args
         _rpz_args="--output ${CONF_OUTPUT}"
-        if [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_ZONE_NAME" ]; then
-            _rpz_args="$_rpz_args --zone-name ${CONF_ZONE_NAME}"
-        fi
         if [ -n "$CONF_OUTPUT_FILE" ]; then
             _rpz_args="$_rpz_args --output-file ${CONF_OUTPUT_FILE}"
         fi
@@ -1655,14 +1595,11 @@ build_args_from_config() {
 
     RPZ_ARGS="--output ${CONF_OUTPUT}"
 
-    # Per-source mode
-    if [ "$CONF_PER_SOURCE" = "yes" ]; then
-        RPZ_ARGS="$RPZ_ARGS --per-source"
-
+    if [ "$CONF_OUTPUT" = "rpz" ]; then
         if [ -n "$CONF_OUTPUT_FILE" ]; then
-            # In per-source mode with validation, write to .tmp subdirectory
-            if [ "$CONF_OUTPUT" = "rpz" ] && \
-               { [ "$CONF_CHECKZONE" = "yes" ] || [ "$CONF_COMPILE_ZONE" = "yes" ]; }; then
+            # With validation enabled, write fresh zones into a .tmp staging
+            # subdirectory so live zones stay intact until validation passes.
+            if [ "$CONF_CHECKZONE" = "yes" ] || [ "$CONF_COMPILE_ZONE" = "yes" ]; then
                 RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}/.tmp"
             else
                 RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}"
@@ -1673,20 +1610,9 @@ build_args_from_config() {
             RPZ_ARGS="$RPZ_ARGS --allowlist ${CONF_ALLOWLIST_FILE}"
         fi
     else
-        # Combined mode
-        if [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_ZONE_NAME" ]; then
-            RPZ_ARGS="$RPZ_ARGS --zone-name ${CONF_ZONE_NAME}"
-        fi
-
+        # Pi-hole output: single flat-file blocklist.
         if [ -n "$CONF_OUTPUT_FILE" ]; then
-            # When checkzone or compilezone is enabled, write to a temp file first
-            # so the previous zone file is preserved until validation passes.
-            if [ "$CONF_OUTPUT" = "rpz" ] && \
-               { [ "$CONF_CHECKZONE" = "yes" ] || [ "$CONF_COMPILE_ZONE" = "yes" ]; }; then
-                RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}.tmp"
-            else
-                RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}"
-            fi
+            RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}"
         fi
     fi
 
@@ -2212,17 +2138,11 @@ run_rpz() {
         fi
     fi
 
-    # Apply reload from config if not set via CLI. This runs regardless of
-    # whether args came from build_args_from_config or from "-- <args>" on
-    # the CLI, so that explicit-arg runs still get BIND reload/freeze/thaw.
-    if [ $DO_RELOAD -eq 0 ] && [ "$CONF_RELOAD" = "yes" ]; then
-        if [ "$CONF_PER_SOURCE" = "yes" ]; then
-            DO_RELOAD=1
-            RELOAD_ZONE="__per_source__"
-        elif [ -n "$CONF_RELOAD_ZONE" ]; then
-            DO_RELOAD=1
-            RELOAD_ZONE="$CONF_RELOAD_ZONE"
-        fi
+    # Apply reload from config. This runs regardless of whether args came
+    # from build_args_from_config or from "-- <args>" on the CLI, so that
+    # explicit-arg runs still get BIND reload/freeze/thaw on the RPZ path.
+    if [ "$CONF_RELOAD" = "yes" ] && [ "$CONF_OUTPUT" = "rpz" ]; then
+        DO_RELOAD=1
     fi
 
     # Seed-gap detection: if any incremental zone is missing its .list.previous
@@ -2307,7 +2227,7 @@ run_rpz() {
     #
     # --full-rebuild on the CLI forces every zone through the full path.
 
-    if [ "$CONF_PER_SOURCE" = "yes" ] && [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_OUTPUT_FILE" ]; then
+    if [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_OUTPUT_FILE" ]; then
 
         _tmp_dir="${CONF_OUTPUT_FILE}/.tmp"
         mkdir -p "$CONF_OUTPUT_FILE"
@@ -2630,131 +2550,19 @@ run_rpz() {
         return 0
     fi
 
-    # ── Combined mode guards and validation ───────────────────────────────
-
-    # Zero-length file guard: abort before validating/reloading if output is empty
-    # When checkzone/compilezone is enabled, the output went to .tmp
+    # ── Pi-hole (combined flat-file) post-processing ──────────────────────
+    #
+    # Pi-hole output is a single flat blocklist file. The RPZ output path
+    # returned above. Only Pi-hole reaches this point.
+    #
+    # Zero-length file guard: abort if the rendered file is empty or missing.
     if [ -n "$CONF_OUTPUT_FILE" ]; then
-        if { [ "$CONF_CHECKZONE" = "yes" ] || [ "$CONF_COMPILE_ZONE" = "yes" ]; } && \
-           [ "$CONF_OUTPUT" = "rpz" ]; then
-            _guard_file="${CONF_OUTPUT_FILE}.tmp"
-        else
-            _guard_file="$CONF_OUTPUT_FILE"
-        fi
-        if [ ! -s "$_guard_file" ]; then
-            log_err "Output file is empty or missing: $_guard_file — aborting"
+        if [ ! -s "$CONF_OUTPUT_FILE" ]; then
+            log_err "Output file is empty or missing: $CONF_OUTPUT_FILE — aborting"
             return 1
         fi
     fi
 
-    # ── Zone validation and compilation (RPZ output only) ─────────────────
-
-    if [ "$CONF_OUTPUT" = "rpz" ] && [ -n "$CONF_OUTPUT_FILE" ] && [ -n "$CONF_ZONE_NAME" ]; then
-
-        # When checkzone/compilezone is enabled, Python wrote to .tmp via
-        # build_args_from_config; the final path still has the old zone file.
-        _final_file="$CONF_OUTPUT_FILE"
-        _text_file="$CONF_OUTPUT_FILE"
-
-        if [ "$CONF_CHECKZONE" = "yes" ] || [ "$CONF_COMPILE_ZONE" = "yes" ]; then
-            _text_file="${CONF_OUTPUT_FILE}.tmp"
-
-            if [ ! -s "$_text_file" ]; then
-                log_err "Text zone file is empty or missing: $_text_file — aborting"
-                return 1
-            fi
-        fi
-
-        # Step 1: named-checkzone validation
-        if [ "$CONF_CHECKZONE" = "yes" ]; then
-            _checkzone_bin=$(find_named_tool "named-checkzone")
-            if [ -n "$_checkzone_bin" ]; then
-                log_info "Validating zone with named-checkzone..."
-                _cz_output=$("$_checkzone_bin" "$CONF_ZONE_NAME" "$_text_file" 2>&1)
-                _cz_rc=$?
-                if [ $_cz_rc -ne 0 ]; then
-                    log_err "named-checkzone failed (exit code: $_cz_rc)"
-                    log_err "$_cz_output"
-                    log_err "Keeping previous zone file intact. Fix the issue and re-run."
-                    rm -f "$_text_file"
-                    return 1
-                fi
-                log_info "named-checkzone passed: $_cz_output"
-            else
-                log_warn "named-checkzone not found — skipping validation"
-            fi
-        fi
-
-        # Step 2: named-compilezone (text → raw binary format)
-        if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
-            _compilezone_bin=$(find_named_tool "named-compilezone")
-            if [ -n "$_compilezone_bin" ]; then
-                log_info "Compiling zone to raw format with named-compilezone..."
-                _compile_output=$("$_compilezone_bin" -o "$_final_file" -F raw \
-                    "$CONF_ZONE_NAME" "$_text_file" 2>&1)
-                _compile_rc=$?
-                if [ $_compile_rc -ne 0 ]; then
-                    log_err "named-compilezone failed (exit code: $_compile_rc)"
-                    log_err "$_compile_output"
-                    log_err "Keeping previous zone file intact."
-                    rm -f "$_text_file"
-                    return 1
-                fi
-                log_info "Zone compiled: $_compile_output"
-                rm -f "$_text_file"
-
-                if [ ! -s "$_final_file" ]; then
-                    log_err "Compiled zone file is empty: $_final_file — aborting"
-                    return 1
-                fi
-            else
-                log_warn "named-compilezone not found — falling back to text format"
-                mv -f "$_text_file" "$_final_file"
-            fi
-        elif [ "$CONF_CHECKZONE" = "yes" ]; then
-            # Checkzone passed, no compilation — move validated text to final path
-            mv -f "$_text_file" "$_final_file"
-        fi
-    fi
-
-    # Optional BIND reload
-    if [ $DO_RELOAD -eq 1 ]; then
-        reload_bind
-        return $?
-    fi
-
-    return 0
-}
-
-# ─── BIND reload ──────────────────────────────────────────────────────────────
-
-reload_bind() {
-    if ! command -v "$RNDC_BIN" >/dev/null 2>&1; then
-        for _try in /usr/sbin/rndc /usr/local/sbin/rndc /usr/bin/rndc; do
-            if [ -x "$_try" ]; then
-                RNDC_BIN="$_try"
-                break
-            fi
-        done
-    fi
-
-    if ! command -v "$RNDC_BIN" >/dev/null 2>&1; then
-        log_err "rndc not found. Cannot reload zone: $RELOAD_ZONE"
-        log_err "Install BIND utilities or set RNDC_BIN to the correct path."
-        return 1
-    fi
-
-    log_info "Reloading BIND zone: $RELOAD_ZONE"
-    _rndc_output=$($RNDC_BIN reload "$RELOAD_ZONE" 2>&1)
-    _rndc_rc=$?
-
-    if [ $_rndc_rc -ne 0 ]; then
-        log_err "rndc reload failed (exit code: $_rndc_rc): $_rndc_output"
-        log_err "Check rndc key permissions. See: $0 --help"
-        return 1
-    fi
-
-    log_info "BIND zone reloaded: $RELOAD_ZONE"
     return 0
 }
 

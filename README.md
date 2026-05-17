@@ -1,17 +1,32 @@
 # rpz-zone-factory
 
-Threat intelligence pipeline for DNS. Fetches from 6 public feeds, builds RFC 5782 RPZ zone files for BIND, and optionally outputs Pi-hole flat blocklists.  Currently used in a FreeBSD production environment, so it works, but may be a bit confusing to set up as the project has evolved over time.  I've tried to add Linux specific options, but those have not been extensively tested.
+Threat intelligence pipeline for DNS. Fetches from 12 public feeds, builds RFC 5782 RPZ zone files for BIND, and optionally outputs Pi-hole flat blocklists.  Currently used in a FreeBSD production environment, so it works, but may be a bit confusing to set up as the project has evolved over time.  I've tried to add Linux specific options, but those have not been extensively tested.
 
 Per-source zones support **incremental updates via TSIG-authenticated `nsupdate`** so secondaries receive **NOTIFY → IXFR** with only the changed records, instead of re-AXFR'ing the whole zone on every refresh. Steady-state runs (no upstream changes) exit in seconds via a 304-aware fast-path.
+
+## Before You Start
+
+Have these in place before running `--setup`:
+
+- **BIND 9.16 or later**, with RPZ support compiled in. The default `bind9` builds on Debian/Ubuntu and `bind918`/`bind916` on FreeBSD include it.
+- **`rndc` working against your BIND instance.** Test with `rndc status`.
+- **A non-root user to run as.** Don't run rpz-zone-factory as root. Either pick an existing non-root user, or follow [Running as a Non-Root User](#running-as-a-non-root-user) first.
+
+The `--setup` wizard collects configuration but does NOT modify `named.conf`. The expected flow is:
+
+1. Run `./run-rpz.sh --setup` to pick categories, configure TSIG, and save config.
+2. Generate `named.conf` snippets for the categories you picked (see [BIND Configuration](#bind-configuration)) and merge them into your BIND config.
+3. Restart BIND (or `rndc reconfig`) so it loads the new zone definitions.
+4. Run `./run-rpz.sh -i` for the first test run.
 
 ## How It Works
 
 Two shell scripts handle all operations:
 
-- **`run-rpz.sh`** — the main orchestrator. Manages the Python venv, runs the pipeline, validates zones with `named-checkzone`, applies incremental updates via `nsupdate`, falls back to per-zone freeze/replace/thaw on full rebuilds, and (when nothing has changed) skips the entire pipeline via the v0.7.0 fast-path. Run it from cron or interactively. One-time `--setup` wizard configures everything.
-- **`allow.sh`** — real-time allowlist management. Adds or removes domains from the RPZ allowlist zone via TSIG-authenticated `nsupdate`, with an append-only audit log. Preserves the journal so secondaries see the change as an IXFR delta.
+- **`run-rpz.sh`**: the main orchestrator. Manages the Python venv, runs the pipeline, validates zones with `named-checkzone`, applies incremental updates via `nsupdate`, falls back to per-zone freeze/replace/thaw on full rebuilds, and (when nothing has changed) skips the entire pipeline via the v0.7.0 fast-path. Run it from cron or interactively. One-time `--setup` wizard configures everything.
+- **`allow.sh`**: real-time allowlist management. Adds or removes domains from the RPZ allowlist zone via TSIG-authenticated `nsupdate`, with an append-only audit log. Preserves the journal so secondaries see the change as an IXFR delta.
 
-The Python engine (`rpz_factory/`) does the actual fetching, parsing, filtering, and zone rendering. The shell scripts call it — you don't need to invoke Python directly. See [PYTHON.md](PYTHON.md) for direct-invocation reference and [ARCHITECTURE.md](ARCHITECTURE.md) for the developer deep-dive.
+The Python engine (`rpz_factory/`) does the actual fetching, parsing, filtering, and zone rendering. The shell scripts call it. You don't need to invoke Python directly. See [PYTHON.md](PYTHON.md) for direct-invocation reference and [ARCHITECTURE.md](ARCHITECTURE.md) for the developer deep-dive.
 
 ## Quick Start
 
@@ -30,24 +45,24 @@ cd /opt/rpz-zone-factory
 crontab -e
 ```
 
-The `--setup` wizard walks through output format, per-source mode, zone names, BIND reload, `named-checkzone` validation, optionally `named-compilezone`, TSIG key configuration, the feeds directory, and which zones should use the incremental IXFR update path. All choices are saved to `.run-rpz.conf` so subsequent runs (including cron) need zero arguments.
+The `--setup` wizard walks through output format, threat categories (`CONF_CATEGORIES`), which categories use the incremental IXFR path (`CONF_INCREMENTAL_CATEGORIES`), BIND reload, `named-checkzone` validation, optionally `named-compilezone`, TSIG key configuration, and the feeds directory. All choices are saved to `.run-rpz.conf` so subsequent runs (including cron) need zero arguments.
 
 ### Cron examples
 
-After `--setup`, the script reads `.run-rpz.conf` automatically — no CLI args needed:
+After `--setup`, the script reads `.run-rpz.conf` automatically. No CLI args needed:
 
 ```cron
 # Per-source RPZ zones for BIND, every 4 hours - change directory to where you have it installed
 15 */4 * * * /opt/rpz-zone-factory/run-rpz.sh
 
 # With explicit args (overrides saved config)
-15 */4 * * * /opt/rpz-zone-factory/run-rpz.sh -- --output rpz --per-source --output-file /etc/namedb/master/rpz/ -v
+15 */4 * * * /opt/rpz-zone-factory/run-rpz.sh -- --output rpz --output-file /etc/namedb/master/rpz/ -v
 
 # Pi-hole flat file, daily at 3:05 AM
 5 3 * * * /opt/rpz-zone-factory/run-rpz.sh -- --output pihole --output-file /var/www/rpz/block.txt
 ```
 
-> With the v0.7.0 fast-path, runs that find no upstream changes complete in roughly the time it takes to make 6 conditional GETs (~5s) instead of running the full pipeline. Hourly cron schedules are reasonable if your upstream feeds publish frequently.
+> With the v0.7.0 fast-path, runs that find no upstream changes complete in roughly the time it takes to make one conditional GET per configured source (a few seconds total) instead of running the full pipeline. Hourly cron schedules are reasonable if your upstream feeds publish frequently.
 
 ### Dynamic allowlist
 
@@ -62,14 +77,14 @@ After `--setup`, the script reads `.run-rpz.conf` automatically — no CLI args 
 ./allow.sh --audit
 ```
 
-See `./allow.sh --setup` for TSIG key configuration, or the [allow.sh section](#allowsh--dynamic-allowlist) below for full details.
+See `./allow.sh --setup` for TSIG key configuration, or the [allow.sh section](#allowsh-dynamic-allowlist) below for full details.
 
 ## Sources
 
 Each feed produces one RPZ zone. As of v0.8.0, the zone filename encodes
 its category: `<feed>.<category>.rpz`. When BIND synthesizes an NXDOMAIN
 response from RPZ, the SOA in the authority section reveals which category
-caused the block — so an operator looking at `dig` output can immediately
+caused the block, so an operator looking at `dig` output can immediately
 tell whether the entry is `ads`, `malware`, `ipreputation`, etc.
 
 | Source | Category | Type | Zone | URL |
@@ -118,7 +133,6 @@ with `CONF_SOURCES_EXTRA` / `CONF_SOURCES_EXCLUDE`.
 | `-i`, `--interactive` | Force interactive mode |
 | `-c`, `--cron` | Force cron mode |
 | `--setup` | Interactive setup wizard: configure output, sources, BIND reload, zone validation/compilation, TSIG keys, incremental zones, and generate cron entries |
-| `--reload-bind ZONE` | (Combined mode only.) After a successful run, call `rndc reload ZONE`. In per-source mode, run-rpz.sh handles per-zone reload/thaw internally and this flag is unused. |
 | `--full-rebuild` | Force the full rebuild path (per-zone freeze → file replace → thaw) for every zone, bypassing the incremental IXFR path. Use for recovery, after BIND/zone config changes, or to force a clean re-seed of `.list.previous` snapshots. (v0.6.0+) |
 | `--force` | Bypass the v0.7.0 fast-path that exits early when every upstream source returns 304 Not Modified. Use after manual zone edits or for debugging. (v0.7.0+) |
 | `--rpz-dir DIR` | Override RPZ_DIR (can also set via environment) |
@@ -138,24 +152,54 @@ with `CONF_SOURCES_EXTRA` / `CONF_SOURCES_EXCLUDE`.
 
 The `--setup` wizard saves all choices to `.run-rpz.conf` in the project directory. Key settings:
 
+**Output:**
+
 | Setting | Description |
 |---------|-------------|
 | `CONF_OUTPUT` | `rpz` or `pihole` |
-| `CONF_PER_SOURCE` | `yes` or `no` — one zone file per source |
-| `CONF_OUTPUT_FILE` | Output file (combined) or directory (per-source) |
-| `CONF_ZONE_NAME` | Zone name for combined mode |
-| `CONF_ALLOWLIST_FILE` | Path to allowlist text file |
-| `CONF_RELOAD` | `yes` or `no` — rndc reload after update |
-| `CONF_CHECKZONE` | `yes` or `no` — validate with `named-checkzone` |
-| `CONF_COMPILE_ZONE` | `yes` or `no` — compile to binary (raw) format |
-| `CONF_SOURCES` | Space-separated source list, or `all` |
+| `CONF_OUTPUT_FILE` | Output directory (RPZ) or file path (Pi-hole) |
 | `CONF_VERBOSITY` | `0` (quiet), `1` (`-v`), `2` (`-vv`) |
+
+**Source/category selection (v0.7.0+):**
+
+| Setting | Description |
+|---------|-------------|
+| `CONF_CATEGORIES` | Space-separated categories to fetch (e.g. `malware ads tracking`). When set, replaces the legacy `CONF_SOURCES` selection. |
+| `CONF_SOURCES_EXTRA` | Individual feed keys to add on top of the resolved category selection |
+| `CONF_SOURCES_EXCLUDE` | Individual feed keys to drop from the resolved selection |
+| `CONF_SOURCES` | (Legacy, pre-v0.7.0.) Space-separated source list, or `all`. Honored only when `CONF_CATEGORIES` is empty. |
+
+**BIND reload + validation:**
+
+| Setting | Description |
+|---------|-------------|
+| `CONF_RELOAD` | `yes` or `no` (handle BIND reloads/freeze/thaw after updates) |
+| `CONF_CHECKZONE` | `yes` or `no` (validate with `named-checkzone`) |
+| `CONF_COMPILE_ZONE` | `yes` or `no` (compile to binary, raw format) |
+
+**Allowlist / dynamic updates:**
+
+| Setting | Description |
+|---------|-------------|
+| `CONF_ALLOWLIST_FILE` | Path to allowlist text file |
 | `CONF_TSIG_KEY_FILE` | Path to TSIG key file (shared by `allow.sh` and the v0.6.0 incremental update path) |
+| `CONF_TRANSFER_TSIG_KEY_FILE` | (v0.8.0+) Path to a separate TSIG key for zone transfers when running split-key mode. Empty = use `CONF_TSIG_KEY_FILE` for both update and transfer. |
 | `CONF_ALLOW_SERVER` | Server for nsupdate (default: `localhost`) |
 | `CONF_ALLOW_ZONE` | Allowlist zone name (default: `allowlist.rpz`) |
 | `CONF_AUDIT_LOG` | Path to audit log file (default: `allow-audit.log` next to allowlist) |
-| `CONF_FEEDS_DIR` | (v0.6.0+) Directory holding `.list.previous` baseline snapshots for the incremental update path. Default: `<output>/feeds`. The allowlist `.txt` source file lives here too. |
-| `CONF_INCREMENTAL_ZONES` | (v0.6.0+) Space-separated list of zones that should use the IXFR-based incremental update path. Zones not listed here go through the full rebuild path. Empty = no zones use incremental updates. |
+
+**Incremental (IXFR) updates (v0.6.0+):**
+
+| Setting | Description |
+|---------|-------------|
+| `CONF_FEEDS_DIR` | Directory holding `.list.previous` baseline snapshots for the incremental update path. Default: `<output>/feeds`. The allowlist `.txt` source file lives here too. |
+| `CONF_INCREMENTAL_CATEGORIES` | (v0.7.0+, preferred) Space-separated categories whose feeds should use the IXFR update path. Resolved against `CONF_CATEGORIES` at runtime. |
+| `CONF_INCREMENTAL_ZONES` | (Legacy, pre-v0.7.0.) Space-separated zone filenames that should use the IXFR update path. Still honored when `CONF_INCREMENTAL_CATEGORIES` is empty. |
+| `CONF_INCREMENTAL_TTL` | TTL for records emitted via `nsupdate` (default: `300`) |
+| `CONF_FEED_LOG_DIR` | Optional directory for per-feed delta logs (when `CONF_LOG_REBUILDS` enables logging) |
+| `CONF_LOG_REBUILDS` | `yes` or `no`: whether to write a snapshot of each zone's domain list during full rebuilds (default: `no`) |
+
+A zone uses incremental updates when its feed's category is in `CONF_INCREMENTAL_CATEGORIES`, OR its zone filename is in the legacy `CONF_INCREMENTAL_ZONES`. With both empty, every zone goes through the full rebuild path.
 
 Edit `.run-rpz.conf` directly or re-run `--setup` to reconfigure.
 
@@ -182,15 +226,15 @@ grep rpz-zone-factory /var/log/daemon.log
 ### Venv Lifecycle
 
 - **Created** on first run (or via `--setup`)
-- **Reused** on subsequent runs — no reinstall overhead
+- **Reused** on subsequent runs (no reinstall overhead)
 - **Auto-healed**: if the venv is broken (missing python, missing deps), the script recreates it
-- **No activation/deactivation**: the script calls the venv's python binary directly — no `source activate` fragility
+- **No activation/deactivation**: the script calls the venv's python binary directly. No `source activate` fragility.
 
-## Incremental Updates (IXFR) — v0.6.0+
+## Incremental Updates (IXFR, v0.6.0+)
 
-Per-source zones listed in `CONF_INCREMENTAL_ZONES` are updated by **diffing the previously-fetched feed against the freshly generated zone** and sending only the additions/deletions via TSIG-authenticated `nsupdate`. BIND writes the delta to the zone's journal, bumps the SOA serial, and secondaries receive **NOTIFY → IXFR** instead of re-AXFR'ing the whole zone — turning megabyte transfers into hundred-byte deltas.
+Per-source zones listed in `CONF_INCREMENTAL_ZONES` are updated by **diffing the previously-fetched feed against the freshly generated zone** and sending only the additions/deletions via TSIG-authenticated `nsupdate`. BIND writes the delta to the zone's journal, bumps the SOA serial, and secondaries receive **NOTIFY → IXFR** instead of re-AXFR'ing the whole zone. This turns megabyte transfers into hundred-byte deltas.
 
-For a typical day where upstream feeds add/remove a handful of domains, a single domain add transfers as 6 records (~230 bytes) instead of the full zone (~5000+ records / ~150KB for `urlhaus.malware.rpz`).
+On a typical day, upstream feeds add or remove a handful of domains. A single domain add transfers as 6 records (~230 bytes), versus the full zone (~5000+ records, ~150KB for `urlhaus.malware.rpz`).
 
 ### How a zone goes from cold to incremental
 
@@ -211,7 +255,7 @@ A full rebuild always re-seeds `.list.previous` afterward, so a zone can flip ba
 
 ### BIND configuration requirements
 
-**Every zone selected for IXFR (via `CONF_INCREMENTAL_CATEGORIES` or the legacy `CONF_INCREMENTAL_ZONES`) must have `allow-update { key "rpz-update"; };` in its `named.conf` definition** — including the per-source threat zones, not just the allowlist. Without this, `nsupdate` will be REFUSED and the zone falls back to full rebuild on every run. See the [BIND Configuration](#bind-configuration) section below for complete zone examples.
+**Every zone selected for IXFR (via `CONF_INCREMENTAL_CATEGORIES` or the legacy `CONF_INCREMENTAL_ZONES`) must have `allow-update { key "rpz-update"; };` in its `named.conf` definition**, including the per-source threat zones, not just the allowlist. Without this, `nsupdate` will be REFUSED and the zone falls back to full rebuild on every run. See the [BIND Configuration](#bind-configuration) section below for complete zone examples.
 
 ### Per-zone freeze/thaw (full rebuild path)
 
@@ -232,20 +276,20 @@ zone urlhaus.malware.rpz/IN: Transfer started.
 transfer of 'urlhaus.malware.rpz/IN' from <primary>#53: Transfer completed: 1 messages, 6 records, 229 bytes (serial 2026040827)
 ```
 
-`6 records` is the IXFR delta for a single domain add (old SOA, new SOA, two CNAMEs for `domain` and `*.domain`). If you instead see hundreds or thousands of records for what should have been a small change, the secondary is doing AXFR — check that the primary has `allow-update` on the zone and that `nsupdate` is succeeding.
+`6 records` is the IXFR delta for a single domain add (old SOA, new SOA, two CNAMEs for `domain` and `*.domain`). If you instead see hundreds or thousands of records for what should have been a small change, the secondary is doing AXFR. Check that the primary has `allow-update` on the zone and that `nsupdate` is succeeding.
 
-## Fast-path: skip when nothing changed — v0.7.0+
+## Fast-path: skip when nothing changed (v0.7.0+)
 
-All 6 feeds use `If-Modified-Since` / `ETag` headers. When every requested source returns `304 Not Modified`, run-rpz.sh exits in roughly the time it takes to make the conditional HTTP requests (~5s for 6 sources) instead of running the full pipeline (~30s in steady state). The fast-path applies in both per-source mode (per-zone — only zones whose source returned 304 are skipped) and combined mode (whole-zone — only triggers if every source is 304).
+Every HTTP feed uses `If-Modified-Since` / `ETag` headers. When every requested source returns `304 Not Modified`, run-rpz.sh exits in roughly the time it takes to make the conditional HTTP requests (a few seconds for the full set) instead of running the full pipeline (~30s in steady state).
 
-- **Per-source mode:** any zone whose source returned 304 with no error and whose live `.db` exists is skipped entirely (no parse, no filter, no render, no diff, no IXFR, no seed, no reload). Zones with new content render normally on the same run.
-- **Combined mode:** if every source returned 304 and the live combined zone exists, the Python engine exits with code 2 and run-rpz.sh skips its entire post-processing pipeline.
+- **RPZ output (per-zone fast-path):** any zone whose source returned 304 with no error and whose live `.db` exists is skipped entirely (no parse, no filter, no render, no diff, no IXFR, no seed, no reload). Zones with new content render normally on the same run.
+- **Pi-hole output (whole-file fast-path):** if every source returned 304 and the live blocklist file exists, the Python engine exits with code 2 and run-rpz.sh skips its post-processing.
 - **Allowlist:** the allowlist source is a local text file, not HTTP, so the fast-path uses an mtime check instead. If `allowlist.txt` hasn't been modified since the live `allowlist.rpz.db` was last written, the allowlist render is skipped.
 - **`--force`** bypasses all of this and forces a full pipeline run. Use after manual zone edits or for debugging.
 
 The fast-path is safe: 304 means upstream content is unchanged, the cached `.previous` snapshot still matches, and BIND's in-memory state is already correct. There's nothing to do. HTTP metadata is stored in `.cache/*.meta.json`.
 
-## allow.sh — Dynamic Allowlist
+## allow.sh: Dynamic Allowlist
 
 `allow.sh` adds or removes domains from the RPZ allowlist zone in real time using TSIG-authenticated `nsupdate`, without waiting for the next scheduled rpz-zone-factory run. Changes are also persisted to the allowlist text file so they survive regeneration.
 
@@ -291,7 +335,7 @@ All settings can be overridden with flags. Run `./allow.sh -h` for the full flag
 ### How it works
 
 1. Validates the domain name
-2. Appends/removes the domain in the allowlist text file (race condition safe — file is updated before the dynamic update)
+2. Appends/removes the domain in the allowlist text file (race condition safe: file is updated before the dynamic update)
 3. Sends `nsupdate` with TSIG key to add/remove RPZ passthru records
 4. Runs `rndc sync <zone>` to flush in-memory state to the `.db` file. **The journal (`.jnl`) is preserved** so secondaries can pull the change via IXFR instead of re-AXFR'ing the whole zone.
 5. Writes an entry to the audit log (success or failure)
@@ -303,10 +347,10 @@ Every add/remove operation is logged to an append-only audit log. The log record
 - Timestamp (local time with UTC offset)
 - Action (`add` or `remove`)
 - Domain
-- Operator (`whoami` — who ran the command)
+- Operator (`whoami`, who ran the command)
 - Result (`OK` or `FAIL:reason`)
 
-Failures are logged too — if `nsupdate` fails, the log records the exit code.
+Failures are logged too. If `nsupdate` fails, the log records the exit code.
 
 Example:
 
@@ -325,13 +369,13 @@ View the log with `--audit`:
 ./allow.sh --audit 50     # last 50 entries
 ```
 
-`--audit` doesn't require a TSIG key, domain, or any preflight — it just reads the log file.
+`--audit` doesn't require a TSIG key, domain, or any preflight. It just reads the log file.
 
 ### TSIG setup
 
 Run `./allow.sh --setup` for step-by-step instructions covering key generation, directory permissions, `named.conf` changes, and testing.
 
-The `run-rpz.sh --setup` wizard also walks through TSIG configuration when per-source mode with an allowlist is enabled.
+The `run-rpz.sh --setup` wizard also walks through TSIG configuration when RPZ output with an allowlist is enabled.
 
 ## Pipeline Behavior
 
@@ -369,14 +413,52 @@ The pipeline applies rule-based filtering to reduce false positives:
 
 ## BIND Configuration
 
-### Per-source mode (recommended)
+You need three things in `named.conf` per selected zone:
 
-Define each zone in `named.conf`. **Every zone you want updated incrementally needs `allow-update { key "rpz-update"; };`** so that `nsupdate` (run-rpz.sh's incremental path, and `allow.sh`) can deliver TSIG-authenticated dynamic updates. Without `allow-update`, `nsupdate` will be REFUSED and the zone silently falls back to a full rebuild on every run, forcing secondaries to AXFR.
+1. A `zone { ... };` block declaring the primary, file path, ACLs, and `allow-update` (for zones that use the incremental IXFR path).
+2. An entry in a `response-policy { ... };` stanza inside `options { }`, in the right order (allowlist first with `policy passthru`).
+3. The TSIG key referenced by `allow-update`, typically pulled in via `include "/etc/bind/tsig/rpz-update.key";` at the top level. See `./allow.sh --setup` for the key generation walkthrough.
 
-Adjust `allow-transfer` to permit your secondary nameservers (shown here as a placeholder ACL `secondaries`) and add `also-notify` so they're notified of changes.
+The exact set of zones you need depends on which categories you picked at `--setup`. The selection table you saw in [Sources](#sources) above tells you what zone filename each feed produces.
+
+#### Generate the snippets
+
+Rather than hand-writing the `zone {}` blocks for every category combination, let the registry generate them. The same selection flags accepted by the wizard work here:
+
+```sh
+# Default: all categories, zones into /etc/namedb/master/rpz, TSIG key "rpz-update"
+python -m rpz_factory.categories bind-config
+
+# Match what you set up: just malware and ads, custom paths
+python -m rpz_factory.categories bind-config \
+    --categories malware ads \
+    --zone-dir /usr/local/etc/namedb/master/rpz \
+    --tsig-key rpz-update \
+    --transfer-acl my-secondaries
+
+# Just the response-policy block (e.g. to merge into an existing options { })
+python -m rpz_factory.categories bind-config \
+    --categories malware ads \
+    --section policy
+
+# Skip the allowlist zone (if you don't want one)
+python -m rpz_factory.categories bind-config --no-allowlist
+
+# Use split-TSIG mode (separate transfer key)
+python -m rpz_factory.categories bind-config \
+    --transfer-tsig-key rpz-transfer
+```
+
+Run `python -m rpz_factory.categories bind-config --help` for the full flag list. Pipe the output to a file (`> /etc/bind/rpz.conf`) and `include` it from `named.conf`, or paste the contents directly.
+
+The command emits `allow-update` on every zone by default. That's harmless for static (non-incremental) zones and avoids `REFUSED` errors when you later add a zone to `CONF_INCREMENTAL_CATEGORIES`. Pass `--tsig-key ""` to suppress it entirely.
+
+#### Example output
+
+For `--categories malware`, the command produces:
 
 ```bind
-// Allowlist zone — evaluated first, passthru overrides blocks
+// Allowlist zone: evaluated first, passthru overrides blocks
 zone "allowlist.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/allowlist.rpz.db";
@@ -386,7 +468,8 @@ zone "allowlist.rpz" {
     also-notify { /* secondary IPs */ };
 };
 
-// Threat source zones — all need allow-update for v0.6.0 incremental updates
+// Threat source zones
+
 zone "urlhaus.malware.rpz" {
     type primary;
     file "/etc/namedb/master/rpz/urlhaus.malware.rpz.db";
@@ -396,96 +479,30 @@ zone "urlhaus.malware.rpz" {
     also-notify { /* secondary IPs */ };
 };
 
-zone "cisa-kev.vulnerabilities.rpz" {
+zone "antimalware-hosts.malware.rpz" {
     type primary;
-    file "/etc/namedb/master/rpz/cisa-kev.vulnerabilities.rpz.db";
+    file "/etc/namedb/master/rpz/antimalware-hosts.malware.rpz.db";
     allow-update { key "rpz-update"; };
     allow-query { localhost; secondaries; };
     allow-transfer { secondaries; };
     also-notify { /* secondary IPs */ };
 };
 
-zone "spamhaus-drop.ipreputation.rpz" {
-    type primary;
-    file "/etc/namedb/master/rpz/spamhaus-drop.ipreputation.rpz.db";
-    allow-update { key "rpz-update"; };
-    allow-query { localhost; secondaries; };
-    allow-transfer { secondaries; };
-    also-notify { /* secondary IPs */ };
-};
 
-zone "scamsniffer.scam.rpz" {
-    type primary;
-    file "/etc/namedb/master/rpz/scamsniffer.scam.rpz.db";
-    allow-update { key "rpz-update"; };
-    allow-query { localhost; secondaries; };
-    allow-transfer { secondaries; };
-    also-notify { /* secondary IPs */ };
-};
-
-zone "cryptoscamdb.scam.rpz" {
-    type primary;
-    file "/etc/namedb/master/rpz/cryptoscamdb.scam.rpz.db";
-    allow-update { key "rpz-update"; };
-    allow-query { localhost; secondaries; };
-    allow-transfer { secondaries; };
-    also-notify { /* secondary IPs */ };
-};
-
-zone "et-compromised.ipreputation.rpz" {
-    type primary;
-    file "/etc/namedb/master/rpz/et-compromised.ipreputation.rpz.db";
-    allow-update { key "rpz-update"; };
-    allow-query { localhost; secondaries; };
-    allow-transfer { secondaries; };
-    also-notify { /* secondary IPs */ };
-};
-```
-
-The TSIG key referenced by `allow-update` must be defined elsewhere in `named.conf` (typically via `include "/etc/bind/tsig/rpz-update.key";` at the top level). See `./allow.sh --setup` for the full key generation walkthrough.
-
-Enable the response policy (inside `options {}`):
-
-```bind
 options {
-    // ... existing options ...
+    // ... your existing options ...
 
     response-policy {
         zone "allowlist.rpz" policy passthru;
         zone "urlhaus.malware.rpz";
-        zone "cisa-kev.vulnerabilities.rpz";
-        zone "spamhaus-drop.ipreputation.rpz";
-        zone "scamsniffer.scam.rpz";
-        zone "cryptoscamdb.scam.rpz";
-        zone "et-compromised.ipreputation.rpz";
-        // ...plus any ads/tracking/cryptojacking zones from the registry
+        zone "antimalware-hosts.malware.rpz";
     };
 };
 ```
 
-RPZ zones are evaluated in order. The allowlist zone goes first with `policy passthru` so it can override blocks from subsequent zones.
+RPZ zones are evaluated in order. The allowlist goes first with `policy passthru` so it can override blocks from subsequent zones. **Every zone needs `allow-update`** for the incremental path to work. Without it, `nsupdate` will be REFUSED and the zone silently falls back to full rebuild on every run, forcing secondaries to AXFR.
 
-### Combined mode
-
-If you prefer a single combined zone:
-
-```bind
-zone "block.rpz" {
-    type primary;
-    file "/etc/namedb/master/block.rpz.db";
-    allow-query { localhost; secondaries; };
-    allow-transfer { secondaries; };
-    also-notify { /* secondary IPs */ };
-};
-
-options {
-    response-policy {
-        zone "block.rpz" policy given;
-    };
-};
-```
-
-> **Combined mode is AXFR-only.** Unlike per-source mode, combined mode rewrites the entire zone file every run instead of using `nsupdate`. There's no journal for secondaries to pull deltas from, so every refresh transfers the whole zone. `allow-update` is therefore not needed (and not useful) on the combined zone. If you want IXFR support, switch to per-source mode.
+Replace the placeholder ACL `secondaries` (and `also-notify`) with your real values via `--allow-query-acl`, `--transfer-acl`, or by hand-editing after generation.
 
 ## BIND Reload Permissions
 
@@ -546,7 +563,7 @@ Then: `RNDC_BIN="sudo rndc" ./run-rpz.sh ...`
 
 ## Running as a Non-Root User
 
-Don't run rpz-zone-factory as root. The pipeline needs write access to a few specific paths and read access to BIND credentials — all achievable with group permissions. Here's the complete list.
+Don't run rpz-zone-factory as root. The pipeline needs write access to a few specific paths and read access to BIND credentials, all achievable with group permissions. Here's the complete list.
 
 ### 1. Create a dedicated user (optional but recommended)
 
@@ -572,9 +589,9 @@ chown -R rpzuser:rpzuser /opt/rpz-zone-factory
 
 This covers:
 
-- `.venv/` — Python virtual environment
-- `.cache/` — source cache and HTTP metadata
-- `.run-rpz.conf` — saved configuration
+- `.venv/`: Python virtual environment
+- `.cache/`: source cache and HTTP metadata
+- `.run-rpz.conf`: saved configuration
 
 ### 3. Zone file output directory
 
@@ -695,32 +712,33 @@ rpz-zone-factory/
 ├── run-rpz.sh          # Main orchestrator (cron/interactive wrapper)
 ├── allow.sh            # Dynamic allowlist management (TSIG + nsupdate)
 ├── run.py              # Python CLI entrypoint
-├── Makefile            # `make deploy` → rsync to remote BIND host
 ├── README.md           # This file
 ├── PYTHON.md           # Direct-invocation reference for the Python CLI
 ├── ARCHITECTURE.md     # Developer reference (per-zone state machine, IXFR design)
+├── LICENSE             # MIT
 ├── requirements.txt
 ├── .run-rpz.conf       # Generated by --setup (not in repo)
 ├── rpz_factory/
-│   ├── __init__.py     # __version__
-│   ├── cli.py          # argparse CLI, conditional HTTP, fast-path, summary output
-│   ├── cache.py        # Per-source cache + HTTP metadata persistence
-│   ├── fetcher.py      # HTTP fetch with retry/timeout, If-Modified-Since/ETag
-│   ├── filters.py      # False positive filtering logic
-│   ├── models.py       # Dataclasses: ThreatEntry, FetchResult, HttpMeta, etc.
+│   ├── __init__.py        # __version__
+│   ├── categories.py      # Feed/zone/category registry + bind-config generator
+│   ├── cli.py             # argparse CLI, conditional HTTP, fast-path, summary output
+│   ├── cache.py           # Per-source cache + HTTP metadata persistence
+│   ├── fetcher.py         # HTTP fetch with retry/timeout, If-Modified-Since/ETag
+│   ├── filters.py         # False positive filtering logic
+│   ├── models.py          # Dataclasses: ThreatEntry, FetchResult, HttpMeta, etc.
 │   ├── parsers/
 │   │   ├── __init__.py
-│   │   ├── abusech.py         # Abuse.ch URLhaus RPZ feed parser
-│   │   ├── cisa.py            # CISA KEV JSON parser
-│   │   ├── cryptoscamdb.py    # CryptoScamDB YAML blacklist parser
-│   │   ├── emergingthreats.py # Emerging Threats compromised-IPs parser
-│   │   ├── scamsniffer.py     # Scam Sniffer JSON blacklist parser
-│   │   └── spamhaus.py        # Spamhaus DROP parser
+│   │   ├── abusech.py          # Abuse.ch URLhaus RPZ feed parser
+│   │   ├── cisa.py             # CISA KEV JSON parser
+│   │   ├── cryptoscamdb.py     # CryptoScamDB YAML blacklist parser
+│   │   ├── emergingthreats.py  # Emerging Threats compromised-IPs parser
+│   │   ├── plaintext.py        # Generic parser for hosts-file / plain-domain feeds
+│   │   ├── scamsniffer.py      # Scam Sniffer JSON blacklist parser
+│   │   └── spamhaus.py         # Spamhaus DROP parser
 │   └── renderers/
 │       ├── __init__.py
-│       ├── rpz.py      # RFC 5782 zone file renderer + monotonic serial
-│       └── pihole.py   # Flat domain list renderer
-├── scripts/            # Legacy reference scripts (unused, kept for context)
+│       ├── rpz.py         # RFC 5782 zone file renderer + monotonic serial
+│       └── pihole.py      # Flat domain list renderer
 ├── .cache/             # Per-source cached entries + HTTP metadata (auto-created)
 └── feeds/              # `.list.previous` baseline snapshots for incremental
                         #   diffs (auto-created next to the zone output dir)
@@ -730,4 +748,4 @@ rpz-zone-factory/
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

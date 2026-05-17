@@ -1,4 +1,4 @@
-# ARCHITECTURE.md — rpz-zone-factory internals
+# ARCHITECTURE.md: rpz-zone-factory internals
 
 This is a developer/maintainer reference. For user-facing docs see `README.md`.
 For a focused tour of the Python engine (CLI flags, exit codes, parsers, renderers),
@@ -63,7 +63,7 @@ rpz-zone-factory/
 ├── ARCHITECTURE.md          # this file
 ├── README.md                # user-facing overview + operator docs
 ├── PYTHON.md                # Python engine reference (CLI, parsers, renderers)
-├── Makefile                 # `make deploy` → rsync to remote BIND host
+├── LICENSE                  # MIT
 ├── requirements.txt         # Python deps (requests, pyyaml)
 │
 ├── run.py                   # thin entrypoint: `from rpz_factory.cli import main`
@@ -71,28 +71,24 @@ rpz-zone-factory/
 ├── allow.sh                 # real-time allowlist management via nsupdate
 │
 ├── rpz_factory/             # Python package (the actual work)
-│   ├── __init__.py          # version constant
-│   ├── cli.py               # argparse, main loop, per-source + combined rendering
-│   ├── cache.py             # per-source cache + HTTP metadata (ETag/Last-Modified)
-│   ├── fetcher.py           # HTTP fetch with conditional requests
-│   ├── filters.py           # safe-TLD filter, critical-domain allowlist, dedup
-│   ├── models.py            # dataclasses: ThreatEntry, FetchResult, HttpMeta
+│   ├── __init__.py             # version constant
+│   ├── categories.py           # feed/zone/category registry + bind-config generator
+│   ├── cli.py                  # argparse, main loop, per-source RPZ + combined Pi-hole rendering
+│   ├── cache.py                # per-source cache + HTTP metadata (ETag/Last-Modified)
+│   ├── fetcher.py              # HTTP fetch with conditional requests
+│   ├── filters.py              # safe-TLD filter, critical-domain allowlist, dedup
+│   ├── models.py               # dataclasses: ThreatEntry, FetchResult, HttpMeta
 │   ├── parsers/
-│   │   ├── abusech.py       # URLhaus RPZ feed parser
-│   │   ├── cisa.py          # CISA KEV JSON parser
-│   │   ├── cryptoscamdb.py  # CryptoScamDB YAML parser
-│   │   ├── scamsniffer.py   # Scam Sniffer JSON parser
-│   │   └── spamhaus.py      # Spamhaus DROP parser
+│   │   ├── abusech.py          # URLhaus RPZ feed parser
+│   │   ├── cisa.py             # CISA KEV JSON parser
+│   │   ├── cryptoscamdb.py     # CryptoScamDB YAML parser
+│   │   ├── emergingthreats.py  # Emerging Threats compromised-IPs parser
+│   │   ├── plaintext.py        # generic parser for hosts-file / plain-domain feeds
+│   │   ├── scamsniffer.py      # Scam Sniffer JSON parser
+│   │   └── spamhaus.py         # Spamhaus DROP parser
 │   └── renderers/
-│       ├── rpz.py           # RFC 5782 RPZ zone file renderer
-│       └── pihole.py        # Pi-hole flat-file renderer
-│
-├── scripts/
-│   ├── incremental_updater.sh.legacy       # old standalone incremental attempt,
-│   │                                       # superseded by inlined logic in
-│   │                                       # run-rpz.sh (see header comment)
-│   └── smart_skip_detector.sh.legacy       # never wired up; redundant with
-│                                           # cache.py conditional-HTTP logic
+│       ├── rpz.py              # RFC 5782 RPZ zone file renderer
+│       └── pihole.py           # Pi-hole flat-file renderer
 │
 └── .cache/                  # auto-created, per-source entry cache + HTTP meta
                              # (see cache.py)
@@ -129,8 +125,8 @@ There is a strict separation:
    nsupdate for zones that are configured for incremental updates, and falls
    back to full rebuild + `rndc reload` for everything else.
 
-If you want to change how feeds are fetched, parsed, or filtered — that's
-Python. If you want to change how zones are deployed to BIND — that's shell.
+If you want to change how feeds are fetched, parsed, or filtered, that's
+Python. If you want to change how zones are deployed to BIND, that's shell.
 
 **Do not add BIND-specific or nsupdate-specific logic to the Python code.**
 It is intentionally a pure pipeline.
@@ -144,28 +140,30 @@ Python package can be invoked as `./run.py` without installing it.
 
 ---
 
-## `rpz_factory/` — the Python pipeline
+## `rpz_factory/`: the Python pipeline
 
 ### `__init__.py`
 Defines `__version__`. That is all.
 
 ### `models.py`
 
-Dataclasses used everywhere. Edit with caution — changes ripple.
+Dataclasses used everywhere. Edit with caution. Changes ripple.
 
-- `SourceName` (enum) — canonical source identifiers. Values match the
-  filenames in `.cache/`: `abusech_urlhaus`, `cisa_kev`, `spamhaus_drop`,
-  `scamsniffer`, `cryptoscamdb`. These are NOT the same as the CLI source
-  keys (`urlhaus`, `cisa`, `drop`, etc.) — `cli.py` has two dicts mapping
-  between them (`_SOURCE_KEY_TO_NAME` and `_SOURCE_NAME_TO_KEY`). When you
-  add a source, update both.
-- `EntryType` (enum) — `DOMAIN`, `IP`, or `CIDR`. Determines how the
+- `SourceName` (enum): canonical source identifiers used as cache filename
+  stems (`.cache/<enum_value>.json`). These are NOT the same as the CLI
+  source keys (`urlhaus`, `cisa`, `drop`, etc.); each feed in
+  `rpz_factory/categories.py` carries both a `key` (CLI/config token) and
+  an `enum_value` (`SourceName` value). `cli.py` has two dicts mapping
+  between them (`_SOURCE_KEY_TO_NAME` and `_SOURCE_NAME_TO_KEY`), and the
+  registry in `categories.py` is the source of truth for both. When you
+  add a source, update the registry and both dicts.
+- `EntryType` (enum): `DOMAIN`, `IP`, or `CIDR`. Determines how the
   renderer encodes the entry.
-- `ThreatEntry` — a single blocked thing. `.value` is the raw string;
+- `ThreatEntry`: a single blocked thing. `.value` is the raw string;
   `.normalized_value()` lowercases/strips for comparison.
-- `FetchResult` — what parsers return: list of `ThreatEntry`, source name,
+- `FetchResult`: what parsers return: list of `ThreatEntry`, source name,
   optional error, `not_modified` flag for 304 responses.
-- `HttpMeta` — `etag` and `last_modified` strings, persisted per source
+- `HttpMeta`: `etag` and `last_modified` strings, persisted per source
   in `.cache/<source>.meta.json`.
 
 ### `cache.py`
@@ -173,21 +171,21 @@ Dataclasses used everywhere. Edit with caution — changes ripple.
 Per-source caching to survive transient source failures. Two distinct
 concerns share this file:
 
-1. **Entry cache** — `.cache/<source>.json`. Written on every successful
+1. **Entry cache**: `.cache/<source>.json`. Written on every successful
    fetch. Read when a fetch fails (network error, empty response, parse
    error). Keeps the last-known-good entries so a temporary source outage
    doesn't wipe zones.
-2. **HTTP metadata cache** — `.cache/<source>.meta.json`. Holds ETag and
+2. **HTTP metadata cache**: `.cache/<source>.meta.json`. Holds ETag and
    Last-Modified from the previous response. The fetcher attaches these
    as conditional-request headers next time.
 
 Functions:
 
-- `load_cache(cache_dir, source_enum)` — returns cached `FetchResult` or
+- `load_cache(cache_dir, source_enum)`: returns cached `FetchResult` or
   `None`. Wraps JSON read + validation.
-- `write_cache(cache_dir, fetch_result)` — atomic write via `.tmp` + rename.
-- `load_http_meta(cache_dir, source_enum)` — returns `HttpMeta` or `None`.
-- `write_http_meta(cache_dir, source_enum, http_meta)` — atomic write.
+- `write_cache(cache_dir, fetch_result)`: atomic write via `.tmp` + rename.
+- `load_http_meta(cache_dir, source_enum)`: returns `HttpMeta` or `None`.
+- `write_http_meta(cache_dir, source_enum, http_meta)`: atomic write.
 
 ### `fetcher.py`
 
@@ -196,10 +194,10 @@ conditional-request support. Tracks the last response's headers per URL in a
 module-level dict so `cli.py` can extract ETag/Last-Modified after a
 successful fetch.
 
-- `fetch_with_conditional(url, etag, last_modified, ...)` — returns the
+- `fetch_with_conditional(url, etag, last_modified, ...)`: returns the
   `requests.Response`, or raises. Handles 304 by returning a sentinel that
   `cli.py` checks for.
-- `get_last_fetch_meta(url)` — returns `HttpMeta` from the in-memory dict,
+- `get_last_fetch_meta(url)`: returns `HttpMeta` from the in-memory dict,
   populated by the most recent `fetch_with_conditional` call for that URL.
 
 Parsers call `fetch_with_conditional` to get the response, then parse the
@@ -209,7 +207,7 @@ body and return a `FetchResult`.
 
 Post-fetch filtering to reduce false positives.
 
-- `filter_entries(entries)` — the top-level filter. Applies:
+- `filter_entries(entries)`: the top-level filter. Applies:
   - **Safe TLDs**: drops any domain ending in `.gov`, `.mil`, `.edu`.
   - **Critical allowlist**: hard-coded list of ~50 infrastructure domains
     (Google, Cloudflare, Amazon, Microsoft, etc.). Dropped with exact or
@@ -250,7 +248,7 @@ ttl, soa_*)`. Output is text with:
   - `DOMAIN` → `<domain>.<zone>. CNAME .` + `*.<domain>.<zone>. CNAME .`
   - `IP` → `32.<reversed-ip>.rpz-ip.<zone>. CNAME .`
   - `CIDR` → `<prefix>.<reversed-network>.rpz-ip.<zone>. CNAME .`
-    (prefixes <24 skipped — BIND RPZ minimum)
+    (prefixes <24 skipped: BIND RPZ minimum)
 
 **Important for the shell layer:** the extractor in `run-rpz.sh` parses the
 exact format this renderer produces. Specifically, it expects:
@@ -265,19 +263,19 @@ If you change the renderer format, re-check `extract_domains_from_zone` in
 
 ### `renderers/pihole.py`
 
-Flat domain list for Pi-hole. Only domain entries — IP/CIDR are skipped
-because Pi-hole doesn't support them. One domain per line, no zone suffix,
-no CNAME.
+Flat domain list for Pi-hole. Only domain entries are emitted. IP/CIDR are
+skipped because Pi-hole doesn't support them. One domain per line, no zone
+suffix, no CNAME.
 
 ### `cli.py`
 
 The top-level Python entrypoint. Longest file in the package.
 
-- `build_parser()` — argparse setup. Flags: `--output`, `--zone-name`,
-  `--output-file`, `--sources`, `--cache-dir`, `--per-source`, `--allowlist`,
-  `-v`/`--verbose`, `--version`.
-- `_configure_logging(verbosity)` — sets up logging to stderr.
-- `main(argv)` — the actual pipeline:
+- `build_parser()`: argparse setup. Flags: `--output`, `--output-file`,
+  `--sources`, `--categories`, `--exclude-sources`, `--cache-dir`,
+  `--allowlist`, `--force`, `-v`/`--verbose`, `--version`.
+- `_configure_logging(verbosity)`: sets up logging to stderr.
+- `main(argv)`: the actual pipeline:
   1. Parse args
   2. Resolve cache dir (default `{RPZ_DIR}/.cache`)
   3. Loop over requested sources:
@@ -288,41 +286,43 @@ The top-level Python entrypoint. Longest file in the package.
        - **Error** → load cached entries, log warning
        - **Empty** → load cached entries
        - **Success** → use new entries, write cache, write HTTP meta
-  4. If per-source mode → `_run_per_source(...)` (separate branch)
-  5. Otherwise → filter, render, write output file, print summary
+  4. If `--output rpz` → `_run_per_source(...)` (per-source RPZ)
+  5. If `--output pihole` → filter, render flat blocklist, write, summary
 
-- `_run_per_source(...)` — group entries by source, filter each independently
+- `_run_per_source(...)`: group entries by source, filter each independently
   (no cross-source dedup), render one zone file per source, write to
   `<output_dir>/<zone>.db`. Also handles the allowlist zone (generated from
   the allowlist text file via `_parse_allowlist_file` and
   `_render_allowlist_zone`).
 
-- `_parse_allowlist_file(path)` — read a plain-text allowlist, return list
-  of normalized domains. Used only in per-source mode.
-- `_render_allowlist_zone(domains, zone_name)` — produces an RPZ zone with
+- `_parse_allowlist_file(path)`: read a plain-text allowlist, return list
+  of normalized domains. Used only by the RPZ path.
+- `_render_allowlist_zone(domains, zone_name)`: produces an RPZ zone with
   `CNAME rpz-passthru.` records. This is what the shell extractor operates
   on for the allowlist zone.
 
-**Per-source mode is the production path.** Combined mode still exists for
-legacy use but is not what any current deployment uses.
+**RPZ output always renders one zone file per feed** (per-source mode).
+Pi-hole output is a single combined flat file. There is no longer a combined
+RPZ option; it was removed in v0.8.0 along with the `--per-source`,
+`--zone-name`, and `--reload-bind` flags.
 
 **Key constants in `cli.py` (all derived from `rpz_factory.categories.REGISTRY` as of v0.8.0):**
 
-- `ALL_SOURCES` — every feed key the registry knows about.
-- `SOURCE_ZONE_NAMES` — maps source key to the per-source zone filename
+- `ALL_SOURCES`: every feed key the registry knows about.
+- `SOURCE_ZONE_NAMES`: maps source key to the per-source zone filename
   (e.g., `"urlhaus" → "urlhaus.malware.rpz"`). Filenames embed the feed's
   category so the SOA in synthesized NXDOMAIN responses identifies why a
   name was blocked. The shell extractor and the `CONF_INCREMENTAL_ZONES`
   config (or `CONF_INCREMENTAL_CATEGORIES`) use these same zone names.
-- `_SOURCE_URLS` — feed URL per source (for HTTP meta lookup).
-- `_SOURCE_KEY_TO_NAME` / `_SOURCE_NAME_TO_KEY` — bidirectional map between
+- `_SOURCE_URLS`: feed URL per source (for HTTP meta lookup).
+- `_SOURCE_KEY_TO_NAME` / `_SOURCE_NAME_TO_KEY`: bidirectional map between
   CLI source keys (`urlhaus`) and internal `SourceName` enum values
   (`abusech_urlhaus`). Needed because parsers and cache use enum values but
   CLI uses short keys.
 
 ---
 
-## `run-rpz.sh` — the shell orchestrator
+## `run-rpz.sh`: the shell orchestrator
 
 POSIX sh. No bashisms. Tested on Debian, Ubuntu, FreeBSD 13+.
 
@@ -342,8 +342,7 @@ The file is organized as:
 9. BIND tool discovery
 10. Incremental (IXFR) helpers         ← v0.6.0
 11. Main run function (run_rpz)
-12. reload_bind
-13. main
+12. main
 ```
 
 ### Configuration surface
@@ -361,12 +360,11 @@ Key vars:
 | `PYTHON_BIN`, `VENV_NAME` | Python runtime                                      |
 | `RNDC_BIN`                | Path to `rndc`                                      |
 | `CONF_OUTPUT`             | `rpz` or `pihole`                                   |
-| `CONF_PER_SOURCE`         | `yes` (production) or `no` (legacy combined mode)   |
-| `CONF_OUTPUT_FILE`        | Output dir (per-source) or file (combined)          |
-| `CONF_SOURCES`            | Space-separated list, or `all`                      |
+| `CONF_OUTPUT_FILE`        | Output dir (RPZ) or file path (Pi-hole)             |
+| `CONF_SOURCES`            | (Legacy) space-separated list, or `all`             |
 | `CONF_CHECKZONE`          | `yes` → run `named-checkzone` before deploying      |
 | `CONF_COMPILE_ZONE`       | `yes` → compile to raw binary format                |
-| `CONF_RELOAD`             | `yes` → reload BIND after successful run            |
+| `CONF_RELOAD`             | `yes` → handle BIND reloads/freeze/thaw (RPZ)       |
 | `CONF_ALLOWLIST_FILE`     | Path to allowlist.txt (read by Python + allow.sh)   |
 | `CONF_FEEDS_DIR`          | Where `.list.previous` snapshots live               |
 | `CONF_TSIG_KEY_FILE`      | TSIG key for nsupdate (shared by allow.sh + IXFR)   |
@@ -381,7 +379,7 @@ Key vars:
 |---------------------|---------------------------------------------------|
 | `MODE`              | `interactive` (tty) or `cron` (syslog)            |
 | `DO_SETUP`          | `1` if `--setup` was passed                       |
-| `DO_RELOAD`         | `1` if `--reload-bind ZONE` was passed            |
+| `DO_RELOAD`         | `1` when `CONF_RELOAD=yes` and `CONF_OUTPUT=rpz`. Gates per-zone freeze/reload/thaw. |
 | `DO_FULL_REBUILD`   | `1` if `--full-rebuild` was passed                |
 | `RPZ_ARGS`          | Args passed to `run.py` (after `--` or built)     |
 
@@ -389,30 +387,30 @@ Key vars:
 
 **Logging (POSIX sh doesn't have log levels, so we cook our own):**
 
-- `log_info` / `log_warn` / `log_err` / `log_notice` — in `cron` mode these
+- `log_info` / `log_warn` / `log_err` / `log_notice`: in `cron` mode these
   go to syslog via `logger -t rpz-zone-factory -p daemon.<level> -- "$1"`.
   In `interactive` mode they print to stderr.
 
 **Interactive prompts (only used during `--setup`):**
 
-- `prompt_value label default` — read line, echo result
-- `prompt_yn question default` — returns 0 for yes, 1 for no
-- `prompt_choice question default opt1 opt2 ...` — numbered menu, echoes
+- `prompt_value label default`: read line, echo result
+- `prompt_yn question default`: returns 0 for yes, 1 for no
+- `prompt_choice question default opt1 opt2 ...`: numbered menu, echoes
   the chosen option string
 
 **Help / CLI:**
 
-- `usage [exit_code]` — prints the help block and exits
-- `parse_args "$@"` — walks `$@`, sets globals, stops at `--` (passing
+- `usage [exit_code]`: prints the help block and exits
+- `parse_args "$@"`: walks `$@`, sets globals, stops at `--` (passing
   anything after through to `run.py` via `RPZ_ARGS`)
 
 **Python runtime management:**
 
-- `check_python_version bin` — verifies `bin` is Python ≥ `PYTHON_MIN_VERSION`
+- `check_python_version bin`: verifies `bin` is Python ≥ `PYTHON_MIN_VERSION`
   (currently 3.9)
-- `check_venv` — asserts venv dir exists, pip works, `requests` importable
-- `create_venv` — creates venv, upgrades pip, installs `requirements.txt`
-- `discover_python` — scans PATH for `python3`, `python3.9`..`python3.14`,
+- `check_venv`: asserts venv dir exists, pip works, `requests` importable
+- `create_venv`: creates venv, upgrades pip, installs `requirements.txt`
+- `discover_python`: scans PATH for `python3`, `python3.9`..`python3.14`,
   picks the highest version that meets `PYTHON_MIN_VERSION`, displays a
   summary table
 
@@ -437,7 +435,7 @@ After setup, subsequent runs use the saved config and need zero CLI args.
 
 **Config → CLI args:**
 
-- `build_args_from_config` — when no `RPZ_ARGS` were passed, builds them
+- `build_args_from_config`: when no `RPZ_ARGS` were passed, builds them
   from the `CONF_*` vars so `run.py` gets the right flags. In per-source
   mode with checkzone/compilezone enabled, rewrites `--output-file` to
   point at a `.tmp` subdirectory so the old zones aren't clobbered until
@@ -445,33 +443,33 @@ After setup, subsequent runs use the saved config and need zero CLI args.
 
 **BIND tool discovery:**
 
-- `find_named_tool tool_name` — searches PATH and common sbin locations
+- `find_named_tool tool_name`: searches PATH and common sbin locations
   (`/usr/sbin`, `/usr/local/sbin`, etc.) for `named-checkzone`,
   `named-compilezone`. Echoes the path or returns empty.
 
 ### Incremental (IXFR) helpers (v0.6.0)
 
-These are the v0.6.0 additions. Read them together — they form a
+These are the v0.6.0 additions. Read them together. They form a
 self-contained subsystem.
 
-- `incremental_cname_target zone_name` — echoes the correct CNAME target
+- `incremental_cname_target zone_name`: echoes the correct CNAME target
   for a zone. `allowlist.rpz` → `rpz-passthru.`; everything else → `.`
   (NXDOMAIN). If you add a new "passthru" type zone, extend the case.
 
-- `is_incremental_zone zone_name` — returns 0 if `zone_name` appears in
+- `is_incremental_zone zone_name`: returns 0 if `zone_name` appears in
   `CONF_INCREMENTAL_ZONES` (space-separated list), 1 otherwise.
 
-- `extract_domains_from_zone db_file zone_name` — awk-based parser. Reads
+- `extract_domains_from_zone db_file zone_name`: awk-based parser. Reads
   a rendered RPZ zone file and emits one bare domain per line, sorted,
   unique. Wildcard twins are stripped; SOA/NS/comments/directives are
   skipped. RPZ-IP triggers (`N.reversed-ip.rpz-ip.<zone>.`) pass through
-  verbatim as bare keys ending in `.rpz-ip` — they round-trip through
+  verbatim as bare keys ending in `.rpz-ip`. They round-trip through
   nsupdate but never get a wildcard twin (handled in `build_nsupdate_batch`).
 
   **If you change the renderer output format in `rpz_factory/renderers/rpz.py`,
   you must re-check this extractor.**
 
-- `build_nsupdate_batch zone adds_file dels_file out_file` — writes an
+- `build_nsupdate_batch zone adds_file dels_file out_file`: writes an
   nsupdate input script to `out_file`. Format:
   ```
   server <CONF_ALLOW_SERVER>
@@ -488,14 +486,14 @@ self-contained subsystem.
   journal. Inner helper `_emit_update op bare` detects `.rpz-ip` keys and
   skips the wildcard twin.
 
-- `run_incremental_for_zone zone new_db_file` — the core incremental path.
+- `run_incremental_for_zone zone new_db_file`: the core incremental path.
   Returns 0=success, 1=fatal error (caller falls back to full rebuild),
   2=seed required (no `.previous` snapshot).
 
   Steps:
   1. Preflight (TSIG key, nsupdate binary, feeds dir exists)
   2. If `<feeds>/<zone>.list.previous` missing → return 2 (seed needed)
-  3. `rndc sync <zone>` — flush in-memory journal to `.db` file so the
+  3. `rndc sync <zone>`: flush in-memory journal to `.db` file so the
      snapshot comparison is accurate (decision point #3 in the design
      conversation)
   4. `extract_domains_from_zone` → `<feeds>/<zone>.list.current`
@@ -504,7 +502,7 @@ self-contained subsystem.
   7. Log the counts (`adds=N dels=M`)
   8. Empty diff → clean up `.current`, return 0 (no-op)
   9. `build_nsupdate_batch` → temp file
-  10. `nsupdate -k <TSIG_KEY> < batch` — apply
+  10. `nsupdate -k <TSIG_KEY> < batch`: apply
   11. On success: rotate `.current` → `.previous`, `rndc sync <zone>` to
       flush the new journal entries to `.db`, clean up temp files
   12. On failure: log error, keep temp files for post-mortem, return 1
@@ -513,7 +511,7 @@ self-contained subsystem.
   conversation). If a massive delta is too much for nsupdate, it will
   fail, we catch the failure, and fall back to full rebuild.
 
-- `seed_feed_snapshot zone db_file` — writes the initial
+- `seed_feed_snapshot zone db_file`: writes the initial
   `<feeds>/<zone>.list.previous` from a freshly rendered zone file. Called
   after a full rebuild for a zone that is configured as incremental, so
   that the NEXT scheduled run can diff against this baseline. This is how
@@ -527,11 +525,12 @@ Called by `main` when `--setup` wasn't passed. The flow:
 2. Build `RPZ_ARGS` from config if not passed
 3. Check Python + venv (auto-create if missing)
 4. Run `run.py` under venv, log stderr
-5. On success, branch on `CONF_PER_SOURCE`:
-   - `yes` → the **multi-phase per-source path** below (production)
-   - `no`  → **combined-mode path** (legacy, kept for compatibility)
+5. On success, branch on `CONF_OUTPUT`:
+   - `rpz`    → the **multi-phase RPZ deployment** below
+   - `pihole` → guard the rendered file is non-empty, then return; Pi-hole
+                consumes the flat file via its own update mechanism
 
-**Multi-phase per-source path:**
+**Multi-phase RPZ deployment:**
 
 This is the most important part of the script. Read it carefully before
 changing.
@@ -586,17 +585,6 @@ Phase 8: Cleanup
   Log summary: zones=X incremental=Y full=Z
 ```
 
-### The combined-mode path
-
-Much simpler and not used in production. Renders a single `.db` file,
-optionally validates and compiles it, reloads a single zone. This code
-path is preserved verbatim from v0.5.0 and has NOT been touched in v0.6.0.
-Do not delete it — tests and legacy docs still reference it.
-
-### `reload_bind`
-
-Used only by the combined-mode path. `rndc reload <RELOAD_ZONE>`.
-
 ### `main`
 
 Calls `parse_args`, branches on `DO_SETUP`, calls either `run_setup` or
@@ -604,7 +592,7 @@ Calls `parse_args`, branches on `DO_SETUP`, calls either `run_setup` or
 
 ---
 
-## `allow.sh` — real-time allowlist management
+## `allow.sh`: real-time allowlist management
 
 Standalone script for operators. Adds or removes a single domain from the
 allowlist zone **immediately** (without waiting for the next scheduled
@@ -630,12 +618,12 @@ allowlist zone **immediately** (without waiting for the next scheduled
 For `allow.sh example.com`:
 
 1. Preflight (nsupdate, TSIG key, rndc, allowlist file path)
-2. `allowlist_add` — append domain to allowlist file (atomic, skips if
+2. `allowlist_add`: append domain to allowlist file (atomic, skips if
    already present)
-3. `nsupdate_add` — send `update add` + wildcard `update add` for
+3. `nsupdate_add`: send `update add` + wildcard `update add` for
    `example.com` with `CNAME rpz-passthru.` to the allowlist zone
 4. **On nsupdate failure:** revert the text file edit via `allowlist_remove`
-   (decision #2 in the design conversation — keeps text file and live zone
+   (decision #2 in the design conversation: keeps text file and live zone
    in sync)
 5. On success: `rndc sync -clean <zone>` to flush journal, write audit log
    entry
@@ -644,16 +632,16 @@ Remove is symmetric.
 
 ### Key functions
 
-- `validate_domain` — RFC-shape checks on the input
-- `preflight` — verifies nsupdate, TSIG key file exists, rndc, allowlist
+- `validate_domain`: RFC-shape checks on the input
+- `preflight`: verifies nsupdate, TSIG key file exists, rndc, allowlist
   file path is set
-- `allowlist_add file domain` — append if not present
-- `allowlist_remove file domain` — atomic line removal via temp file
-- `nsupdate_add domain zone` / `nsupdate_remove domain zone` — compose and
+- `allowlist_add file domain`: append if not present
+- `allowlist_remove file domain`: atomic line removal via temp file
+- `nsupdate_add domain zone` / `nsupdate_remove domain zone`: compose and
   send the nsupdate batch with TSIG
-- `rndc_sync_clean zone` — flush and clean journal
-- `audit_write action domain result` — append to `allow-audit.log`
-- `audit_show lines` — `tail -n` the audit log with a header
+- `rndc_sync_clean zone`: flush and clean journal
+- `audit_write action domain result`: append to `allow-audit.log`
+- `audit_show lines`: `tail -n` the audit log with a header
 
 ### Config sourcing
 
@@ -703,8 +691,8 @@ Adding a new `CONF_*` variable:
 ### `.cache/`
 
 Auto-created by `cache.py`. Contains:
-- `<source>.json` — last successful fetch result per source
-- `<source>.meta.json` — HTTP ETag/Last-Modified per source
+- `<source>.json`: last successful fetch result per source
+- `<source>.meta.json`: HTTP ETag/Last-Modified per source
 
 Safe to delete at any time; next run will re-fetch and rebuild.
 
@@ -712,17 +700,38 @@ Safe to delete at any time; next run will re-fetch and rebuild.
 
 ## Release history
 
-- **v0.6.0** (this branch) — incremental (IXFR) zone updates via
-  nsupdate/TSIG. New `CONF_FEEDS_DIR`, `CONF_INCREMENTAL_ZONES`,
-  `CONF_INCREMENTAL_TTL`. New `--full-rebuild` CLI flag. Allowlist file
-  moved to feeds dir. `allow.sh` now reverts on nsupdate failure.
-- **v0.5.0** — conditional HTTP (If-Modified-Since/ETag) in Python pipeline.
+- **v0.8.0**: category-encoded zone filenames (`<feed>.<category>.rpz`) so
+  the synthesized-NXDOMAIN SOA identifies the threat category at a glance.
+  Six new community feeds (AdGuard DNS, anudeepND, EasyPrivacy, AntiMalware
+  Hosts, Prigent Crypto, developerdan) parsed by a generic
+  `rpz_factory/parsers/plaintext.py`. Split-TSIG mode (separate
+  `CONF_TRANSFER_TSIG_KEY_FILE` for zone transfers vs. nsupdate). New
+  `bind-config` subcommand on `python -m rpz_factory.categories` that
+  generates `named.conf` zone {} blocks + response-policy stanza from the
+  selected categories. `CONF_SOURCES` migrated to `CONF_CATEGORIES` (with
+  legacy fallback). **Combined-mode RPZ removed** (along with the
+  `--per-source`, `--zone-name`, and `--reload-bind` flags and the
+  `CONF_PER_SOURCE`, `CONF_ZONE_NAME`, `CONF_RELOAD_ZONE` config vars);
+  RPZ output is now always per-source. Pi-hole output stays combined.
+- **v0.7.0**: 304-aware fast-path. When every requested source returns
+  `304 Not Modified`, run-rpz.sh exits in a few seconds without running
+  the full pipeline. RPZ output skips zones individually; Pi-hole (then
+  also combined RPZ, removed in v0.8.0) exits with code 2 when every
+  source returned 304. Category-based selection introduced
+  (`CONF_CATEGORIES`, `CONF_INCREMENTAL_CATEGORIES`,
+  `CONF_SOURCES_EXTRA`, `CONF_SOURCES_EXCLUDE`). New `--force` flag to
+  bypass the fast-path. Per-feed delta logging.
+- **v0.6.0**: incremental (IXFR) zone updates via nsupdate/TSIG. New
+  `CONF_FEEDS_DIR`, `CONF_INCREMENTAL_ZONES`, `CONF_INCREMENTAL_TTL`. New
+  `--full-rebuild` CLI flag. Allowlist file moved to feeds dir. `allow.sh`
+  now reverts on nsupdate failure.
+- **v0.5.0**: conditional HTTP (If-Modified-Since/ETag) in Python pipeline.
   `rndc freeze`/`thaw` around zone file writes.
-- **v0.4.x** — per-source zones, allowlist zone, `allow.sh` + TSIG.
-- **v0.3.x** — named-checkzone validation, named-compilezone raw format,
+- **v0.4.x**: per-source zones, allowlist zone, `allow.sh` + TSIG.
+- **v0.3.x**: named-checkzone validation, named-compilezone raw format,
   crypto threat feeds.
-- **v0.2.x** — source caching for stale-data preservation.
-- **v0.1.x** — initial.
+- **v0.2.x**: source caching for stale-data preservation.
+- **v0.1.x**: initial.
 
 ---
 
@@ -768,10 +777,15 @@ disagree with them, that's fine, but know they were deliberate:
 
 9. **Single TSIG key for both allow.sh AND incremental updates.** All
    dynamic zones accept the same key. Simpler than tracking per-zone keys.
+   Split-key mode (separate transfer key for slaves) added in v0.8.0 via
+   `CONF_TRANSFER_TSIG_KEY_FILE`.
 
-10. **Combined mode is preserved but not used in production.** Don't
-    remove it. It simplifies the code path for anyone who wants a single
-    zone and doesn't care about per-source attribution.
+10. **Combined-mode RPZ was removed in v0.8.0.** Earlier versions supported
+    rendering a single combined RPZ zone file. The combined path can't do
+    IXFR (every change is a full AXFR), can't carry the category-encoded
+    SOA, and was carrying maintenance cost without users. RPZ output is
+    now always per-source. Pi-hole output is still combined since it
+    consumes a single flat file.
 
 ---
 
@@ -783,8 +797,9 @@ Local (dev machine, no BIND):
 # Syntax check both shell scripts
 sh -n run-rpz.sh && sh -n allow.sh
 
-# Exercise the Python pipeline without writing zones
-./run.py --output rpz --zone-name test.local -v --output-file /tmp/test.db
+# Exercise the Python pipeline (writes per-source zones to /tmp/rpz-test)
+mkdir -p /tmp/rpz-test
+./run.py --output rpz --output-file /tmp/rpz-test --categories malware -v
 
 # Test the setup wizard flow
 ./run-rpz.sh --setup
@@ -848,7 +863,7 @@ In priority order, if anyone wants to extend this:
    Complicated by ordering (deletes must happen before adds for re-adds
    to register in the journal).
 
-5. **Per-source zone config** — right now the renderer hardcodes the
+5. **Per-source zone config:** right now the renderer hardcodes the
    source → zone-name mapping in `SOURCE_ZONE_NAMES`. Making that
    configurable would let operators split/merge zones at will.
 
