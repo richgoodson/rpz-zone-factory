@@ -9,7 +9,7 @@ For the full developer reference (per-zone state machine, IXFR design, internal 
 rpz-zone-factory is split into two layers:
 
 - **Python engine (`rpz_factory/`)**: a pure function from threat feeds to rendered zone files. Fetches sources with conditional HTTP, parses each format, applies false-positive filtering, deduplicates, and renders RFC 5782 RPZ zone files (or a Pi-hole flat list). Has no knowledge of BIND state, `rndc`, `nsupdate`, TSIG keys, or journals.
-- **Shell orchestrator (`run-rpz.sh`)**: calls the Python engine, then handles everything downstream: per-zone freeze/replace/thaw, incremental IXFR diffs, `nsupdate` transactions, reloads, seed snapshot management, and the v0.7.0 fast-path short-circuit.
+- **Shell orchestrator (`run-rpz.sh`)**: calls the Python engine, then handles everything downstream: per-zone freeze/replace/thaw, incremental IXFR diffs, `nsupdate` transactions (single-batch or byte-bounded chunked as of v0.9.1), reloads, seed snapshot management, and the v0.7.0 fast-path short-circuit.
 
 This split keeps the Python side stateless and testable while letting the shell own all BIND-state reasoning.
 
@@ -141,21 +141,25 @@ This replaces an earlier `YYYYMMDDHH` (hour-based) scheme that produced duplicat
 
 Incremental (`nsupdate`-based) updates don't call the Python renderer at all. They let BIND auto-bump the SOA serial in response to the dynamic update. The renderer's serial logic only runs on full rebuilds.
 
+The 2-digit `NN` counter caps each zone at 99 increments per UTC day. For most setups with hourly cron and quiet feeds this is well clear of the ceiling, but a frequently-updated zone running under aggressive cron AND producing v0.9.1 chunked updates AND seeing heavy `allow.sh` activity can accumulate bumps fast. See README's [Serial-bump budget](README.md#serial-bump-budget-v091) for operator guidance. Tracked separately: widening the scheme to `YYMMDDVVVV` (10000/day, still fits uint32 through 2099) to permanently retire the constraint.
+
 ## Package layout
 
 ```
 rpz_factory/
 ├── __init__.py        # __version__
+├── categories.py      # Feed/zone/category registry (REGISTRY) + bind-config generator
 ├── cli.py             # argparse CLI, per-source RPZ + combined Pi-hole rendering, fast-path
 ├── cache.py           # Per-source cache + HTTP metadata persistence
 ├── fetcher.py         # HTTP fetch with retry/timeout + If-Modified-Since/ETag
 ├── filters.py         # Safe TLD, critical allowlist, dedup, label validation
-├── models.py          # Dataclasses: ThreatEntry, FetchResult, HttpMeta, etc.
+├── models.py          # Dataclasses: ThreatEntry, FetchResult, HttpMeta, SourceName enum
 ├── parsers/
 │   ├── abusech.py           # URLhaus RPZ feed
 │   ├── cisa.py              # CISA KEV JSON
 │   ├── cryptoscamdb.py      # CryptoScamDB YAML
 │   ├── emergingthreats.py   # Emerging Threats compromised-IPs
+│   ├── plaintext.py         # Generic parser for hosts-file / plain-domain feeds
 │   ├── scamsniffer.py       # Scam Sniffer JSON blacklist
 │   └── spamhaus.py          # Spamhaus DROP
 └── renderers/
@@ -178,9 +182,14 @@ The feed/category registry has its own small CLI. The shell wrapper (`run-rpz.sh
 
 ## Adding a new source
 
-1. Add a parser in `rpz_factory/parsers/`: takes raw bytes/text, returns a list of `ThreatEntry` objects.
-2. Register it in `rpz_factory/cli.py` (source name, URL, parser function, per-source zone name).
-3. Add it to the sources table in `README.md`.
-4. If it should participate in incremental updates, add the per-source zone to `CONF_INCREMENTAL_ZONES` in `.run-rpz.conf` and add a matching `zone` block with `allow-update` to `named.conf`.
+1. Add a parser in `rpz_factory/parsers/`: takes raw bytes/text, returns a list of `ThreatEntry` objects. For plain-domain or hosts-file feeds you may not need a new parser at all — `parsers/plaintext.py` is generic; pass its `make_fetcher(url, source_enum, label=...)` factory into `SOURCE_FETCHERS` in `cli.py`.
+2. Add a `SourceName` enum value in `rpz_factory/models.py`.
+3. Add a `FeedSpec` entry to `_FEEDS` in `rpz_factory/categories.py` (`key`, `zone`, `category`, `enum_value`, `url`). The constants in `cli.py` (`ALL_SOURCES`, `SOURCE_ZONE_NAMES`, `_SOURCE_URLS`, `_SOURCE_KEY_TO_NAME`, `_SOURCE_NAME_TO_KEY`) are derived from `REGISTRY` at import time, so no edits there are needed for those.
+4. Wire the parser callable into `SOURCE_FETCHERS` in `rpz_factory/cli.py` keyed by feed key. This dict is still hand-maintained because parser callables vary in signature (some are `fetch_and_parse`, some are `plaintext.make_fetcher(...)` factories).
+5. Add the feed to the sources table in `README.md`.
+6. If it should participate in incremental updates, its category should be in `CONF_INCREMENTAL_CATEGORIES` (preferred) or its zone filename in the legacy `CONF_INCREMENTAL_ZONES`. Regenerate the `named.conf` snippet so the new zone has `allow-update`:
+   ```sh
+   python -m rpz_factory.categories bind-config --categories <your-categories>
+   ```
 
 For parser contracts, data flow, and the per-zone state machine that `run-rpz.sh` uses to decide between incremental and full-rebuild paths, read [ARCHITECTURE.md](ARCHITECTURE.md).

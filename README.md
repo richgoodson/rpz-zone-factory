@@ -109,6 +109,7 @@ with `CONF_SOURCES_EXTRA` / `CONF_SOURCES_EXCLUDE`.
 
 ## Requirements
 
+- BIND 9.16+ with RPZ support (see [Before You Start](#before-you-start) for distribution notes)
 - POSIX shell (`sh`), `cron`, `rndc`, `nsupdate`
 - Python 3.9+ (managed automatically by `run-rpz.sh`)
 - `requests` and `pyyaml` (installed into a venv by `run-rpz.sh --setup`)
@@ -196,7 +197,7 @@ The `--setup` wizard saves all choices to `.run-rpz.conf` in the project directo
 | `CONF_INCREMENTAL_CATEGORIES` | (v0.7.0+, preferred) Space-separated categories whose feeds should use the IXFR update path. Resolved against `CONF_CATEGORIES` at runtime. |
 | `CONF_INCREMENTAL_ZONES` | (Legacy, pre-v0.7.0.) Space-separated zone filenames that should use the IXFR update path. Still honored when `CONF_INCREMENTAL_CATEGORIES` is empty. |
 | `CONF_INCREMENTAL_TTL` | TTL for records emitted via `nsupdate` (default: `300`) |
-| `CONF_NSUPDATE_MAX_BATCH_BYTES` | (v0.9.1+) Maximum bytes for a single `nsupdate` batch (text, not wire). Oversized batches are split into multiple chunked transactions so they fit BIND's 65535-byte DNS message limit. Default: `600000`. See [Serial-bump budget](#serial-bump-budget) for tuning notes. |
+| `CONF_NSUPDATE_MAX_BATCH_BYTES` | (v0.9.1+) Maximum bytes for a single `nsupdate` batch (text, not wire). Oversized batches are split into multiple chunked transactions so they fit BIND's 65535-byte DNS message limit. Default: `600000`. See [Serial-bump budget](#serial-bump-budget-v091) for tuning notes. |
 | `CONF_NSUPDATE_MAX_CHUNKS_PER_RUN` | (v0.9.1+) If a zone's projected diff would require more than this many chunks in a single run, fall back to full rebuild instead of chunking. Default: `4`. Bounds per-run SOA-serial bumps and keeps chunking from out-competing a full rebuild on round-trip cost. |
 | `CONF_FEED_LOG_DIR` | Optional directory for per-feed delta logs (when `CONF_LOG_REBUILDS` enables logging) |
 | `CONF_LOG_REBUILDS` | `yes` or `no`: whether to write a snapshot of each zone's domain list during full rebuilds (default: `no`) |
@@ -241,7 +242,7 @@ On a typical day, upstream feeds add or remove a handful of domains. A single do
 ### How a zone goes from cold to incremental
 
 1. **First run for a zone:** no `.list.previous` baseline exists yet, so the zone takes the full rebuild path (per-zone freeze → file replace → thaw). After the rebuild, run-rpz.sh extracts the domain list from the freshly rendered `.db` and writes it to `<feeds>/<zone>.list.previous`. This is the **seed**.
-2. **Subsequent runs:** the script diffs the new feed against `.list.previous`. If `adds=0 dels=0`, nothing happens (no nsupdate, no journal entry, no secondary traffic). If there are real diffs, a single `nsupdate` transaction adds and removes only the changed records, BIND auto-bumps the serial and writes a journal entry, and secondaries pick up the delta via IXFR.
+2. **Subsequent runs:** the script diffs the new feed against `.list.previous`. If `adds=0 dels=0`, nothing happens (no nsupdate, no journal entry, no secondary traffic). If there are real diffs, a TSIG-authenticated `nsupdate` transaction adds and removes only the changed records, BIND auto-bumps the serial and writes a journal entry, and secondaries pick up the delta via IXFR. (As of v0.9.1, batches larger than `CONF_NSUPDATE_MAX_BATCH_BYTES` are split across multiple back-to-back nsupdate transactions; see [Serial-bump budget](#serial-bump-budget-v091).)
 3. **`.list.previous` is refreshed** after each successful incremental run so the next diff is computed against the current state.
 
 ### Falling back to full rebuild
@@ -251,6 +252,7 @@ A zone configured for incremental updates will silently drop back to the full re
 - The zone has no `.list.previous` snapshot (first-ever run, or `--full-rebuild` was used)
 - TSIG is not configured (`CONF_TSIG_KEY_FILE` missing or unreadable)
 - `nsupdate` itself fails for any reason
+- The projected nsupdate batch would require more than `CONF_NSUPDATE_MAX_CHUNKS_PER_RUN` chunks (v0.9.1+; see [Serial-bump budget](#serial-bump-budget-v091))
 - You explicitly pass `--full-rebuild`
 
 A full rebuild always re-seeds `.list.previous` afterward, so a zone can flip back to incremental on the next run.
@@ -280,6 +282,8 @@ transfer of 'urlhaus.malware.rpz/IN' from <primary>#53: Transfer completed: 1 me
 
 `6 records` is the IXFR delta for a single domain add (old SOA, new SOA, two CNAMEs for `domain` and `*.domain`). If you instead see hundreds or thousands of records for what should have been a small change, the secondary is doing AXFR. Check that the primary has `allow-update` on the zone and that `nsupdate` is succeeding.
 
+When v0.9.1 chunking kicks in for an oversized diff, the secondary log will show N back-to-back transfer entries in quick succession (one per chunk), each with its own small record count. That is expected; the total across them is what an un-chunked transfer would have moved.
+
 ### Serial-bump budget (v0.9.1+)
 
 run-rpz.sh's RPZ renderer uses an SOA serial in the format `YYYYMMDDNN` where `NN` is a per-day counter, giving 100 increments per zone per day before the format overflows into the next day's stem. Every operation that updates a zone bumps the serial by 1:
@@ -291,14 +295,9 @@ run-rpz.sh's RPZ renderer uses an SOA serial in the format `YYYYMMDDNN` where `N
 
 For most zones, hourly cron and modest activity stay well under 100/day. The risk is concentrated on **active feeds running under aggressive cron schedules**: e.g. a frequently-updated adlist with a 5-minute cron interval, where a single afternoon of accumulated changes triggers multi-chunk runs back-to-back. If a zone's daily bump count crosses 99, the serial format silently rolls into the next day's stem and the following day's first rebuild can compute a serial less than or equal to the running serial, producing `zone serial unchanged` or `zone serial has gone backwards` warnings on secondaries.
 
-This is operator responsibility, not script enforcement. The chunker hard-caps per-run bumps at `CONF_NSUPDATE_MAX_CHUNKS_PER_RUN` (default 4) — above the cap it falls back to full rebuild, which costs 1 bump + 5 AXFRs instead of N bumps + 5N IXFR streams. The cumulative-across-runs picture is left to you. Guidance:
+This is operator responsibility, not script enforcement. The chunker hard-caps per-run bumps at `CONF_NSUPDATE_MAX_CHUNKS_PER_RUN` (default 4) — above the cap it falls back to full rebuild, which costs 1 bump + 1 AXFR per secondary instead of N bumps + N IXFR streams per secondary. The cumulative-across-runs picture is left to you. Guidance:
 
-- **Pick a cron interval matched to your feed cadence.** Hourly is sane for most threat feeds and stays well under any plausible serial budget. 5-minute intervals on a high-churn adlist are where you start eating budget. Sample crontab (every 6 hours, randomized to avoid stampedes):
-
-  ```cron
-  17 */6 * * * /home/user/rpz-zone-factory/run-rpz.sh --cron >/dev/null 2>&1
-  ```
-
+- **Pick a cron interval matched to your feed cadence.** Hourly is sane for most threat feeds and stays well under any plausible serial budget. 5-minute intervals on a high-churn adlist are where you start eating budget. The [Quick Start cron examples](#cron-examples) above use 4-hourly, which is a reasonable middle ground for most setups.
 - **Tune `CONF_NSUPDATE_MAX_BATCH_BYTES`** if you observe many runs being split into multiple chunks. The default `600000` is conservative (observed BIND overflow at ~910 KB on a typical feed); BIND on capable hardware may tolerate higher. Watch the `nsupdate batch N bytes` INFO log lines to see your actual batch sizes.
 - **Lower `CONF_NSUPDATE_MAX_CHUNKS_PER_RUN`** to push more big-diff cases into full rebuild. Setting it to `1` disables chunking entirely (any oversized batch falls back to full rebuild).
 - **Watch for `gone backwards` warnings** in BIND logs on secondaries — that's the canary that the serial budget was exceeded.

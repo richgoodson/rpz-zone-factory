@@ -166,6 +166,47 @@ Dataclasses used everywhere. Edit with caution. Changes ripple.
 - `HttpMeta`: `etag` and `last_modified` strings, persisted per source
   in `.cache/<source>.meta.json`.
 
+### `categories.py`
+
+Single source of truth for the feed/zone/category registry. Added in
+v0.8.0 to break the duplication that had grown between `cli.py` and the
+shell layer. Both the Python CLI and `run-rpz.sh` (via
+`python -m rpz_factory.categories ...`) consult this file for "what
+feeds exist," "what zone is each feed," and "what categories does this
+feed belong to."
+
+- `CATEGORIES` (tuple): ordered list of category names used for display
+  (`malware`, `ads`, `tracking`, `scam`, `cryptojacking`, `ipreputation`,
+  `vulnerabilities`).
+- `FeedSpec` (dataclass): one feed. Fields:
+  - `key`: CLI/config token, e.g. `"urlhaus"`
+  - `zone`: zone filename without leading path, e.g. `"urlhaus.malware.rpz"`
+  - `category`: one of `CATEGORIES`, or the literal `"policy"` for the
+    allowlist
+  - `enum_value`: `SourceName` enum value (the cache-filename stem)
+  - `url`: primary feed URL (empty string for non-HTTP sources like the
+    allowlist)
+- `_FEEDS` (tuple of `FeedSpec`): every threat feed.
+- `_ALLOWLIST` (`FeedSpec`): the allowlist pseudo-feed.
+- `REGISTRY` (dict, exported): `{key: FeedSpec}` for every feed including
+  the allowlist. `cli.py` derives `ALL_SOURCES`, `SOURCE_ZONE_NAMES`,
+  `_SOURCE_URLS`, `_SOURCE_KEY_TO_NAME`, and `_SOURCE_NAME_TO_KEY` from
+  REGISTRY at import time. `SOURCE_FETCHERS` (parser callable per feed)
+  is the one cli.py constant that is NOT derived from REGISTRY — parser
+  signatures vary too much, so it stays hand-maintained.
+
+CLI subcommands (also called by `run-rpz.sh` to expand category
+selections):
+
+- `list-categories` / `list-feeds` / `list-zones`
+- `resolve --categories ... --extra ... --exclude ...`: applies the same
+  selection logic the wizard uses; prints the resulting feed keys
+  (or zones with `--as-zones`)
+- `zone-for FEED` / `category-for FEED`
+- `bind-config [--categories ...] [--zone-dir ...] [--tsig-key ...] ...`:
+  emits `named.conf` zone blocks and a response-policy stanza. See the
+  README "BIND Configuration" section for the operator walkthrough.
+
 ### `cache.py`
 
 Per-source caching to survive transient source failures. Two distinct
@@ -230,11 +271,18 @@ One file per source. Each exports a `fetch_and_parse(**kwargs)` function
 3. Returns a `FetchResult` with a list of `ThreatEntry`.
 
 To add a new source:
-1. Write `parsers/newsource.py` with `fetch_and_parse`.
-2. Add its import in `cli.py`.
-3. Add it to `ALL_SOURCES`, `SOURCE_FETCHERS`, `_SOURCE_URLS`,
-   `_SOURCE_KEY_TO_NAME`, and `SOURCE_ZONE_NAMES` in `cli.py`.
-4. Add a `SourceName` enum value in `models.py`.
+1. Write `parsers/newsource.py` with `fetch_and_parse`, OR reuse
+   `parsers/plaintext.py` (its `make_fetcher(url, source_enum, label=...)`
+   factory works for any hosts-file or plain-domain feed).
+2. Add a `SourceName` enum value in `models.py`.
+3. Add a `FeedSpec` entry to `_FEEDS` in `categories.py`
+   (`key`, `zone`, `category`, `enum_value`, `url`). The constants
+   `ALL_SOURCES`, `SOURCE_ZONE_NAMES`, `_SOURCE_URLS`,
+   `_SOURCE_KEY_TO_NAME`, and `_SOURCE_NAME_TO_KEY` in `cli.py` are
+   derived from `REGISTRY` at import time.
+4. Wire the parser callable into `SOURCE_FETCHERS` in `cli.py`, keyed by
+   feed key. (Hand-maintained because parser callables vary in signature.)
+5. Add the feed to the sources table in `README.md`.
 
 ### `renderers/rpz.py`
 
@@ -347,31 +395,43 @@ The file is organized as:
 
 ### Configuration surface
 
-Read the top of `run-rpz.sh` for the canonical list. All `CONF_*` variables
-are initialized to empty strings, then overridden by sourcing
-`.run-rpz.conf`, then optionally set by the setup wizard, then written back
-to the conf file.
+Read the top of `run-rpz.sh` for the canonical list. `CONF_*` variables
+are initialized to their defaults (empty string for things the wizard
+always sets, or an actual default value for tunables), then overridden
+by sourcing `.run-rpz.conf`, then optionally set by the setup wizard,
+then written back to the conf file.
 
-Key vars:
+Full var list (kept aligned with the top of `run-rpz.sh`):
 
-| Variable                  | What it controls                                    |
-|---------------------------|-----------------------------------------------------|
-| `RPZ_DIR`                 | Project directory (where run.py lives)              |
-| `PYTHON_BIN`, `VENV_NAME` | Python runtime                                      |
-| `RNDC_BIN`                | Path to `rndc`                                      |
-| `CONF_OUTPUT`             | `rpz` or `pihole`                                   |
-| `CONF_OUTPUT_FILE`        | Output dir (RPZ) or file path (Pi-hole)             |
-| `CONF_SOURCES`            | (Legacy) space-separated list, or `all`             |
-| `CONF_CHECKZONE`          | `yes` → run `named-checkzone` before deploying      |
-| `CONF_COMPILE_ZONE`       | `yes` → compile to raw binary format                |
-| `CONF_RELOAD`             | `yes` → handle BIND reloads/freeze/thaw (RPZ)       |
-| `CONF_ALLOWLIST_FILE`     | Path to allowlist.txt (read by Python + allow.sh)   |
-| `CONF_FEEDS_DIR`          | Where `.list.previous` snapshots live               |
-| `CONF_TSIG_KEY_FILE`      | TSIG key for nsupdate (shared by allow.sh + IXFR)   |
-| `CONF_ALLOW_SERVER`       | nsupdate target server                              |
-| `CONF_ALLOW_ZONE`         | Allowlist zone name                                 |
-| `CONF_INCREMENTAL_ZONES`  | Space-separated zones that use the IXFR path       |
-| `CONF_INCREMENTAL_TTL`    | TTL for nsupdate records (default 300)              |
+| Variable                            | What it controls                                                                 |
+|-------------------------------------|----------------------------------------------------------------------------------|
+| `RPZ_DIR`                           | Project directory (where run.py lives)                                           |
+| `PYTHON_BIN`, `VENV_NAME`           | Python runtime                                                                   |
+| `RNDC_BIN`                          | Path to `rndc`                                                                   |
+| `CONF_OUTPUT`                       | `rpz` or `pihole`                                                                |
+| `CONF_OUTPUT_FILE`                  | Output dir (RPZ) or file path (Pi-hole)                                          |
+| `CONF_VERBOSITY`                    | `0` quiet, `1` `-v`, `2` `-vv` (passed through to the Python CLI)                |
+| `CONF_CATEGORIES`                   | (v0.7.0+) Space-separated categories to fetch                                    |
+| `CONF_SOURCES_EXTRA`                | Individual feed keys to add on top of `CONF_CATEGORIES`                          |
+| `CONF_SOURCES_EXCLUDE`              | Individual feed keys to drop from the resolved selection                         |
+| `CONF_SOURCES`                      | (Legacy, pre-v0.7.0) Space-separated list, or `all`; honored when `CONF_CATEGORIES` is empty |
+| `CONF_CHECKZONE`                    | `yes` → run `named-checkzone` before deploying                                   |
+| `CONF_COMPILE_ZONE`                 | `yes` → compile to raw binary format                                             |
+| `CONF_RELOAD`                       | `yes` → handle BIND reloads/freeze/thaw (RPZ)                                    |
+| `CONF_ALLOWLIST_FILE`               | Path to allowlist.txt (read by Python + allow.sh)                                |
+| `CONF_FEEDS_DIR`                    | Where `.list.previous` snapshots live                                            |
+| `CONF_FEED_LOG_DIR`                 | (v0.7.0+) Optional dir for per-feed delta logs                                   |
+| `CONF_LOG_REBUILDS`                 | (v0.7.0+) `yes` → log full-rebuild domain lists too (default `no`)               |
+| `CONF_TSIG_KEY_FILE`                | TSIG key for nsupdate (shared by allow.sh + IXFR)                                |
+| `CONF_TRANSFER_TSIG_KEY_FILE`       | (v0.8.0+) Separate TSIG key for AXFR/IXFR to slaves; empty = use the update key for both |
+| `CONF_ALLOW_SERVER`                 | nsupdate target server                                                           |
+| `CONF_ALLOW_ZONE`                   | Allowlist zone name                                                              |
+| `CONF_AUDIT_LOG`                    | Path to allow.sh audit log (default: next to allowlist file)                     |
+| `CONF_INCREMENTAL_CATEGORIES`       | (v0.7.0+, preferred) Categories whose feeds use the IXFR path                    |
+| `CONF_INCREMENTAL_ZONES`            | (Legacy) Space-separated zones that use the IXFR path                            |
+| `CONF_INCREMENTAL_TTL`              | TTL for nsupdate records (default `300`)                                         |
+| `CONF_NSUPDATE_MAX_BATCH_BYTES`     | (v0.9.1+) Threshold above which a single nsupdate batch is split (default `600000`) |
+| `CONF_NSUPDATE_MAX_CHUNKS_PER_RUN`  | (v0.9.1+) Cap on chunks per zone per run before falling back to full rebuild (default `4`) |
 
 ### Runtime globals (not persisted to config)
 
@@ -503,10 +563,11 @@ self-contained subsystem.
 
   Hard cap: if projected (or post-emit actual) chunk count exceeds
   `CONF_NSUPDATE_MAX_CHUNKS_PER_RUN`, returns 1 → caller falls back to
-  full rebuild. Rationale: a full rebuild costs 1 SOA bump + 5 AXFRs vs.
-  N bumps + 5N IXFR streams; past some N, full rebuild is cheaper
-  operationally AND consumes less SOA-serial budget (see decision #5
-  addendum and the README "Serial-bump budget" section).
+  full rebuild. Rationale: a full rebuild costs 1 SOA bump + 1 AXFR per
+  secondary vs. N bumps + N IXFR streams per secondary; past some N,
+  full rebuild is cheaper operationally AND consumes less SOA-serial
+  budget (see decision #5 addendum and the README "Serial-bump budget"
+  section).
 
 - `run_incremental_for_zone zone new_db_file`: the core incremental path.
   Returns 0=success, 1=fatal error (caller falls back to full rebuild),
@@ -685,25 +746,6 @@ Flags override config, config overrides built-in defaults.
 
 ---
 
-## `scripts/`
-
-This directory holds two legacy files. **Neither is used at runtime.**
-
-### `incremental_updater.sh.legacy`
-
-An earlier standalone attempt at incremental updates. Not wired up, has
-known bugs, uses `rpz-passthru` for block zones (wrong). Kept because its
-top-level structure informed the inlined v0.6.0 implementation. Read the
-header comment in the file for a full list of why it was retired.
-
-### `smart_skip_detector.sh.legacy`
-
-Would have hashed feed content and skipped fetches when unchanged. Was
-never wired up. Redundant with the conditional-HTTP logic in `cache.py` /
-`fetcher.py`. Kept only as a historical marker.
-
----
-
 ## Configuration files
 
 ### `.run-rpz.conf`
@@ -713,8 +755,11 @@ Generated by `run-rpz.sh --setup`. Sourced at the top of `run-rpz.sh` and
 **Not tracked in git** (`.gitignore`).
 
 Adding a new `CONF_*` variable:
-1. Declare it at the top of `run-rpz.sh` with an empty default
-2. Add a prompt in `run_setup`
+1. Declare it at the top of `run-rpz.sh` with an appropriate default
+   (empty string for things the wizard always sets, or the actual
+   default value for tunables like `CONF_NSUPDATE_MAX_BATCH_BYTES="600000"`)
+2. Add a prompt in `run_setup` (or skip if it's an expert tunable that
+   does not warrant a prompt)
 3. Add it to the `cat > "$_conf_file" <<CONF` heredoc that writes the file
 4. (If `allow.sh` needs it) add the read in `allow.sh`'s config-load section
 
@@ -873,7 +918,15 @@ mkdir -p /tmp/rpz-test
 On the remote BIND host:
 
 ```sh
-make deploy                        # rsync current branch
+# rsync from your dev machine (excluding venv, cache, IDE state, secrets):
+rsync -avz --exclude='.git/' --exclude='.venv/' --exclude='.cache/' \
+  --exclude='__pycache__/' --exclude='*.pyc' \
+  --exclude='.run-rpz.conf' --exclude='allow-audit.log' \
+  --exclude='*.rpz.db' --exclude='*.rpz' \
+  --exclude='.claude/' --exclude='.DS_Store' \
+  ./ bind-host:~/rpz-zone-factory/
+
+# Then on the BIND host:
 cd ~/rpz-zone-factory
 
 # Dry run without incremental
@@ -920,10 +973,12 @@ In priority order, if anyone wants to extend this:
    counts of adds/dels per zone per run. Easy to bolt onto the
    `log_info "Incremental[$_zone_name]: ..."` line.
 
-4. **Parallel nsupdate.** For very large diffs, splitting additions and
-   deletions across multiple nsupdate invocations could speed things up.
-   Complicated by ordering (deletes must happen before adds for re-adds
-   to register in the journal).
+4. **Parallel nsupdate.** v0.9.1 added serial chunking of oversized
+   nsupdate batches (`apply_nsupdate_chunked`). Running chunks in
+   parallel rather than serially could further reduce wall-clock time
+   on very large diffs, but requires care with ordering: all deletes
+   must complete before any add can run, otherwise a re-add could
+   race against an uncompleted delete and produce no journal entry.
 
 5. **Per-source zone config:** right now the renderer hardcodes the
    source → zone-name mapping in `SOURCE_ZONE_NAMES`. Making that
