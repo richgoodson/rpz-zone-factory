@@ -182,7 +182,7 @@ The feed/category registry has its own small CLI. The shell wrapper (`run-rpz.sh
 
 ## Adding a new source
 
-1. Add a parser in `rpz_factory/parsers/`: takes raw bytes/text, returns a list of `ThreatEntry` objects. For plain-domain or hosts-file feeds you may not need a new parser at all — `parsers/plaintext.py` is generic; pass its `make_fetcher(url, source_enum, label=...)` factory into `SOURCE_FETCHERS` in `cli.py`.
+1. Add a parser in `rpz_factory/parsers/`: takes raw bytes/text, returns a list of `ThreatEntry` objects. For plain-domain or hosts-file feeds you may not need a new parser at all: `parsers/plaintext.py` is generic; pass its `make_fetcher(url, source_enum, label=...)` factory into `SOURCE_FETCHERS` in `cli.py`.
 2. Add a `SourceName` enum value in `rpz_factory/models.py`.
 3. Add a `FeedSpec` entry to `_FEEDS` in `rpz_factory/categories.py` (`key`, `zone`, `category`, `enum_value`, `url`). The constants in `cli.py` (`ALL_SOURCES`, `SOURCE_ZONE_NAMES`, `_SOURCE_URLS`, `_SOURCE_KEY_TO_NAME`, `_SOURCE_NAME_TO_KEY`) are derived from `REGISTRY` at import time, so no edits there are needed for those.
 4. Wire the parser callable into `SOURCE_FETCHERS` in `rpz_factory/cli.py` keyed by feed key. This dict is still hand-maintained because parser callables vary in signature (some are `fetch_and_parse`, some are `plaintext.make_fetcher(...)` factories).

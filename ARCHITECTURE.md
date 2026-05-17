@@ -192,7 +192,7 @@ feed belong to."
   the allowlist. `cli.py` derives `ALL_SOURCES`, `SOURCE_ZONE_NAMES`,
   `_SOURCE_URLS`, `_SOURCE_KEY_TO_NAME`, and `_SOURCE_NAME_TO_KEY` from
   REGISTRY at import time. `SOURCE_FETCHERS` (parser callable per feed)
-  is the one cli.py constant that is NOT derived from REGISTRY — parser
+  is the one cli.py constant that is NOT derived from REGISTRY. Parser
   signatures vary too much, so it stays hand-maintained.
 
 CLI subcommands (also called by `run-rpz.sh` to expand category
@@ -549,7 +549,7 @@ self-contained subsystem.
 
 - `apply_nsupdate_chunked zone adds_file dels_file` (v0.9.1+): wraps the
   nsupdate call. Projects total batch size in bytes via awk (per-record
-  byte counts are exactly computable from the FQDN and fixed syntax —
+  byte counts are exactly computable from the FQDN and fixed syntax;
   all RPZ content is ASCII). Two paths:
   - **Single batch (common):** projected ≤ `CONF_NSUPDATE_MAX_BATCH_BYTES`
     → delegates to `build_nsupdate_batch` + a single `nsupdate -k` call.
@@ -777,7 +777,7 @@ Safe to delete at any time; next run will re-fetch and rebuild.
 
 - **v0.9.1**: byte-bounded `nsupdate` chunking via the new
   `apply_nsupdate_chunked` helper. Pre-projects total batch size in bytes
-  (exactly, from FQDN + fixed syntax — all RPZ content is ASCII), takes
+  (exactly, from FQDN + fixed syntax; all RPZ content is ASCII), takes
   the single-batch fast path when it fits under
   `CONF_NSUPDATE_MAX_BATCH_BYTES` (default 600000), otherwise emits
   multiple self-contained nsupdate transactions. Hard cap of

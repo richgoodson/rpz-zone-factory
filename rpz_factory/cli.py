@@ -462,7 +462,7 @@ def main(argv: list[str] | None = None) -> int:
         and os.path.getsize(_live_path) > 0
     ):
         logger.info(
-            "All %d sources returned 304; live blocklist %s exists — skipping render",
+            "All %d sources returned 304; live blocklist %s exists; skipping render",
             len(args.sources),
             _live_path,
         )

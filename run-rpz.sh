@@ -1324,7 +1324,7 @@ CONF_INCREMENTAL_CATEGORIES="${CONF_INCREMENTAL_CATEGORIES}"
 CONF_INCREMENTAL_ZONES="${CONF_INCREMENTAL_ZONES}"
 CONF_INCREMENTAL_TTL="${CONF_INCREMENTAL_TTL}"
 
-# nsupdate batch sizing — split oversized batches into chunks; fall back to
+# nsupdate batch sizing: split oversized batches into chunks; fall back to
 # full rebuild if a single run would need more chunks than the cap. See the
 # "Serial-bump budget" section of README.md.
 CONF_NSUPDATE_MAX_BATCH_BYTES="${CONF_NSUPDATE_MAX_BATCH_BYTES}"
@@ -2751,7 +2751,7 @@ run_rpz() {
     # Zero-length file guard: abort if the rendered file is empty or missing.
     if [ -n "$CONF_OUTPUT_FILE" ]; then
         if [ ! -s "$CONF_OUTPUT_FILE" ]; then
-            log_err "Output file is empty or missing: $CONF_OUTPUT_FILE — aborting"
+            log_err "Output file is empty or missing: $CONF_OUTPUT_FILE, aborting"
             return 1
         fi
     fi
