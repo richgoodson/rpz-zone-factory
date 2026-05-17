@@ -65,6 +65,8 @@ CONF_FEED_LOG_DIR=""   # per-feed delta log directory (default: sibling "log" di
 CONF_LOG_REBUILDS="no" # log full-rebuild domain lists to feed logs (default: no)
 CONF_INCREMENTAL_ZONES=""  # space-separated zones that use the incremental (IXFR) update path
 CONF_INCREMENTAL_TTL="300" # TTL for nsupdate records (matches zone default)
+CONF_NSUPDATE_MAX_BATCH_BYTES="600000"  # Max bytes per nsupdate batch (text); split into chunks if exceeded
+CONF_NSUPDATE_MAX_CHUNKS_PER_RUN="4"    # Max chunks per zone per run; fall back to full rebuild if exceeded
 
 # v0.7.0 category-aware feed selection. The wizard writes these; runtime
 # resolution uses python -m rpz_factory.categories to expand them.
@@ -82,7 +84,7 @@ fi
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION="0.9.0"
+VERSION="0.9.1"
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
@@ -1321,6 +1323,12 @@ CONF_LOG_REBUILDS="${CONF_LOG_REBUILDS}"
 CONF_INCREMENTAL_CATEGORIES="${CONF_INCREMENTAL_CATEGORIES}"
 CONF_INCREMENTAL_ZONES="${CONF_INCREMENTAL_ZONES}"
 CONF_INCREMENTAL_TTL="${CONF_INCREMENTAL_TTL}"
+
+# nsupdate batch sizing — split oversized batches into chunks; fall back to
+# full rebuild if a single run would need more chunks than the cap. See the
+# "Serial-bump budget" section of README.md.
+CONF_NSUPDATE_MAX_BATCH_BYTES="${CONF_NSUPDATE_MAX_BATCH_BYTES}"
+CONF_NSUPDATE_MAX_CHUNKS_PER_RUN="${CONF_NSUPDATE_MAX_CHUNKS_PER_RUN}"
 CONF
 
     printf "  [OK] Configuration saved to: %s\n" "$_conf_file"
@@ -1868,6 +1876,197 @@ build_nsupdate_batch() {
     } > "$_out"
 }
 
+# Apply nsupdate batches for a zone, splitting into byte-bounded chunks
+# when the projected single batch would exceed CONF_NSUPDATE_MAX_BATCH_BYTES.
+#
+# Why this exists: BIND's nsupdate fails with "dns_request_create: ran out
+# of space" when the rendered UPDATE message exceeds the 65535-byte DNS
+# wire limit. Splitting the work across multiple nsupdate transactions
+# keeps large diffs on the IXFR path instead of falling back to AXFR.
+#
+# Byte accounting is exact (not estimated): every emitted line's length
+# is known from the FQDN, fixed syntax, and CNAME target. Records are all
+# ASCII per DNS spec, so length() == bytes in awk.
+#
+# Each chunk = its own nsupdate transaction = its own SOA bump = its own
+# IXFR delta to secondaries. To bound the per-run serial-bump cost (the
+# SOA serial scheme is YYYYMMDDNN, max 100 increments/day), if the
+# projected chunk count exceeds CONF_NSUPDATE_MAX_CHUNKS_PER_RUN this
+# function returns 1 and the caller falls back to full rebuild
+# (1 SOA bump + 5 AXFRs vs N bumps + 5N IXFR streams).
+#
+# Args: <zone> <adds_file> <dels_file>
+# Returns:
+#   0 = all batches applied successfully
+#   1 = any batch failed OR projected chunk count exceeds the cap
+apply_nsupdate_chunked() {
+    _ans_zone="$1"
+    _ans_adds="$2"
+    _ans_dels="$3"
+
+    _ans_target=$(incremental_cname_target "$_ans_zone")
+    _ans_ttl="${CONF_INCREMENTAL_TTL:-300}"
+    _ans_server="${CONF_ALLOW_SERVER:-127.0.0.1}"
+    _ans_max_bytes="${CONF_NSUPDATE_MAX_BATCH_BYTES:-600000}"
+    _ans_max_chunks="${CONF_NSUPDATE_MAX_CHUNKS_PER_RUN:-4}"
+
+    # Project total batch size in bytes.
+    # Header = "server <s>\nzone <z>\n", trailer = "send\n".
+    # Per-record bytes = length of the formatted nsupdate command(s).
+    _ans_total=$(awk -v zone="$_ans_zone" -v ttl="$_ans_ttl" \
+                     -v target="$_ans_target" -v server="$_ans_server" \
+                     -v dels_file="$_ans_dels" '
+        function rec_bytes(op, bare,    is_ip, n, line) {
+            is_ip = (bare ~ /\.rpz-ip$/)
+            if (op == "a") {
+                line = "update add " bare "." zone ". " ttl " IN CNAME " target "\n"
+                n = length(line)
+                if (!is_ip) {
+                    line = "update add *." bare "." zone ". " ttl " IN CNAME " target "\n"
+                    n += length(line)
+                }
+            } else {
+                line = "update delete " bare "." zone ". CNAME\n"
+                n = length(line)
+                if (!is_ip) {
+                    line = "update delete *." bare "." zone ". CNAME\n"
+                    n += length(line)
+                }
+            }
+            return n
+        }
+        BEGIN {
+            header = length("server " server "\nzone " zone "\n")
+            trailer = length("send\n")
+            total = header + trailer
+        }
+        /./ {
+            op = (FILENAME == dels_file) ? "d" : "a"
+            total += rec_bytes(op, $0)
+        }
+        END { print total }
+    ' "$_ans_dels" "$_ans_adds")
+
+    log_info "Incremental[$_ans_zone]: nsupdate batch ${_ans_total} bytes (limit ${_ans_max_bytes})"
+
+    # Fast path: single batch fits. Use existing builder + single nsupdate
+    # call. No behavior change vs prior versions for this case.
+    if [ "$_ans_total" -le "$_ans_max_bytes" ]; then
+        _ans_batch=$(mktemp "/tmp/rpz-nsupdate-${_ans_zone}.XXXXXX" 2>/dev/null || echo "/tmp/rpz-nsupdate-${_ans_zone}.$$")
+        build_nsupdate_batch "$_ans_zone" "$_ans_adds" "$_ans_dels" "$_ans_batch"
+
+        _ans_out=$(nsupdate -4 -k "$CONF_TSIG_KEY_FILE" < "$_ans_batch" 2>&1)
+        _ans_rc=$?
+        if [ $_ans_rc -ne 0 ]; then
+            log_err "Incremental[$_ans_zone]: nsupdate failed (rc=$_ans_rc): $_ans_out"
+            log_err "Incremental[$_ans_zone]: kept for debugging: batch=$_ans_batch"
+            return 1
+        fi
+        rm -f "$_ans_batch"
+        return 0
+    fi
+
+    # Project chunk count: ceil(total / max_bytes). Slight under-estimate
+    # because each extra chunk adds another (header + trailer) overhead,
+    # but we re-check after actual emit and bail if over the cap.
+    _ans_proj_chunks=$(( (_ans_total + _ans_max_bytes - 1) / _ans_max_bytes ))
+    log_info "Incremental[$_ans_zone]: batch ${_ans_total} bytes exceeds limit, projecting ${_ans_proj_chunks} chunks"
+
+    if [ "$_ans_proj_chunks" -gt "$_ans_max_chunks" ]; then
+        log_warn "Incremental[$_ans_zone]: projected ${_ans_proj_chunks} chunks exceeds CONF_NSUPDATE_MAX_CHUNKS_PER_RUN=${_ans_max_chunks}, falling back to full rebuild"
+        return 1
+    fi
+
+    # Emit chunks. Deletes first across however many chunks they need,
+    # then adds. Within each chunk: header -> records -> send.
+    _ans_chunk_prefix=$(mktemp -u "/tmp/rpz-nsupdate-${_ans_zone}.chunk.XXXXXX" 2>/dev/null || echo "/tmp/rpz-nsupdate-${_ans_zone}.chunk.$$")
+    _ans_chunk_list="${_ans_chunk_prefix}.list"
+
+    awk -v zone="$_ans_zone" -v ttl="$_ans_ttl" -v target="$_ans_target" \
+        -v server="$_ans_server" -v max_bytes="$_ans_max_bytes" \
+        -v prefix="$_ans_chunk_prefix" -v dels_file="$_ans_dels" '
+        function header_text() { return "server " server "\nzone " zone "\n" }
+        function trailer_text() { return "send\n" }
+        function emit_rec(op, bare,    is_ip, txt) {
+            is_ip = (bare ~ /\.rpz-ip$/)
+            if (op == "a") {
+                txt = "update add " bare "." zone ". " ttl " IN CNAME " target "\n"
+                if (!is_ip) txt = txt "update add *." bare "." zone ". " ttl " IN CNAME " target "\n"
+            } else {
+                txt = "update delete " bare "." zone ". CNAME\n"
+                if (!is_ip) txt = txt "update delete *." bare "." zone ". CNAME\n"
+            }
+            return txt
+        }
+        function open_chunk() {
+            chunk_idx++
+            chunk_file = sprintf("%s.%02d", prefix, chunk_idx)
+            chunk_files[chunk_idx] = chunk_file
+            chunk_bytes = length(header_text()) + length(trailer_text())
+            printf "%s", header_text() > chunk_file
+        }
+        function close_chunk() {
+            printf "%s", trailer_text() >> chunk_file
+            close(chunk_file)
+        }
+        BEGIN { chunk_idx = 0; open_chunk() }
+        /./ {
+            op = (FILENAME == dels_file) ? "d" : "a"
+            txt = emit_rec(op, $0)
+            tb = length(txt)
+            # Roll to a new chunk if appending this record would overflow.
+            # Guard against the pathological case of a single record larger
+            # than max_bytes: we only roll if the current chunk has at
+            # least one record in it.
+            min_chunk = length(header_text()) + length(trailer_text())
+            if (chunk_bytes + tb > max_bytes && chunk_bytes > min_chunk) {
+                close_chunk()
+                open_chunk()
+            }
+            printf "%s", txt >> chunk_file
+            chunk_bytes += tb
+        }
+        END {
+            close_chunk()
+            for (i = 1; i <= chunk_idx; i++) print chunk_files[i]
+        }
+    ' "$_ans_dels" "$_ans_adds" > "$_ans_chunk_list"
+
+    _ans_actual_chunks=$(wc -l < "$_ans_chunk_list" | tr -d ' ')
+
+    # Safety: actual chunk count can be projected + 1 in edge cases.
+    if [ "$_ans_actual_chunks" -gt "$_ans_max_chunks" ]; then
+        log_warn "Incremental[$_ans_zone]: emitted ${_ans_actual_chunks} chunks (cap ${_ans_max_chunks}), falling back to full rebuild"
+        while IFS= read -r _ans_f; do rm -f "$_ans_f"; done < "$_ans_chunk_list"
+        rm -f "$_ans_chunk_list"
+        return 1
+    fi
+
+    log_info "Incremental[$_ans_zone]: sending ${_ans_actual_chunks} chunks"
+
+    _ans_chunk_i=0
+    while IFS= read -r _ans_chunk_file; do
+        _ans_chunk_i=$((_ans_chunk_i + 1))
+        _ans_chunk_size=$(wc -c < "$_ans_chunk_file" | tr -d ' ')
+        log_info "Incremental[$_ans_zone]: chunk ${_ans_chunk_i}/${_ans_actual_chunks} (${_ans_chunk_size} bytes): sending"
+
+        _ans_out=$(nsupdate -4 -k "$CONF_TSIG_KEY_FILE" < "$_ans_chunk_file" 2>&1)
+        _ans_rc=$?
+        if [ $_ans_rc -ne 0 ]; then
+            log_err "Incremental[$_ans_zone]: chunk ${_ans_chunk_i}/${_ans_actual_chunks} nsupdate failed (rc=$_ans_rc): $_ans_out"
+            log_err "Incremental[$_ans_zone]: kept for debugging: chunks=${_ans_chunk_prefix}.*"
+            return 1
+        fi
+        log_info "Incremental[$_ans_zone]: chunk ${_ans_chunk_i}/${_ans_actual_chunks} succeeded"
+    done < "$_ans_chunk_list"
+
+    # Cleanup on success.
+    while IFS= read -r _ans_f; do rm -f "$_ans_f"; done < "$_ans_chunk_list"
+    rm -f "$_ans_chunk_list"
+
+    return 0
+}
+
 # ─── Feed delta logging ──────────────────────────────────────────────────────
 #
 # Writes per-feed add/del logs for auditing.  One file per zone, appended to
@@ -1981,7 +2180,7 @@ run_incremental_for_zone() {
     # run (e.g. via allow.sh) are now reflected in the .previous snapshot
     # via the next seed, but for the running zone we rely on nsupdate's
     # idempotent behavior to handle overlap.
-    log_info "Incremental[$_zone]: rndc sync \u2192 flushing journal to .db"
+    log_info "Incremental[$_zone]: rndc sync -> flushing journal to .db"
     _sync_output=$($RNDC_BIN sync "$_zone" 2>&1)
     _sync_rc=$?
     if [ $_sync_rc -ne 0 ]; then
@@ -2028,20 +2227,14 @@ run_incremental_for_zone() {
     # Feed delta log — only when there are actual changes
     log_feed_delta "$_zone" "incremental" "$_adds" "$_dels" "$_add_count" "$_del_count"
 
-    # Build nsupdate batch
-    _batch=$(mktemp "/tmp/rpz-nsupdate-${_zone}.XXXXXX" 2>/dev/null || echo "/tmp/rpz-nsupdate-${_zone}.$$")
-    build_nsupdate_batch "$_zone" "$_adds" "$_dels" "$_batch"
-
-    # Apply
+    # Apply: chunker handles single-batch fast path and oversized splits.
     log_info "Incremental[$_zone]: applying nsupdate (+$_add_count -$_del_count)"
-    # -4 forces IPv4 so hostnames like "localhost" don't try ::1 on v4-only BIND.
-    _nsupd_output=$(nsupdate -4 -k "$CONF_TSIG_KEY_FILE" < "$_batch" 2>&1)
+    apply_nsupdate_chunked "$_zone" "$_adds" "$_dels"
     _nsupd_rc=$?
 
     if [ $_nsupd_rc -ne 0 ]; then
-        log_err "Incremental[$_zone]: nsupdate failed (rc=$_nsupd_rc): $_nsupd_output"
         # Keep intermediate files for post-mortem
-        log_err "Incremental[$_zone]: kept for debugging: adds=$_adds dels=$_dels batch=$_batch"
+        log_err "Incremental[$_zone]: kept for debugging: adds=$_adds dels=$_dels"
         rm -f "$_curr"
         return 1
     fi
@@ -2050,7 +2243,7 @@ run_incremental_for_zone() {
 
     # Rotate: current becomes the new previous
     if ! mv "$_curr" "$_prev"; then
-        log_warn "Incremental[$_zone]: failed to rotate $_curr → $_prev"
+        log_warn "Incremental[$_zone]: failed to rotate $_curr -> $_prev"
     fi
 
     # Flush journal to disk so .db stays in sync
@@ -2061,7 +2254,7 @@ run_incremental_for_zone() {
     fi
 
     # Clean up tmp files on success
-    rm -f "$_adds" "$_dels" "$_batch"
+    rm -f "$_adds" "$_dels"
 
     return 0
 }

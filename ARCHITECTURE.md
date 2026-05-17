@@ -484,7 +484,29 @@ self-contained subsystem.
   ```
   Deletions come first so a re-add registers as a net change in the
   journal. Inner helper `_emit_update op bare` detects `.rpz-ip` keys and
-  skips the wildcard twin.
+  skips the wildcard twin. TSIG is supplied via `nsupdate -k keyfile` on
+  the command line, not via a `key` line in the file.
+
+- `apply_nsupdate_chunked zone adds_file dels_file` (v0.9.1+): wraps the
+  nsupdate call. Projects total batch size in bytes via awk (per-record
+  byte counts are exactly computable from the FQDN and fixed syntax —
+  all RPZ content is ASCII). Two paths:
+  - **Single batch (common):** projected ≤ `CONF_NSUPDATE_MAX_BATCH_BYTES`
+    → delegates to `build_nsupdate_batch` + a single `nsupdate -k` call.
+    Behavior identical to pre-v0.9.1.
+  - **Chunked:** projected > threshold → re-emits via a chunking awk pass
+    that opens a new self-contained chunk file (its own header + records
+    + `send`) whenever the next record would push the running chunk over
+    threshold. Deletes first across however many chunks they need, then
+    adds. Each chunk is its own nsupdate transaction, its own journal
+    entry, its own SOA bump, its own IXFR delta to secondaries.
+
+  Hard cap: if projected (or post-emit actual) chunk count exceeds
+  `CONF_NSUPDATE_MAX_CHUNKS_PER_RUN`, returns 1 → caller falls back to
+  full rebuild. Rationale: a full rebuild costs 1 SOA bump + 5 AXFRs vs.
+  N bumps + 5N IXFR streams; past some N, full rebuild is cheaper
+  operationally AND consumes less SOA-serial budget (see decision #5
+  addendum and the README "Serial-bump budget" section).
 
 - `run_incremental_for_zone zone new_db_file`: the core incremental path.
   Returns 0=success, 1=fatal error (caller falls back to full rebuild),
@@ -501,15 +523,23 @@ self-contained subsystem.
   6. `comm -23 prev curr` → deletions
   7. Log the counts (`adds=N dels=M`)
   8. Empty diff → clean up `.current`, return 0 (no-op)
-  9. `build_nsupdate_batch` → temp file
-  10. `nsupdate -k <TSIG_KEY> < batch`: apply
-  11. On success: rotate `.current` → `.previous`, `rndc sync <zone>` to
+  9. `apply_nsupdate_chunked` → handles single-batch fast path or
+     chunked-batch path, returns rc
+  10. On success: rotate `.current` → `.previous`, `rndc sync <zone>` to
       flush the new journal entries to `.db`, clean up temp files
-  12. On failure: log error, keep temp files for post-mortem, return 1
+  11. On failure: log error, keep adds/dels files for post-mortem,
+      return 1 (caller falls back to full rebuild)
 
-  **No churn threshold.** Trusts nsupdate (decision #4 in the design
-  conversation). If a massive delta is too much for nsupdate, it will
-  fail, we catch the failure, and fall back to full rebuild.
+  **Churn threshold for message-size only** (v0.9.1+, addendum to
+  decision #4): pre-v0.9.1 the no-threshold rule trusted nsupdate to
+  fail and our fallback to catch it. That still applies for genuine
+  errors. For message-size overflow specifically, we now project the
+  batch size and either chunk (small overflow) or fall back to full
+  rebuild (large overflow), instead of always falling back. The motivation
+  was that large active feeds (adguard-dns observed at +4114/-2936 in
+  one cron interval, ~910 KB batch) reliably overflow BIND's 65535-byte
+  DNS message limit, and the AXFR fallback for routine overflow was
+  defeating the IXFR design.
 
 - `seed_feed_snapshot zone db_file`: writes the initial
   `<feeds>/<zone>.list.previous` from a freshly rendered zone file. Called
@@ -700,6 +730,25 @@ Safe to delete at any time; next run will re-fetch and rebuild.
 
 ## Release history
 
+- **v0.9.1**: byte-bounded `nsupdate` chunking via the new
+  `apply_nsupdate_chunked` helper. Pre-projects total batch size in bytes
+  (exactly, from FQDN + fixed syntax — all RPZ content is ASCII), takes
+  the single-batch fast path when it fits under
+  `CONF_NSUPDATE_MAX_BATCH_BYTES` (default 600000), otherwise emits
+  multiple self-contained nsupdate transactions. Hard cap of
+  `CONF_NSUPDATE_MAX_CHUNKS_PER_RUN` (default 4) chunks per zone per run;
+  beyond that, falls back to full rebuild to bound per-run SOA-serial
+  bumps. Fixes the case where a large active feed (adguard-dns observed
+  at +4114/-2936 → ~910 KB text batch) would reliably overflow BIND's
+  65535-byte DNS message limit and fall back to AXFR. New README
+  "Serial-bump budget" section covers the cumulative-across-runs picture
+  that is operator responsibility.
+- **v0.9.0**: removed combined-mode RPZ entirely (was already deprecated in
+  v0.8.0 docs but the code path remained). Added `bind-config` subcommand
+  on `python -m rpz_factory.categories` for generating `named.conf` zone
+  blocks and response-policy stanza from the operator's category
+  selection. Documentation pass: README/ARCHITECTURE/PYTHON tightened,
+  Before-You-Start section added, em-dash scrub.
 - **v0.8.0**: category-encoded zone filenames (`<feed>.<category>.rpz`) so
   the synthesized-NXDOMAIN SOA identifies the threat category at a glance.
   Six new community feeds (AdGuard DNS, anudeepND, EasyPrivacy, AntiMalware
@@ -761,6 +810,19 @@ disagree with them, that's fine, but know they were deliberate:
 5. **No churn threshold for falling back to full rebuild.** Trusts
    nsupdate. If a batch is too big nsupdate will fail, we catch the
    failure, and fall back. Simpler than guessing a threshold.
+
+   **v0.9.1 addendum:** the no-threshold rule still holds for genuine
+   errors (TSIG, BIND down, etc.), but for message-size overflow
+   specifically we now project the batch size up front and either chunk
+   it across multiple nsupdate transactions (small overflow) or fall
+   back to full rebuild (large overflow). The motivation was that
+   large active feeds reliably overflow BIND's 65535-byte DNS message
+   limit, and the AXFR fallback for routine overflow was defeating the
+   IXFR design. See `apply_nsupdate_chunked` and the README's
+   "Serial-bump budget" section. Tracked separately: widening the SOA
+   serial scheme from `YYYYMMDDNN` (max 100/day) to `YYMMDDVVVV`
+   (max 10000/day, fits uint32 through 2099) to permanently retire the
+   per-day serial-bump constraint that motivates the chunk cap.
 
 6. **Seed path is automatic.** First time a zone runs as incremental, or
    any time `.previous` is missing, the shell takes the full-rebuild path
