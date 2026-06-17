@@ -17,8 +17,12 @@ Python and shell layers.
 from __future__ import annotations
 
 import argparse
+import glob
+import os
 import sys
 from dataclasses import dataclass
+
+from rpz_factory import userfeeds
 
 # Ordered for display purposes (wizard, --help, summaries).
 CATEGORIES: tuple[str, ...] = (
@@ -39,8 +43,9 @@ class FeedSpec:
     key: str           # CLI/config token, e.g. "urlhaus"
     zone: str          # zone filename without leading path, e.g. "urlhaus.malware.rpz"
     category: str      # one of CATEGORIES, or "policy" for allowlist
-    enum_value: str    # SourceName enum value, e.g. "abusech_urlhaus"
+    enum_value: str    # source identity value, e.g. "abusech_urlhaus" or "user_my_feed"
     url: str           # primary feed URL
+    kind: str = "domain"  # "domain" or "ip" - selects the generic plaintext parser
 
 
 # The allowlist is a policy zone (passthru), not a category-blocked zone.
@@ -54,7 +59,7 @@ _ALLOWLIST = FeedSpec(
     url="",  # local file, not HTTP
 )
 
-_FEEDS: tuple[FeedSpec, ...] = (
+_BUILTIN_FEEDS: tuple[FeedSpec, ...] = (
     FeedSpec(
         key="urlhaus",
         zone="urlhaus.malware.rpz",
@@ -141,8 +146,72 @@ _FEEDS: tuple[FeedSpec, ...] = (
     ),
 )
 
-REGISTRY: dict[str, FeedSpec] = {f.key: f for f in _FEEDS}
 ALLOWLIST: FeedSpec = _ALLOWLIST
+
+
+def _builtin_registry_facts() -> tuple[set[str], set[str]]:
+    """Return (built-in keys, built-in zones), each including the allowlist.
+
+    These are the facts user feeds are validated against. Owning them here and
+    passing them into userfeeds keeps the dependency arrow one-way
+    (categories -> userfeeds) and userfeeds import-pure.
+    """
+    keys = {f.key for f in _BUILTIN_FEEDS} | {_ALLOWLIST.key}
+    zones = {f.zone for f in _BUILTIN_FEEDS} | {_ALLOWLIST.zone}
+    return keys, zones
+
+
+def _load_user_feeds() -> tuple[list[FeedSpec], list[str]]:
+    """Validate user-feeds.yaml and return (valid FeedSpecs, issue strings).
+
+    Lenient: never raises, so a malformed config yields built-ins only plus
+    recorded issues. categories.py *is* the registry and is imported by both
+    cli.py and the shell, so it must stay importable no matter what the file
+    contains - a bad feed degrades to a recorded issue, never an exception.
+    """
+    builtin_keys, builtin_zones = _builtin_registry_facts()
+    result = userfeeds.load_user_feeds(
+        valid_categories=set(CATEGORIES),
+        builtin_keys=builtin_keys,
+        builtin_zones=builtin_zones,
+    )
+    specs = [
+        FeedSpec(
+            key=s.key,
+            zone=s.zone,
+            category=s.category,
+            enum_value=s.enum_value,
+            url=s.url,
+            kind=s.kind,
+        )
+        for s in result.specs
+    ]
+    return specs, result.issues
+
+
+# Loaded at import time: categories.py is the registry, and both cli.py and the
+# shell need user feeds present in REGISTRY. Built-ins always come first (stable
+# order), then any valid user feeds.
+_USER_FEEDS, USER_FEED_ISSUES = _load_user_feeds()
+_FEEDS: tuple[FeedSpec, ...] = _BUILTIN_FEEDS + tuple(_USER_FEEDS)
+
+REGISTRY: dict[str, FeedSpec] = {f.key: f for f in _FEEDS}
+
+
+def user_feed_summary() -> str | None:
+    """One-line WARNING summary of skipped user feeds, or None if clean.
+
+    Shared by both entry points (cli.main and this module's _cli) so the line
+    is identical regardless of how user feeds were loaded. Returns None when
+    nothing was skipped - including the common no-user-feeds case.
+    """
+    if not USER_FEED_ISSUES:
+        return None
+    reasons = "; ".join(USER_FEED_ISSUES)
+    return (
+        f"user-feeds: loaded {len(_USER_FEEDS)}, SKIPPED {len(USER_FEED_ISSUES)} "
+        f"({reasons}) - run 'validate-feeds'"
+    )
 
 
 def all_feed_keys() -> list[str]:
@@ -349,6 +418,13 @@ def render_bind_config(
     return "\n".join(out) + "\n"
 
 
+def _emit_user_feed_issues() -> None:
+    """Print the user-feed skip summary to stderr, if any (decision 5)."""
+    summary = user_feed_summary()
+    if summary:
+        print(f"WARNING: {summary}", file=sys.stderr)
+
+
 def _cli(argv: list[str] | None = None) -> int:
     """Shell-friendly CLI for run-rpz.sh.
 
@@ -446,7 +522,35 @@ def _cli(argv: list[str] | None = None) -> int:
         help="Which section(s) to emit (default: %(default)s)",
     )
 
+    sub.add_parser(
+        "validate-feeds",
+        help="strictly validate user-feeds.yaml; print every problem and exit "
+        "non-zero if any (run after editing the file)",
+    )
+
+    p_orphans = sub.add_parser(
+        "list-orphans",
+        help="list live zone files / feed snapshots no longer backed by the "
+        "registry (e.g. after removing a user feed); exits non-zero if any",
+    )
+    p_orphans.add_argument(
+        "--zone-dir",
+        required=True,
+        help="directory holding the live <zone>.db files",
+    )
+    p_orphans.add_argument(
+        "--feeds-dir",
+        default=None,
+        help="optional directory holding <zone>.list.{previous,current} snapshots",
+    )
+
     args = p.parse_args(argv)
+
+    # Surface skipped user feeds on every shell-facing subcommand except
+    # validate-feeds (which prints its own, richer report). Passive WARNING to
+    # stderr; never changes the subcommand's own exit code (decision 5).
+    if args.cmd != "validate-feeds":
+        _emit_user_feed_issues()
 
     if args.cmd == "list-categories":
         for c in CATEGORIES:
@@ -543,6 +647,57 @@ def _cli(argv: list[str] | None = None) -> int:
             )
         )
         return 0
+
+    if args.cmd == "validate-feeds":
+        builtin_keys, builtin_zones = _builtin_registry_facts()
+        try:
+            result = userfeeds.load_user_feeds(
+                valid_categories=set(CATEGORIES),
+                builtin_keys=builtin_keys,
+                builtin_zones=builtin_zones,
+                strict=True,
+            )
+        except userfeeds.UserFeedError as e:
+            print(
+                f"user-feeds: {len(e.issues)} problem(s) in {userfeeds.default_path()}:",
+                file=sys.stderr,
+            )
+            for issue in e.issues:
+                print(f"  - {issue}", file=sys.stderr)
+            return 1
+        print(f"user-feeds: OK ({len(result.specs)} feed(s) valid)")
+        return 0
+
+    if args.cmd == "list-orphans":
+        # A zone is "known" if it is still backed by the registry (built-in or
+        # a currently-valid user feed) or is the allowlist. Anything live on
+        # disk that is not known is an orphan from a removed/renamed feed.
+        known_zones = {f.zone for f in _FEEDS} | {ALLOWLIST.zone}
+        orphans: list[str] = []
+
+        for path in sorted(glob.glob(os.path.join(args.zone_dir, "*.db"))):
+            stem = os.path.basename(path)[:-3]  # strip ".db"
+            if stem not in known_zones:
+                orphans.append(path)
+
+        if args.feeds_dir:
+            snapshots = sorted(
+                glob.glob(os.path.join(args.feeds_dir, "*.list.previous"))
+                + glob.glob(os.path.join(args.feeds_dir, "*.list.current"))
+            )
+            for path in snapshots:
+                base = os.path.basename(path)
+                stem = base
+                for suffix in (".list.previous", ".list.current"):
+                    if base.endswith(suffix):
+                        stem = base[: -len(suffix)]
+                        break
+                if stem not in known_zones:
+                    orphans.append(path)
+
+        for o in orphans:
+            print(o)
+        return 1 if orphans else 0
 
     return 1
 

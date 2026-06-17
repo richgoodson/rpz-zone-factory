@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # generated zone files (per-source mode writes one per feed to OUTPUT_DIR)
 *.rpz.db

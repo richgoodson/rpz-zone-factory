@@ -77,13 +77,14 @@ rpz-zone-factory/
 │   ├── cache.py                # per-source cache + HTTP metadata (ETag/Last-Modified)
 │   ├── fetcher.py              # HTTP fetch with conditional requests
 │   ├── filters.py              # safe-TLD filter, critical-domain allowlist, dedup
-│   ├── models.py               # dataclasses: ThreatEntry, FetchResult, HttpMeta
+│   ├── models.py               # dataclasses: ThreatEntry, FetchResult, HttpMeta, SourceRef
+│   ├── userfeeds.py            # loader/validator for optional user-feeds.yaml (stdlib + yaml only)
 │   ├── parsers/
 │   │   ├── abusech.py          # URLhaus RPZ feed parser
 │   │   ├── cisa.py             # CISA KEV JSON parser
 │   │   ├── cryptoscamdb.py     # CryptoScamDB YAML parser
 │   │   ├── emergingthreats.py  # Emerging Threats compromised-IPs parser
-│   │   ├── plaintext.py        # generic parser for hosts-file / plain-domain feeds
+│   │   ├── plaintext.py        # generic parser for hosts-file / plain-domain feeds + IPv4 IP/CIDR feeds
 │   │   ├── scamsniffer.py      # Scam Sniffer JSON parser
 │   │   └── spamhaus.py         # Spamhaus DROP parser
 │   └── renderers/
@@ -149,14 +150,23 @@ Defines `__version__`. That is all.
 
 Dataclasses used everywhere. Edit with caution. Changes ripple.
 
-- `SourceName` (enum): canonical source identifiers used as cache filename
-  stems (`.cache/<enum_value>.json`). These are NOT the same as the CLI
-  source keys (`urlhaus`, `cisa`, `drop`, etc.); each feed in
+- `SourceName` (enum): canonical source identifiers for built-in feeds, used
+  as cache filename stems (`.cache/<enum_value>.json`). These are NOT the same
+  as the CLI source keys (`urlhaus`, `cisa`, `drop`, etc.); each feed in
   `rpz_factory/categories.py` carries both a `key` (CLI/config token) and
   an `enum_value` (`SourceName` value). `cli.py` has two dicts mapping
   between them (`_SOURCE_KEY_TO_NAME` and `_SOURCE_NAME_TO_KEY`), and the
   registry in `categories.py` is the source of truth for both. When you
-  add a source, update the registry and both dicts.
+  add a built-in source, update the registry and both dicts.
+- `SourceRef` (frozen dataclass): source identity for an operator-defined
+  feed from `user-feeds.yaml`, value `"user_<key>"`. It is NOT a `SourceName`
+  member. Every consumer reads only `.value`, so a `SourceRef` and a
+  `SourceName` are interchangeable at every call site (cache, filters, the
+  per-source grouping in `cli.py`). `ThreatEntry.source` and
+  `FetchResult.source` are typed `SourceName | SourceRef`. Using a value
+  object instead of dynamically extending the enum keeps `models.py`
+  import-pure (no config load), so a malformed config can never make the
+  package unimportable. See `userfeeds.py`.
 - `EntryType` (enum): `DOMAIN`, `IP`, or `CIDR`. Determines how the
   renderer encodes the entry.
 - `ThreatEntry`: a single blocked thing. `.value` is the raw string;
@@ -183,17 +193,28 @@ feed belong to."
   - `zone`: zone filename without leading path, e.g. `"urlhaus.malware.rpz"`
   - `category`: one of `CATEGORIES`, or the literal `"policy"` for the
     allowlist
-  - `enum_value`: `SourceName` enum value (the cache-filename stem)
+  - `enum_value`: source identity value (the cache-filename stem): a
+    `SourceName` value for built-ins, `"user_<key>"` for user feeds
   - `url`: primary feed URL (empty string for non-HTTP sources like the
     allowlist)
-- `_FEEDS` (tuple of `FeedSpec`): every threat feed.
+  - `kind`: `"domain"` (default) or `"ip"`, selects the generic parser
+- `_BUILTIN_FEEDS` (tuple of `FeedSpec`): every built-in threat feed.
+- `_USER_FEEDS` (list of `FeedSpec`) / `USER_FEED_ISSUES` (list of str):
+  the valid user feeds loaded from `user-feeds.yaml` and the issues for any
+  that were skipped. Loaded at import time via `userfeeds.load_user_feeds`,
+  validated against the built-in keys/zones/categories. Lenient: a bad file
+  yields built-ins only plus recorded issues, never an import-time exception.
+- `_FEEDS` (tuple): `_BUILTIN_FEEDS + _USER_FEEDS`, built-ins first.
 - `_ALLOWLIST` (`FeedSpec`): the allowlist pseudo-feed.
-- `REGISTRY` (dict, exported): `{key: FeedSpec}` for every feed including
-  the allowlist. `cli.py` derives `ALL_SOURCES`, `SOURCE_ZONE_NAMES`,
-  `_SOURCE_URLS`, `_SOURCE_KEY_TO_NAME`, and `_SOURCE_NAME_TO_KEY` from
-  REGISTRY at import time. `SOURCE_FETCHERS` (parser callable per feed)
-  is the one cli.py constant that is NOT derived from REGISTRY. Parser
-  signatures vary too much, so it stays hand-maintained.
+- `REGISTRY` (dict, exported): `{key: FeedSpec}` for every feed (built-in and
+  user) including the allowlist. `cli.py` derives `ALL_SOURCES`,
+  `SOURCE_ZONE_NAMES`, `_SOURCE_URLS`, `_SOURCE_KEY_TO_NAME`, and
+  `_SOURCE_NAME_TO_KEY` from REGISTRY at import time. `SOURCE_FETCHERS`
+  (parser callable per feed) is the one cli.py constant that is NOT derived
+  from REGISTRY; for user feeds, `cli._fetcher_for` builds a generic plaintext
+  fetcher on the fly from the spec's URL and kind.
+- `user_feed_summary()`: the shared one-line WARNING string for skipped feeds,
+  used by both `cli.main` and the module CLI so the message is identical.
 
 CLI subcommands (also called by `run-rpz.sh` to expand category
 selections):
@@ -206,6 +227,32 @@ selections):
 - `bind-config [--categories ...] [--zone-dir ...] [--tsig-key ...] ...`:
   emits `named.conf` zone blocks and a response-policy stanza. See the
   README "BIND Configuration" section for the operator walkthrough.
+- `validate-feeds`: strictly validate `user-feeds.yaml`, print every problem,
+  exit non-zero if any.
+- `list-orphans --zone-dir DIR [--feeds-dir DIR]`: print live zone files /
+  feed snapshots no longer backed by the registry; exit non-zero if any.
+  Read-only.
+
+Every subcommand except `validate-feeds` first prints `USER_FEED_ISSUES` to
+stderr (if any), so a skipped user feed is loud on shell-driven invocations too.
+
+### `userfeeds.py`
+
+Loader + validator for the optional `user-feeds.yaml`. Imports only the
+standard library and `yaml` (**no `rpz_factory` imports**). It receives the
+registry facts it validates against (valid categories, built-in keys, built-in
+zones) as arguments; `categories.py` owns those facts and passes them in. This
+one-way arrow (`categories -> userfeeds`) is deliberate: it removes the import
+cycle a dynamic enum would have created and is why the merge can run at
+`categories` import time without risk.
+
+- `UserFeedSpec` (frozen): `key`, `category`, `url`, `kind`, `label`, with
+  derived `enum_value` (`"user_" + key` with hyphens to underscores) and `zone`
+  (`<key>.<category>.rpz`) as properties so they cannot drift.
+- `load_user_feeds(*, valid_categories, builtin_keys, builtin_zones, strict,
+  path) -> LoadResult`: one validation pass, structural then cross-reference.
+  Lenient (`strict=False`) never raises; strict (`strict=True`, used by
+  `validate-feeds`) raises `UserFeedError` carrying every issue at once.
 
 ### `cache.py`
 
@@ -270,19 +317,29 @@ One file per source. Each exports a `fetch_and_parse(**kwargs)` function
 2. Parses the response body (JSON / YAML / text RPZ / DROP format).
 3. Returns a `FetchResult` with a list of `ThreatEntry`.
 
-To add a new source:
+`plaintext.py` also parses IPv4 IP/CIDR feeds via `parse_ip_text` (selected by
+`make_fetcher(..., kind="ip")`): first token per line, `ipaddress`-validated,
+IPv4 only (the `rpz-ip` encoding is IPv4), IPv6 and unparseable lines dropped
+and counted. Its drop-count log escalates to WARNING when drops exceed kept, so
+a mostly-IPv6 feed cannot silently render an empty zone. This is the path user
+`kind: ip` feeds take.
+
+To add a new **built-in** source:
 1. Write `parsers/newsource.py` with `fetch_and_parse`, OR reuse
-   `parsers/plaintext.py` (its `make_fetcher(url, source_enum, label=...)`
-   factory works for any hosts-file or plain-domain feed).
+   `parsers/plaintext.py` (its `make_fetcher(url, source, label=..., kind=...)`
+   factory works for any hosts-file, plain-domain, or IPv4 IP/CIDR feed).
 2. Add a `SourceName` enum value in `models.py`.
-3. Add a `FeedSpec` entry to `_FEEDS` in `categories.py`
-   (`key`, `zone`, `category`, `enum_value`, `url`). The constants
-   `ALL_SOURCES`, `SOURCE_ZONE_NAMES`, `_SOURCE_URLS`,
+3. Add a `FeedSpec` entry to `_BUILTIN_FEEDS` in `categories.py`
+   (`key`, `zone`, `category`, `enum_value`, `url`, optional `kind`). The
+   constants `ALL_SOURCES`, `SOURCE_ZONE_NAMES`, `_SOURCE_URLS`,
    `_SOURCE_KEY_TO_NAME`, and `_SOURCE_NAME_TO_KEY` in `cli.py` are
    derived from `REGISTRY` at import time.
 4. Wire the parser callable into `SOURCE_FETCHERS` in `cli.py`, keyed by
    feed key. (Hand-maintained because parser callables vary in signature.)
 5. Add the feed to the sources table in `README.md`.
+
+For a feed from an arbitrary URL with no new parser, prefer `user-feeds.yaml`
+(see `userfeeds.py` and the README) instead of editing the package.
 
 ### `renderers/rpz.py`
 
@@ -658,7 +715,7 @@ Phase 5: Full rebuild writes
     Compile .db from .tmp using named-compilezone -F raw (if enabled)
     Otherwise cp .tmp/<zone>.db → <output>/<zone>.db
   Remove orphaned .jnl files ONLY for zones in _full_bucket.
-  NEVER touches .jnl files for zones in _incremental_bucket — those
+  NEVER touches .jnl files for zones in _incremental_bucket - those
   journals are live and BIND is actively using them.
 
 Phase 6: Reload and thaw
@@ -775,6 +832,16 @@ Safe to delete at any time; next run will re-fetch and rebuild.
 
 ## Release history
 
+- **v0.10.0**: user-supplied web feeds via an optional `user-feeds.yaml`.
+  Operator-defined domain and IPv4 IP/CIDR feeds from arbitrary URLs, with no
+  code changes. New `userfeeds.py` (dependency-free loader/validator), a
+  `SourceRef` value object for user-feed identity (instead of a dynamic
+  `SourceName` enum), IPv4 `parse_ip_text` in `parsers/plaintext.py`, registry
+  merge plus `validate-feeds` and `list-orphans` subcommands in
+  `categories.py`, and `RPZ_USER_FEEDS` + an unconfigured-zone preflight +
+  per-run orphan summary in `run-rpz.sh`. Bad feeds are skipped with a WARNING,
+  never fatal. First `tests/` suite (pytest; `requirements-dev.txt`). Also
+  scrubbed em-dashes from `run-rpz.sh` and the new/modified source files.
 - **v0.9.1**: byte-bounded `nsupdate` chunking via the new
   `apply_nsupdate_chunked` helper. Pre-projects total batch size in bytes
   (exactly, from FQDN + fixed syntax; all RPZ content is ASCII), takes
@@ -894,6 +961,37 @@ disagree with them, that's fine, but know they were deliberate:
     now always per-source. Pi-hole output is still combined since it
     consumes a single flat file.
 
+11. **User feeds use a `SourceRef` value object, not a dynamic enum.** The
+    alternative considered for `user-feeds.yaml` was extending the `SourceName`
+    enum at import time. That created an import cycle (the enum lives in
+    `models.py`, which everything imports) and made the enum's contents depend
+    on import order. Instead a user feed carries `SourceRef("user_<key>")`;
+    `models.py` does no config loading and stays import-pure, and `userfeeds.py`
+    imports nothing from the package (it receives registry facts as arguments).
+    The dependency arrow is one-way: `categories -> userfeeds`.
+
+12. **A bad `user-feeds.yaml` degrades loudly; it never takes down built-ins.**
+    A per-feed error drops that feed; a file-level error drops all custom feeds;
+    either way the built-in feeds still run. The skipped feeds are surfaced at
+    WARNING on every run (both `cli.main` and the `categories` module CLI), and
+    `validate-feeds` gives a strict, non-zero-on-problem check. Rationale: a
+    security tool that silently drops coverage to punish a typo is worse than
+    one that keeps protecting and complains. The same "loud, not silent" rule
+    drives the IPv4 drop-count WARNING (a mostly-IPv6 `ip` feed) and the
+    unconfigured-zone / orphan warnings below.
+
+13. **User-feed provisioning and teardown are operator actions, surfaced but
+    not automated.** A feed in the registry is rendered, but BIND does not serve
+    it until the operator adds the zone to `named.conf` and runs
+    `rndc reconfig`; removing a feed leaves an orphaned `.db` + journal +
+    snapshots until the operator tears them down. `run_rpz` makes both visible
+    rather than acting: an **unconfigured-zone preflight** (`rndc zonestatus`,
+    read-only) warns when a rendered zone is not in `named.conf`, and a per-run
+    **orphan summary** (`list-orphans`, read-only) lists live files no longer
+    backed by the registry. The tool never deletes live zone files
+    (reversible-actions rule); teardown stays manual. See the README "Adding
+    Your Own Feeds" section.
+
 ---
 
 ## How to test changes
@@ -903,6 +1001,9 @@ Local (dev machine, no BIND):
 ```sh
 # Syntax check both shell scripts
 sh -n run-rpz.sh && sh -n allow.sh
+
+# Run the Python test suite (pytest; dev deps in requirements-dev.txt)
+.venv/bin/python -m pytest tests/ -q
 
 # Exercise the Python pipeline (writes per-source zones to /tmp/rpz-test)
 mkdir -p /tmp/rpz-test

@@ -107,6 +107,81 @@ Categories: `malware`, `ads`, `tracking`, `scam`, `cryptojacking`,
 edit `CONF_CATEGORIES` in `.run-rpz.conf`. Add or drop individual feeds
 with `CONF_SOURCES_EXTRA` / `CONF_SOURCES_EXCLUDE`.
 
+## Adding Your Own Feeds
+
+The feeds above are built in. To add a feed from any other URL without
+touching the code, drop it into `user-feeds.yaml` at the repo root (override
+the path with the `RPZ_USER_FEEDS` environment variable). If the file is
+absent, nothing changes.
+
+```yaml
+feeds:
+  - key: my-corp-blocklist        # CLI token, cache name, zone-name stem
+    category: malware             # must be one of the categories above
+    url: https://example.com/blocklist.txt
+    kind: domain                  # domain (default) or ip
+    label: "Corp blocklist"       # optional, used only in log lines
+
+  - key: my-bad-ips
+    category: ipreputation
+    url: https://example.com/bad-ips.txt
+    kind: ip
+```
+
+- `kind: domain` accepts plain-domain and hosts-file lists (the same formats
+  the built-in community feeds use).
+- `kind: ip` accepts plain IPv4 address and CIDR lists. **IPv4 only** for now:
+  the `rpz-ip` encoding this tool emits is IPv4, so IPv6 lines are dropped (and
+  counted). A feed that turns out to be mostly IPv6 logs a WARNING so it cannot
+  silently render an almost-empty zone.
+- A feed reuses one of the existing categories, so it inherits that category's
+  zone-name scheme (`<key>.<category>.rpz`) and update mode (IXFR vs full
+  rebuild). Custom categories are out of scope.
+
+After editing the file, validate it:
+
+```sh
+python -m rpz_factory.categories validate-feeds
+```
+
+This exits non-zero and prints every problem (bad key, unknown category, bad
+URL, a key or derived zone that collides with a built-in, etc.). A bad feed is
+**skipped, not fatal**: the built-in feeds always run, and each run prints a
+`WARNING: user-feeds: loaded N, SKIPPED M ...` line naming what was dropped, so
+a typo never silently removes coverage.
+
+### Activating a new feed in BIND
+
+A feed in the registry is a feed that gets *rendered*. It is not yet a feed BIND
+*serves*. Adding the feed to `user-feeds.yaml` does not, by itself, create the
+zone in `named.conf`. The order to follow is **render first, then provision**:
+
+1. Add the feed to `user-feeds.yaml`; run `validate-feeds`.
+2. Run `run-rpz.sh` once. Python renders `<key>.<category>.rpz.db` into the zone
+   directory. Because the zone is not in `named.conf` yet, the run stages the
+   file but cannot activate it, and prints:
+   `user-feeds: rendered but NOT served by BIND (no named.conf zone): ...`
+3. Regenerate the `named.conf` zone block and response-policy entry. The
+   generator already includes the new zone:
+   `python -m rpz_factory.categories bind-config ...` (or re-run
+   `run-rpz.sh --setup`). Install it and run `rndc reconfig`. BIND loads the
+   `.db` staged in step 2 and the feed is live.
+4. From then on, `run-rpz.sh` manages the zone automatically.
+
+### Removing a feed
+
+Deleting a feed from `user-feeds.yaml` stops it being rendered, but the live
+`<zone>.db`, its `named.conf` block, any `.db.jnl` journal, and the
+`<feeds>/<zone>.list.*` snapshots remain on disk, and the zone keeps serving its
+last render. Teardown is manual (the tool never deletes live zone files):
+
+1. Remove the feed from `user-feeds.yaml`.
+2. `python -m rpz_factory.categories list-orphans --zone-dir <zone-dir> [--feeds-dir <feeds-dir>]`
+   reports every live file no longer backed by the registry. `run-rpz.sh` also
+   prints this list on every run until the zone is torn down.
+3. Remove the zone's `named.conf` block and response-policy entry; `rndc reconfig`.
+4. Delete the orphaned `<zone>.db`, `<zone>.db.jnl`, and `<zone>.list.*` files.
+
 ## Requirements
 
 - BIND 9.16+ with RPZ support (see [Before You Start](#before-you-start) for distribution notes)

@@ -14,10 +14,11 @@ from rpz_factory.categories import (
     REGISTRY,
     all_feed_keys,
     resolve_selection,
+    user_feed_summary,
 )
 from rpz_factory.fetcher import get_last_fetch_meta
 from rpz_factory.filters import filter_entries
-from rpz_factory.models import FetchResult, HttpMeta, SourceName, ThreatEntry
+from rpz_factory.models import FetchResult, HttpMeta, SourceName, SourceRef, ThreatEntry
 from rpz_factory.parsers import (
     abusech,
     cisa,
@@ -39,7 +40,7 @@ EXIT_NO_CHANGES = 2
 ALL_SOURCES = all_feed_keys()
 
 # Per-source RPZ zone names (used with --per-source). Drops the trailing
-# ".db" — the shell layer adds it. Derived from the categories registry.
+# ".db" - the shell layer adds it. Derived from the categories registry.
 SOURCE_ZONE_NAMES = {key: spec.zone for key, spec in REGISTRY.items()}
 
 
@@ -184,6 +185,36 @@ _SOURCE_KEY_TO_NAME = {key: spec.enum_value for key, spec in REGISTRY.items()}
 _SOURCE_NAME_TO_KEY = {v: k for k, v in _SOURCE_KEY_TO_NAME.items()}
 
 
+def _source_obj(enum_value: str):
+    """Resolve a source identity value to its source object.
+
+    Built-in values map to a SourceName enum member; user-feed values (which
+    are not enum members) fall back to a SourceRef. Both expose `.value`, so
+    every downstream consumer (cache, filters, grouping) is unaffected.
+    """
+    try:
+        return SourceName(enum_value)
+    except ValueError:
+        return SourceRef(enum_value)
+
+
+def _fetcher_for(key: str):
+    """Return the fetch_and_parse callable for a feed key.
+
+    Built-ins have a pre-built entry in SOURCE_FETCHERS. User feeds are not in
+    that table, so build a generic plaintext fetcher on the fly from their
+    registry spec (URL + kind). This is the edit that lets a user feed actually
+    fetch - without it the bare SOURCE_FETCHERS lookup KeyErrors on any user
+    feed.
+    """
+    if key in SOURCE_FETCHERS:
+        return SOURCE_FETCHERS[key]
+    spec = REGISTRY[key]
+    return plaintext.make_fetcher(
+        spec.url, _source_obj(spec.enum_value), label=key, kind=spec.kind
+    )
+
+
 def _resolve_live_zone_path(output_dir: str, filename: str) -> str:
     """Return the path to the currently-live zone file for serial lookup.
 
@@ -192,7 +223,7 @@ def _resolve_live_zone_path(output_dir: str, filename: str) -> str:
     In that case the live zone file is at <real_dir>/<filename>.
 
     When checkzone is disabled, output_dir IS the real directory and the live
-    file is at <output_dir>/<filename> — but that's the same file we're about
+    file is at <output_dir>/<filename> - but that's the same file we're about
     to write. The caller must read the serial BEFORE opening for write.
     """
     # Detect the ".tmp" staging subdirectory convention.
@@ -263,6 +294,14 @@ def main(argv: list[str] | None = None) -> int:
     _configure_logging(args.verbose)
     logger = logging.getLogger("rpz_factory")
 
+    # Surface any skipped user feeds once, loudly, at WARNING - visible even at
+    # the default (non-verbose) level so a dropped feed never goes silent in
+    # cron mail (decision 5). The categories module CLI emits the same line
+    # independently for shell-driven invocations.
+    _uf_summary = user_feed_summary()
+    if _uf_summary:
+        logger.warning(_uf_summary)
+
     # Resolve --sources / --categories / --exclude-sources into the final
     # ordered feed list. Stored back on args.sources for downstream code.
     # When both --categories and --sources are given, the explicit feed
@@ -309,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
     errored_sources: set[str] = set()
 
     for source_key in args.sources:
-        fetcher = SOURCE_FETCHERS[source_key]
+        fetcher = _fetcher_for(source_key)
         logger.info("Fetching source: %s", source_key)
 
         # Load HTTP conditional-request metadata from cache
@@ -317,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
         http_meta: HttpMeta | None = None
         if source_enum_value:
             try:
-                source_enum = SourceName(source_enum_value)
+                source_enum = _source_obj(source_enum_value)
                 http_meta = load_http_meta(cache_dir, source_enum)
             except ValueError:
                 pass
@@ -332,12 +371,12 @@ def main(argv: list[str] | None = None) -> int:
             result: FetchResult = fetcher(**fetch_kwargs)
 
             if result.not_modified:
-                # 304 — use cached entries
+                # 304 - use cached entries
                 logger.info("Source %s: not modified (304), using cache", source_key)
                 not_modified_sources.append(source_key)
                 if source_enum_value:
                     try:
-                        source_enum = SourceName(source_enum_value)
+                        source_enum = _source_obj(source_enum_value)
                         cached = load_cache(cache_dir, source_enum)
                         if cached:
                             all_entries.extend(cached.entries)
@@ -400,7 +439,7 @@ def main(argv: list[str] | None = None) -> int:
             # Try cache fallback on exception
             if source_enum_value:
                 try:
-                    source_enum = SourceName(source_enum_value)
+                    source_enum = _source_obj(source_enum_value)
                     cached = load_cache(cache_dir, source_enum)
                     if cached:
                         all_entries.extend(cached.entries)
@@ -515,7 +554,7 @@ def _run_per_source(
 
     Per-zone fast-path: if a source returned 304 and didn't error out,
     skip rendering that zone entirely. The shell side iterates `*.db`
-    files in the staging directory, so an absent file means "no work" —
+    files in the staging directory, so an absent file means "no work" -
     no validation, no IXFR, no seed, no reload. --force bypasses this.
     """
     from collections import defaultdict
@@ -557,7 +596,7 @@ def _run_per_source(
             _live_path = _resolve_live_zone_path(output_dir, f"{zone_name}.db")
             if os.path.isfile(_live_path) and os.path.getsize(_live_path) > 0:
                 logger.info(
-                    "Source %s: 304 unchanged and live %s exists — skipping render",
+                    "Source %s: 304 unchanged and live %s exists - skipping render",
                     source_key,
                     _live_path,
                 )
@@ -598,7 +637,7 @@ def _run_per_source(
     # Write allowlist zone if provided.
     #
     # Allowlist fast-path: the source is a local text file, not HTTP, so
-    # there's no 304 to leverage. Instead compare mtimes — if the .txt
+    # there's no 304 to leverage. Instead compare mtimes - if the .txt
     # hasn't been touched since the live .db was last written, the zone
     # is already in sync (allow.sh nsupdates touch the .db on every
     # change, and run-rpz.sh seeds the .db after a render). --force
@@ -618,7 +657,7 @@ def _run_per_source(
             and os.path.getmtime(args.allowlist) <= os.path.getmtime(_live_allowlist)
         ):
             logger.info(
-                "Allowlist: %s unchanged since live %s — skipping render",
+                "Allowlist: %s unchanged since live %s - skipping render",
                 args.allowlist,
                 _live_allowlist,
             )
@@ -652,7 +691,7 @@ def _run_per_source(
         zone_name = SOURCE_ZONE_NAMES.get(source_key, source_key)
         if source_key in skipped_sources:
             tag = " (skipped)"
-            count_str = "—"
+            count_str = "-"
         elif source_key in not_modified_sources:
             tag = " (cached/304)"
             count_str = str(count)
@@ -662,7 +701,7 @@ def _run_per_source(
         print(f"  {zone_name}: {count_str}{tag}", file=sys.stderr)
     if args.allowlist:
         if allowlist_skipped:
-            print(f"  allowlist.rpz: — (skipped)", file=sys.stderr)
+            print(f"  allowlist.rpz: - (skipped)", file=sys.stderr)
         else:
             _al_count = len(allowlist_domains) if allowlist_domains else 0
             print(f"  allowlist.rpz: {_al_count}", file=sys.stderr)
@@ -678,7 +717,7 @@ def _run_per_source(
     # return 0 and let the shell process whatever .db files exist.
     if rendered_zone_count == 0 and (skipped_sources or allowlist_skipped):
         logger.info(
-            "All %d sources unchanged; no zones rendered — exiting with code %d",
+            "All %d sources unchanged; no zones rendered - exiting with code %d",
             len(skipped_sources) + (1 if allowlist_skipped else 0),
             EXIT_NO_CHANGES,
         )

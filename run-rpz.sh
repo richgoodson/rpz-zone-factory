@@ -1,8 +1,8 @@
 #!/bin/sh
-# run-rpz.sh — Cron/interactive wrapper for rpz-zone-factory
+# run-rpz.sh - Cron/interactive wrapper for rpz-zone-factory
 # Version: 0.8.0
 # Portable: Debian, Ubuntu, FreeBSD 13+
-# POSIX sh — no bashisms.
+# POSIX sh - no bashisms.
 #
 # v0.6.0: Incremental zone updates via nsupdate/TSIG for IXFR support.
 #         Zones listed in CONF_INCREMENTAL_ZONES are updated by diffing
@@ -25,6 +25,11 @@
 # Default: directory where this script lives (resolved via symlinks)
 _script_real="$(cd "$(dirname "$0")" && pwd)"
 RPZ_DIR="${RPZ_DIR:-$_script_real}"
+
+# Honor an operator-set RPZ_USER_FEEDS (path to user-feeds.yaml). Exported so
+# the Python userfeeds loader sees it. Absent => default <repo-root>/user-feeds.yaml
+# (or no custom feeds). Deliberately NOT derived from RPZ_DIR (paths decoupled).
+[ -n "${RPZ_USER_FEEDS:-}" ] && export RPZ_USER_FEEDS
 
 # Python binary (must be >= 3.9). Searches PATH if not absolute.
 PYTHON_BIN="${PYTHON_BIN:-python3.11}"
@@ -53,8 +58,8 @@ CONF_OUTPUT_FILE=""     # Output directory (rpz) or file (pihole)
 CONF_SOURCES=""         # Space-separated source list, or empty for all
 CONF_VERBOSITY=""       # 0=quiet, 1=-v, 2=-vv
 CONF_RELOAD=""          # yes or no
-CONF_COMPILE_ZONE=""    # yes or no — use named-compilezone for binary (raw) format
-CONF_CHECKZONE=""       # yes or no — validate with named-checkzone before deploying
+CONF_COMPILE_ZONE=""    # yes or no - use named-compilezone for binary (raw) format
+CONF_CHECKZONE=""       # yes or no - validate with named-checkzone before deploying
 CONF_ALLOWLIST_FILE=""  # path to allowlist file (RPZ output only)
 CONF_TSIG_KEY_FILE=""           # path to TSIG key file for nsupdate (allow.sh + IXFR run-rpz.sh)
 CONF_TRANSFER_TSIG_KEY_FILE=""  # path to TSIG key file for AXFR/IXFR transfers to slaves (optional; least-privilege split)
@@ -84,7 +89,7 @@ fi
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION="0.9.1"
+VERSION="0.10.0"
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 
@@ -216,7 +221,7 @@ prompt_choice() {
         _pc_num=$(( _pc_num + 1 ))
     done
 
-    # Invalid choice — return default
+    # Invalid choice - return default
     _pc_num=1
     for _pc_opt in "$@"; do
         if [ "$_pc_num" = "$_pc_default" ]; then
@@ -301,7 +306,7 @@ categories_menu() {
 
 usage() {
     cat <<USAGE
-run-rpz.sh — Cron/interactive wrapper for rpz-zone-factory v${VERSION}
+run-rpz.sh - Cron/interactive wrapper for rpz-zone-factory v${VERSION}
 
 USAGE:
   ./run-rpz.sh --setup                Interactive setup wizard
@@ -541,7 +546,7 @@ create_venv() {
     # produces a venv without pip. Try once more with an explicit
     # ensurepip call before giving up.
     if ! "$_venv_py" -m pip --version >/dev/null 2>&1; then
-        log_warn "pip missing in new venv — retrying with ensurepip"
+        log_warn "pip missing in new venv - retrying with ensurepip"
         "$_venv_py" -m ensurepip --upgrade --default-pip >/dev/null 2>&1 || true
     fi
     if ! "$_venv_py" -m pip --version >/dev/null 2>&1; then
@@ -700,7 +705,7 @@ discover_python() {
 run_setup() {
     printf "\n"
     printf "╔══════════════════════════════════════════════════════════════╗\n"
-    printf "║         rpz-zone-factory v%-6s — Interactive Setup         ║\n" "$VERSION"
+    printf "║         rpz-zone-factory v%-6s - Interactive Setup         ║\n" "$VERSION"
     printf "╚══════════════════════════════════════════════════════════════╝\n"
     printf "\n"
     printf "This wizard will walk you through configuration, verify your\n"
@@ -774,7 +779,7 @@ run_setup() {
     section_header "Output Configuration"
 
     _def_output="${CONF_OUTPUT:-rpz}"
-    _choice=$(prompt_choice "Output format:" "1" "rpz  — BIND RPZ zone file (RFC 5782)" "pihole — Pi-hole flat blocklist")
+    _choice=$(prompt_choice "Output format:" "1" "rpz  - BIND RPZ zone file (RFC 5782)" "pihole - Pi-hole flat blocklist")
     case "$_choice" in
         rpz*) CONF_OUTPUT="rpz" ;;
         pihole*) CONF_OUTPUT="pihole" ;;
@@ -813,7 +818,7 @@ run_setup() {
             printf "  [OK] Feeds directory exists: %s\n" "$CONF_FEEDS_DIR"
         fi
 
-        # Allowlist file — now lives inside the feeds directory by default
+        # Allowlist file - now lives inside the feeds directory by default
         printf "\n  An allowlist zone (allowlist.rpz) provides BIND-level override\n"
         printf "  for domains that appear in threat zones but should be allowed.\n\n"
         printf "  The allowlist is a plain text file with one domain per line.\n"
@@ -860,10 +865,10 @@ run_setup() {
 
     _def_cats="${CONF_CATEGORIES:-all}"
     if [ -z "$CONF_CATEGORIES" ] && [ -n "$CONF_SOURCES" ] && [ "$CONF_SOURCES" != "all" ]; then
-        # Legacy explicit-source config — surface as default to "all" but
+        # Legacy explicit-source config - surface as default to "all" but
         # warn the operator that re-running --setup will switch them to
         # category-based selection.
-        printf "\n  (Legacy CONF_SOURCES detected — switching to category-based selection.)\n"
+        printf "\n  (Legacy CONF_SOURCES detected - switching to category-based selection.)\n"
         _def_cats="all"
     fi
     _cat_pick=$(categories_menu "$_def_cats")
@@ -889,10 +894,12 @@ run_setup() {
     printf "  EasyPrivacy and skip the noisy AntiMalwareHosts list?\n"
     printf "    Extra:   easyprivacy\n"
     printf "    Exclude: antimalware-hosts\n\n"
-    printf "  This prompt does NOT accept arbitrary URLs — feed sources are\n"
-    printf "  defined in 'rpz_factory/categories.py'. To add a brand-new feed\n"
-    printf "  URL, edit that file (FeedSpec entry) and re-run --setup.\n\n"
-    printf "  Run 'python -m rpz_factory.categories list-feeds' to see them all.\n\n"
+    printf "  This prompt selects from the built-in registry only. To add your\n"
+    printf "  own feed from an arbitrary URL (a plain domain or IPv4 list), put\n"
+    printf "  it in 'user-feeds.yaml' (see README), then run:\n"
+    printf "    python -m rpz_factory.categories validate-feeds\n"
+    printf "  to confirm it loads. List built-in feed keys with:\n"
+    printf "    python -m rpz_factory.categories list-feeds\n\n"
     _def_extra="${CONF_SOURCES_EXTRA:-}"
     CONF_SOURCES_EXTRA=$(prompt_value "Extra feeds to add (blank for none)" "$_def_extra")
     _def_excl="${CONF_SOURCES_EXCLUDE:-}"
@@ -900,6 +907,16 @@ run_setup() {
     # Clear the legacy CONF_SOURCES so build_args_from_config takes the
     # category branch unambiguously. The wizard is the source of truth now.
     CONF_SOURCES=""
+
+    # Advisory: surface any user-feeds.yaml problems during setup. Non-fatal -
+    # bad custom feeds are skipped at run time, built-ins are unaffected. The
+    # wizard's other registry calls discard stderr, so check explicitly here.
+    if ! _uf_out=$(rpz_registry validate-feeds 2>&1); then
+        printf "\n  [!] user-feeds.yaml has problems; these feeds will be SKIPPED:\n"
+        printf '%s\n' "$_uf_out" | sed 's/^/      /'
+        printf "      Built-in feeds still run. Fix and re-check with:\n"
+        printf "        python -m rpz_factory.categories validate-feeds\n"
+    fi
 
     _def_verb="${CONF_VERBOSITY:-0}"
     _verb_choice=$(prompt_choice "Verbosity level:" "1" "Quiet (errors only)" "Info (-v)" "Debug (-vv)")
@@ -971,7 +988,7 @@ run_setup() {
             _rndc_rc=$?
 
             if [ $_rndc_rc -eq 0 ]; then
-                printf "  [OK] rndc status succeeded — you have access\n"
+                printf "  [OK] rndc status succeeded - you have access\n"
             else
                 printf "  [!]  rndc status failed (exit code %d)\n" "$_rndc_rc"
                 printf "    Output: %s\n" "$_rndc_test"
@@ -1007,7 +1024,7 @@ run_setup() {
         printf "  run aborts for that zone.\n\n"
         printf "  If you skip validation, a malformed render would replace the live\n"
         printf "  zone file. Next time BIND tries to load it (reload, restart, etc.)\n"
-        printf "  it'll refuse the zone — which can also bring down the whole\n"
+        printf "  it'll refuse the zone - which can also bring down the whole\n"
         printf "  response-policy unit. Recommended: yes.\n\n"
 
         _def_checkzone="${CONF_CHECKZONE:-yes}"
@@ -1068,10 +1085,10 @@ run_setup() {
         section_header "TSIG Keys"
 
         printf "  TSIG authenticates two distinct paths in this system:\n\n"
-        printf "    1. nsupdate (management) — used by allow.sh for interactive\n"
+        printf "    1. nsupdate (management) - used by allow.sh for interactive\n"
         printf "       allowlist edits, and by run-rpz.sh for IXFR-style\n"
         printf "       incremental zone updates.\n"
-        printf "    2. Zone transfers (AXFR/IXFR) — authenticates slaves that\n"
+        printf "    2. Zone transfers (AXFR/IXFR) - authenticates slaves that\n"
         printf "       pull copies of the zones from this primary.\n\n"
         printf "  You can use a single key for both, or split them. Splitting\n"
         printf "  is the principle-of-least-privilege choice: the key handed\n"
@@ -1196,7 +1213,7 @@ run_setup() {
                     printf "             algorithm hmac-sha256;\n"
                     printf "             secret \"<base64-encoded-secret>\";\n"
                     printf "         };\n\n"
-                    printf "       The transfer key needs the same secret on every slave —\n"
+                    printf "       The transfer key needs the same secret on every slave -\n"
                     printf "       copy %s\n" "$CONF_TRANSFER_TSIG_KEY_FILE"
                     printf "       to each slave's TSIG include path. The nsupdate key\n"
                     printf "       (%s)\n" "$CONF_TSIG_KEY_FILE"
@@ -1253,12 +1270,12 @@ run_setup() {
         # Clear the legacy zone list so resolve_incremental_zones takes
         # the category branch.
         CONF_INCREMENTAL_ZONES=""
-        # nsupdate TTL is hardcoded to 300s — same as the zone default — so
+        # nsupdate TTL is hardcoded to 300s - same as the zone default - so
         # we don't risk creating mixed-TTL zones via dynamic updates.
         CONF_INCREMENTAL_TTL="300"
     else
         if [ "$CONF_OUTPUT" = "rpz" ] && [ -z "$CONF_TSIG_KEY_FILE" ]; then
-            printf "\n  Incremental updates require a TSIG key — disabled.\n"
+            printf "\n  Incremental updates require a TSIG key - disabled.\n"
         fi
         CONF_INCREMENTAL_ZONES=""
         CONF_INCREMENTAL_CATEGORIES=""
@@ -1271,7 +1288,7 @@ run_setup() {
     _conf_file="${RPZ_DIR}/.run-rpz.conf"
 
     cat > "$_conf_file" <<CONF
-# run-rpz.sh configuration — generated by --setup
+# run-rpz.sh configuration - generated by --setup
 # $(date)
 #
 # This file is sourced by run-rpz.sh on startup.
@@ -1307,17 +1324,17 @@ CONF_COMPILE_ZONE="${CONF_COMPILE_ZONE}"
 CONF_ALLOWLIST_FILE="${CONF_ALLOWLIST_FILE}"
 CONF_FEEDS_DIR="${CONF_FEEDS_DIR}"
 
-# Dynamic updates (TSIG) — shared by allow.sh and incremental zone updates
+# Dynamic updates (TSIG) - shared by allow.sh and incremental zone updates
 CONF_TSIG_KEY_FILE="${CONF_TSIG_KEY_FILE}"
 CONF_TRANSFER_TSIG_KEY_FILE="${CONF_TRANSFER_TSIG_KEY_FILE}"
 CONF_ALLOW_SERVER="${CONF_ALLOW_SERVER}"
 CONF_ALLOW_ZONE="${CONF_ALLOW_ZONE}"
 
-# Feed delta logging — per-feed add/del logs for auditing
+# Feed delta logging - per-feed add/del logs for auditing
 CONF_FEED_LOG_DIR="${CONF_FEED_LOG_DIR}"
 CONF_LOG_REBUILDS="${CONF_LOG_REBUILDS}"
 
-# Incremental (IXFR) zone updates — see v0.6.0 release notes
+# Incremental (IXFR) zone updates - see v0.6.0 release notes
 # Preferred: CONF_INCREMENTAL_CATEGORIES (category-based). The legacy
 # CONF_INCREMENTAL_ZONES is honored when CONF_INCREMENTAL_CATEGORIES is empty.
 CONF_INCREMENTAL_CATEGORIES="${CONF_INCREMENTAL_CATEGORIES}"
@@ -1474,7 +1491,7 @@ CONF
         # an IXFR zone (resolved via _EFFECTIVE_INCR_ZONES), include
         # allow-update so run-rpz.sh can deliver IXFR-style incremental
         # updates via nsupdate. The full zone list comes from the
-        # categories registry — it tracks every feed managed by Python.
+        # categories registry - it tracks every feed managed by Python.
         _src_zones=$(rpz_registry list-zones | tr '\n' ' ')
         for _src_zone in $_src_zones; do
             printf "  zone \"%s\" {\n" "$_src_zone"
@@ -1556,7 +1573,7 @@ CONF
         printf "    with 'policy passthru' to override subsequent blocks.\n"
         printf "\n"
         printf "  • RPZ rewrite events (QNAME redirects, NXDOMAIN synthesis, etc.)\n"
-        printf "    are emitted on BIND's default logging channel by default —\n"
+        printf "    are emitted on BIND's default logging channel by default -\n"
         printf "    no extra config required. The stanza below routes them to a\n"
         printf "    dedicated, rotated file so RPZ activity is easier to audit\n"
         printf "    separately from the rest of named.log:\n"
@@ -1625,10 +1642,10 @@ build_args_from_config() {
     fi
 
     # Feed selection. v0.7.0 supports four config keys, in priority order:
-    #   CONF_CATEGORIES        — categories to include (e.g. "malware ads")
-    #   CONF_SOURCES_EXTRA     — extra individual feeds on top of categories
-    #   CONF_SOURCES_EXCLUDE   — feeds to drop from the resolved selection
-    #   CONF_SOURCES (legacy)  — explicit feed list, overrides categories
+    #   CONF_CATEGORIES        - categories to include (e.g. "malware ads")
+    #   CONF_SOURCES_EXTRA     - extra individual feeds on top of categories
+    #   CONF_SOURCES_EXCLUDE   - feeds to drop from the resolved selection
+    #   CONF_SOURCES (legacy)  - explicit feed list, overrides categories
     # When CONF_CATEGORIES is set, --categories + --sources (extra) is passed
     # to Python and resolution happens there. Legacy CONF_SOURCES is still
     # honored for users who haven't re-run --setup.
@@ -1740,8 +1757,8 @@ rpz_registry() {
 }
 
 # Resolve the effective IXFR zone list. Honors (in priority order):
-#   CONF_INCREMENTAL_CATEGORIES — categories whose feeds use IXFR
-#   CONF_INCREMENTAL_ZONES      — explicit zone list (legacy)
+#   CONF_INCREMENTAL_CATEGORIES - categories whose feeds use IXFR
+#   CONF_INCREMENTAL_ZONES      - explicit zone list (legacy)
 # Stores result in _EFFECTIVE_INCR_ZONES (space-separated zone filenames).
 # Always includes allowlist.rpz when any category is selected, since the
 # allowlist always uses the IXFR path (run-rpz.sh treats it specially).
@@ -1809,7 +1826,7 @@ extract_domains_from_zone() {
             # Check the suffix matches
             if (substr(name, n + 2) != zs) next
             bare = substr(name, 1, n)
-            # Skip wildcard twins — we only want one row per domain
+            # Skip wildcard twins - we only want one row per domain
             if (substr(bare, 1, 2) == "*.") next
             print bare
         }
@@ -1829,7 +1846,7 @@ build_nsupdate_batch() {
     _ttl="${CONF_INCREMENTAL_TTL:-300}"
     _server="${CONF_ALLOW_SERVER:-127.0.0.1}"
 
-    # Domain names ending in ".rpz-ip" are IP triggers — they never have
+    # Domain names ending in ".rpz-ip" are IP triggers - they never have
     # a wildcard twin in the rendered zone, so skip emitting one.
     _emit_update() {
         _op="$1"          # "add" or "delete"
@@ -1856,7 +1873,7 @@ build_nsupdate_batch() {
         printf 'server %s\n' "$_server"
         printf 'zone %s\n' "$_zone"
 
-        # Deletions first — if a domain is re-added we want the delete+add to
+        # Deletions first - if a domain is re-added we want the delete+add to
         # register as a net change in the journal.
         if [ -s "$_dels" ]; then
             while IFS= read -r _d; do
@@ -2073,7 +2090,7 @@ apply_nsupdate_chunked() {
 # ${CONF_FEED_LOG_DIR}/<zone>.log.
 #
 # Feed logs always record individual domains (+domain / -domain) regardless
-# of CONF_VERBOSITY — they are an audit trail, not console output.
+# of CONF_VERBOSITY - they are an audit trail, not console output.
 # CONF_VERBOSITY controls only the no-op case:
 #   0 = no-op runs are not logged (the log only shows actual changes)
 #   1+= no-op runs get a single "no-changes" line
@@ -2088,7 +2105,7 @@ log_feed_delta() {
     _lfd_add_count="$5"
     _lfd_del_count="$6"
 
-    # Resolve log directory — default is a sibling "log" dir next to CONF_FEEDS_DIR
+    # Resolve log directory - default is a sibling "log" dir next to CONF_FEEDS_DIR
     _lfd_dir="${CONF_FEED_LOG_DIR}"
     if [ -z "$_lfd_dir" ] && [ -n "$CONF_FEEDS_DIR" ]; then
         _lfd_dir="$(dirname "$CONF_FEEDS_DIR")/log"
@@ -2116,7 +2133,7 @@ log_feed_delta() {
     # Summary line
     printf '%s %s +%s -%s\n' "$_lfd_ts" "$_lfd_action" "$_lfd_add_count" "$_lfd_del_count" >> "$_lfd_log"
 
-    # Individual domains — always written for actual changes
+    # Individual domains - always written for actual changes
     if [ -n "$_lfd_adds_file" ] && [ -s "$_lfd_adds_file" ]; then
         sed "s/^/${_lfd_ts} +/" "$_lfd_adds_file" >> "$_lfd_log"
     fi
@@ -2131,15 +2148,15 @@ log_feed_delta() {
 #
 # Returns:
 #   0 = success (nsupdate applied or no-op)
-#   1 = fatal — caller should fall back to full rebuild for this zone
-#   2 = seed required — .previous missing, caller should full-rebuild and seed
+#   1 = fatal - caller should fall back to full rebuild for this zone
+#   2 = seed required - .previous missing, caller should full-rebuild and seed
 run_incremental_for_zone() {
     _zone="$1"
     _new_db="$2"
 
     _feeds_dir="${CONF_FEEDS_DIR}"
     if [ -z "$_feeds_dir" ]; then
-        log_err "CONF_FEEDS_DIR is not set — cannot run incremental update for $_zone"
+        log_err "CONF_FEEDS_DIR is not set - cannot run incremental update for $_zone"
         return 1
     fi
 
@@ -2156,7 +2173,7 @@ run_incremental_for_zone() {
     # Seed path: no previous snapshot, caller should full-rebuild and then
     # write <zone>.list.previous from the rendered .db.
     if [ ! -f "$_prev" ]; then
-        log_info "Incremental: no previous snapshot for $_zone — seed required"
+        log_info "Incremental: no previous snapshot for $_zone - seed required"
         return 2
     fi
 
@@ -2185,7 +2202,7 @@ run_incremental_for_zone() {
     _sync_rc=$?
     if [ $_sync_rc -ne 0 ]; then
         log_warn "Incremental[$_zone]: rndc sync failed ($_sync_rc): $_sync_output"
-        # Not fatal — nsupdate can still proceed, diff may just be noisier.
+        # Not fatal - nsupdate can still proceed, diff may just be noisier.
     fi
 
     # Extract fresh domain list from the new zone
@@ -2199,7 +2216,7 @@ run_incremental_for_zone() {
     _old_count=$(wc -l < "$_prev" | tr -d ' ')
 
     if [ "$_new_count" = "0" ]; then
-        log_warn "Incremental[$_zone]: extracted zero domains from new zone — skipping (kept .previous)"
+        log_warn "Incremental[$_zone]: extracted zero domains from new zone - skipping (kept .previous)"
         rm -f "$_curr"
         return 1
     fi
@@ -2216,7 +2233,7 @@ run_incremental_for_zone() {
 
     log_info "Incremental[$_zone]: prev=$_old_count curr=$_new_count adds=$_add_count dels=$_del_count"
 
-    # No changes — no-op, keep .previous as-is, discard .current
+    # No changes - no-op, keep .previous as-is, discard .current
     if [ "$_add_count" = "0" ] && [ "$_del_count" = "0" ]; then
         log_info "Incremental[$_zone]: no changes, skipping nsupdate"
         log_feed_delta "$_zone" "no-changes" "" "" "0" "0"
@@ -2224,7 +2241,7 @@ run_incremental_for_zone() {
         return 0
     fi
 
-    # Feed delta log — only when there are actual changes
+    # Feed delta log - only when there are actual changes
     log_feed_delta "$_zone" "incremental" "$_adds" "$_dels" "$_add_count" "$_del_count"
 
     # Apply: chunker handles single-batch fast path and oversized splits.
@@ -2299,7 +2316,7 @@ seed_feed_snapshot() {
 
     log_info "Seed[$_zone]: saved baseline snapshot ($_count domains)"
 
-    # Feed delta log — all domains are new in a seed
+    # Feed delta log - all domains are new in a seed
     log_feed_delta "$_zone" "seed" "$_prev" "" "$_count" "0"
 
     return 0
@@ -2347,7 +2364,7 @@ run_rpz() {
         _need_force=0
         for _iz in $_EFFECTIVE_INCR_ZONES; do
             if [ ! -f "${CONF_FEEDS_DIR}/${_iz}.list.previous" ]; then
-                log_info "Seed-gap: ${_iz} has no .list.previous — adding --force"
+                log_info "Seed-gap: ${_iz} has no .list.previous - adding --force"
                 _need_force=1
             fi
         done
@@ -2361,7 +2378,7 @@ run_rpz() {
         return 1
     fi
 
-    # Check venv — create if missing
+    # Check venv - create if missing
     if ! check_venv; then
         log_info "Venv not ready, attempting auto-setup..."
         if ! create_venv; then
@@ -2399,7 +2416,7 @@ run_rpz() {
     # rendered" (the v0.7.0 fast-path). Treat as a successful no-op and skip
     # the entire post-processing pipeline (validation, IXFR, reload, seed).
     if [ $EXIT_CODE -eq 2 ]; then
-        log_info "rpz-zone-factory: no upstream changes — skipping post-processing"
+        log_info "rpz-zone-factory: no upstream changes - skipping post-processing"
         return 0
     fi
 
@@ -2426,7 +2443,7 @@ run_rpz() {
         mkdir -p "$CONF_OUTPUT_FILE"
 
         if [ ! -d "$_tmp_dir" ]; then
-            log_err "Temp directory missing: $_tmp_dir — aborting"
+            log_err "Temp directory missing: $_tmp_dir - aborting"
             return 1
         fi
 
@@ -2434,7 +2451,7 @@ run_rpz() {
         if [ "$CONF_CHECKZONE" = "yes" ]; then
             _checkzone_bin=$(find_named_tool "named-checkzone")
             if [ -z "$_checkzone_bin" ]; then
-                log_warn "named-checkzone not found — skipping validation"
+                log_warn "named-checkzone not found - skipping validation"
             fi
         fi
 
@@ -2442,7 +2459,7 @@ run_rpz() {
         if [ "$CONF_COMPILE_ZONE" = "yes" ]; then
             _compilezone_bin=$(find_named_tool "named-compilezone")
             if [ -z "$_compilezone_bin" ]; then
-                log_warn "named-compilezone not found — will use text format"
+                log_warn "named-compilezone not found - will use text format"
             fi
         fi
 
@@ -2478,7 +2495,34 @@ run_rpz() {
             _valid_zones="${_valid_zones} ${_zone_name}"
         done
 
-        # Phase 2: sort valid zones into two buckets — incremental and full.
+        # Phase 1b: unconfigured-zone preflight (provisioning visibility).
+        #
+        # A freshly rendered zone whose name is not yet in named.conf still gets
+        # its .db staged by the full-rebuild path below (so it is ready for first
+        # load), but BIND will not serve it until the operator adds the zone block
+        # and runs 'rndc reconfig'. For such a zone the freeze/reload attempts
+        # fail harmlessly with per-zone warnings; this block turns that into one
+        # consolidated, actionable message so a new user feed never silently fails
+        # to take effect. Read-only ('rndc zonestatus' only queries). Only runs
+        # when we are actually deploying to BIND (DO_RELOAD=1).
+        #
+        # Caveat: if rndc itself is broken, every zone looks "unconfigured" - but
+        # in that case the whole reload path is already failing loudly elsewhere.
+        _unconfigured_zones=""
+        if [ $DO_RELOAD -eq 1 ]; then
+            for _zone_name in $_valid_zones; do
+                if ! $RNDC_BIN zonestatus "$_zone_name" >/dev/null 2>&1; then
+                    _unconfigured_zones="${_unconfigured_zones} ${_zone_name}"
+                fi
+            done
+        fi
+        if [ -n "$_unconfigured_zones" ]; then
+            log_warn "user-feeds: rendered but NOT served by BIND (no named.conf zone):${_unconfigured_zones}"
+            log_warn "  -> add the zone block(s) and run 'rndc reconfig' to activate."
+            log_warn "     Re-run '$0 --setup' to re-emit the named.conf, or use 'rpz_factory.categories bind-config'."
+        fi
+
+        # Phase 2: sort valid zones into two buckets - incremental and full.
         _incremental_bucket=""
         _full_bucket=""
         for _zone_name in $_valid_zones; do
@@ -2498,14 +2542,14 @@ run_rpz() {
 
             # Needs TSIG configuration
             if [ -z "$CONF_TSIG_KEY_FILE" ] || [ ! -f "$CONF_TSIG_KEY_FILE" ]; then
-                log_warn "Incremental[$_zone_name]: TSIG key missing — falling back to full rebuild"
+                log_warn "Incremental[$_zone_name]: TSIG key missing - falling back to full rebuild"
                 _full_bucket="${_full_bucket} ${_zone_name}"
                 continue
             fi
 
             # Needs .previous snapshot (otherwise it's a seed → full rebuild)
             if [ -z "$CONF_FEEDS_DIR" ] || [ ! -f "${CONF_FEEDS_DIR}/${_zone_name}.list.previous" ]; then
-                log_info "Incremental[$_zone_name]: no previous snapshot — seeding via full rebuild"
+                log_info "Incremental[$_zone_name]: no previous snapshot - seeding via full rebuild"
                 _full_bucket="${_full_bucket} ${_zone_name}"
                 continue
             fi
@@ -2513,7 +2557,7 @@ run_rpz() {
             _incremental_bucket="${_incremental_bucket} ${_zone_name}"
         done
 
-        # Phase 3: incremental zones — apply while BIND is live.
+        # Phase 3: incremental zones - apply while BIND is live.
         # On nsupdate failure, push the zone into the full-rebuild bucket.
         _incr_applied_count=0
         for _zone_name in $_incremental_bucket; do
@@ -2531,7 +2575,7 @@ run_rpz() {
                     # including the nsupdate deltas and the bumped serial.
                     #
                     # Do NOT overwrite the .db with our freshly Python-rendered
-                    # copy from .tmp — it has a stale Python-computed serial
+                    # copy from .tmp - it has a stale Python-computed serial
                     # (hour-based) that would regress BIND's state and produce
                     # "serial has gone backwards" errors, potentially breaking
                     # IXFR for secondaries.
@@ -2543,23 +2587,23 @@ run_rpz() {
                     log_info "Incremental[$_zone_name]: BIND owns the .db file; skipping post-copy"
                     ;;
                 2)
-                    # Seed required — shouldn't happen (we pre-checked .previous
+                    # Seed required - shouldn't happen (we pre-checked .previous
                     # above) but handle defensively by routing to full rebuild.
-                    log_info "Incremental[$_zone_name]: seed required at apply time — routing to full rebuild"
+                    log_info "Incremental[$_zone_name]: seed required at apply time - routing to full rebuild"
                     _full_bucket="${_full_bucket} ${_zone_name}"
                     ;;
                 *)
-                    log_warn "Incremental[$_zone_name]: failed — falling back to full rebuild"
+                    log_warn "Incremental[$_zone_name]: failed - falling back to full rebuild"
                     _full_bucket="${_full_bucket} ${_zone_name}"
                     ;;
             esac
         done
 
-        # Phase 4+5: full-rebuild zones — per-zone freeze/replace/thaw.
+        # Phase 4+5: full-rebuild zones - per-zone freeze/replace/thaw.
         #
         # For each zone in the full bucket we:
         #   1. Try `rndc freeze <zone>`. Success (or "already frozen") means
-        #      the zone is dynamic — we'll thaw it at the end to re-read the
+        #      the zone is dynamic - we'll thaw it at the end to re-read the
         #      file synchronously. "not dynamic" means it's a static zone and
         #      we'll use `rndc reload <zone>` instead.
         #   2. Stage the new .db to <final>.new.$$, atomic mv into place.
@@ -2614,7 +2658,7 @@ run_rpz() {
                     case "$_freeze_output" in
                         *"already frozen"*)
                             _is_dynamic=1
-                            log_warn "rndc freeze $_zone_name: already frozen — proceeding"
+                            log_warn "rndc freeze $_zone_name: already frozen - proceeding"
                             ;;
                         *"not dynamic"*|*"not a dynamic"*)
                             _is_dynamic=0
@@ -2627,7 +2671,7 @@ run_rpz() {
 
                 # Stage to <final>.new.$$ first, then atomic rename. This
                 # only needs dir-write permission, not write access to the
-                # existing file — important because BIND may own a zone file
+                # existing file - important because BIND may own a zone file
                 # after dynamic update journal flushes.
                 if [ -n "$_compilezone_bin" ]; then
                     log_info "Compiling $_zone_name to raw format..."
@@ -2668,7 +2712,7 @@ run_rpz() {
                     continue
                 fi
 
-                # Remove any orphaned journal — for dyn zones the freeze
+                # Remove any orphaned journal - for dyn zones the freeze
                 # ensures no writer holds it; for static zones it shouldn't
                 # exist in the first place.
                 _jnl_file="${_final_file}.jnl"
@@ -2709,7 +2753,7 @@ run_rpz() {
 
         # Phase 6: seed feed snapshots for every zone that took the full path
         # AND is configured as incremental. This gives the next scheduled run
-        # a baseline to diff against — how a zone transitions from seed to
+        # a baseline to diff against - how a zone transitions from seed to
         # incremental. Extract from the text .db in .tmp (compilezone does
         # not consume its input so the file is still there).
         if [ -n "$CONF_FEEDS_DIR" ]; then
@@ -2736,6 +2780,23 @@ run_rpz() {
         done
 
         log_info "Per-source run complete: zones=$_total_zones incremental=$_incr_applied_count full=$_full_count"
+
+        # Per-run orphan summary (provisioning visibility): live zone files or
+        # feed snapshots no longer backed by the registry - e.g. left behind when
+        # a user feed was removed from user-feeds.yaml. Read-only; never deletes.
+        # Teardown stays manual (see README).
+        if [ -n "$CONF_FEEDS_DIR" ]; then
+            _orphans=$(rpz_registry list-orphans --zone-dir "$CONF_OUTPUT_FILE" --feeds-dir "$CONF_FEEDS_DIR" 2>/dev/null)
+        else
+            _orphans=$(rpz_registry list-orphans --zone-dir "$CONF_OUTPUT_FILE" 2>/dev/null)
+        fi
+        if [ -n "$_orphans" ]; then
+            log_warn "user-feeds: live zones/snapshots no longer backed by the registry (orphans):"
+            printf '%s\n' "$_orphans" | while IFS= read -r _orphan; do
+                [ -n "$_orphan" ] && log_warn "  $_orphan"
+            done
+            log_warn "  -> if a feed was removed: delete its named.conf block, 'rndc reconfig', then remove the file(s)."
+        fi
 
         if [ $_any_failed -eq 1 ]; then
             return 1

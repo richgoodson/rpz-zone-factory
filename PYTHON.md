@@ -179,12 +179,60 @@ The feed/category registry has its own small CLI. The shell wrapper (`run-rpz.sh
 | `resolve --categories ... --extra ... --exclude ...` | apply the same selection logic the wizard uses, print resulting feed keys (or zones with `--as-zones`) |
 | `zone-for FEED` / `category-for FEED` | single-feed lookup |
 | `bind-config [--categories ...] [--zone-dir ...] [--tsig-key ...]` | emit `named.conf` zone blocks and a response-policy stanza for the selected zones. See [README.md](README.md#bind-configuration) for the operator walkthrough. |
+| `validate-feeds` | strictly validate `user-feeds.yaml`; print every problem and exit non-zero if any (see below) |
+| `list-orphans --zone-dir DIR [--feeds-dir DIR]` | print live zone files / feed snapshots no longer backed by the registry; exit non-zero if any. Read-only, never deletes |
+
+## User-supplied feeds (`user-feeds.yaml`)
+
+Operators can add feeds without editing the package. `rpz_factory/userfeeds.py`
+loads and validates an optional `user-feeds.yaml`; `categories.py` merges the
+valid feeds into `REGISTRY` at import time, so they flow through every
+registry-derived path (`cli.py`'s source maps, the shell's category expansion,
+`bind-config`) with no further wiring. See [README.md](README.md#adding-your-own-feeds)
+for the YAML schema and the BIND activation/removal walkthrough; this section is
+the engine-level reference.
+
+**Path resolution.** `RPZ_USER_FEEDS` if set, else `<repo-root>/user-feeds.yaml`.
+Deliberately not derived from `RPZ_DIR` (the two are decoupled). A missing file
+means no custom feeds and zero behavior change.
+
+**Identity: `SourceRef`, not a dynamic enum.** A built-in feed's `ThreatEntry`
+carries a `SourceName` enum member; a user feed carries a
+`SourceRef("user_<key>")` value object (`models.py`). Both expose `.value`, the
+only attribute any consumer reads (cache filenames, log lines, the per-source
+grouping in `cli.py`), so the two are interchangeable everywhere. This avoids
+extending the `SourceName` enum at import time and keeps `models.py` import-pure,
+so a malformed config can never make the package unimportable.
+
+**Validation (one pass, `userfeeds.load_user_feeds`).** Structural checks first
+(key DNS-safe `^[a-z0-9][a-z0-9-]*$`, no duplicate key in the file, `kind` in
+`{domain, ip}`, `url` scheme http/https), then cross-reference against the
+built-in registry (`category` known; key not colliding with a built-in key or
+`allowlist`; derived zone `<key>.<category>.rpz` not colliding with a built-in
+zone or an earlier user feed). `categories.py` owns those registry facts and
+passes them in, so `userfeeds.py` imports nothing from the package.
+
+**Two kinds.** `domain` reuses `parsers/plaintext.parse_text`; `ip` uses
+`parse_ip_text` (IPv4 only; IPv6 and unparseable lines are dropped and counted).
+The IP drop-count log escalates from INFO to **WARNING when drops exceed kept**
+entries, so a feed that collapses to a near-empty zone is loud at the default
+log level.
+
+**Graceful degradation (decision: never take down the built-in pipeline).** A
+per-feed error drops just that feed; a file-level error (unparseable YAML, wrong
+top-level shape) drops all custom feeds. Either way the built-ins still run and
+the issues are recorded in `categories.USER_FEED_ISSUES`. Both entry points
+surface them: `cli.main` logs the summary at WARNING, and the
+`categories` module CLI prints the same line to stderr on every subcommand
+except `validate-feeds` (which prints its own richer report). For deliberate
+checking, `validate-feeds` re-runs validation in strict mode and exits non-zero
+on any problem.
 
 ## Adding a new source
 
 1. Add a parser in `rpz_factory/parsers/`: takes raw bytes/text, returns a list of `ThreatEntry` objects. For plain-domain or hosts-file feeds you may not need a new parser at all: `parsers/plaintext.py` is generic; pass its `make_fetcher(url, source_enum, label=...)` factory into `SOURCE_FETCHERS` in `cli.py`.
 2. Add a `SourceName` enum value in `rpz_factory/models.py`.
-3. Add a `FeedSpec` entry to `_FEEDS` in `rpz_factory/categories.py` (`key`, `zone`, `category`, `enum_value`, `url`). The constants in `cli.py` (`ALL_SOURCES`, `SOURCE_ZONE_NAMES`, `_SOURCE_URLS`, `_SOURCE_KEY_TO_NAME`, `_SOURCE_NAME_TO_KEY`) are derived from `REGISTRY` at import time, so no edits there are needed for those.
+3. Add a `FeedSpec` entry to `_BUILTIN_FEEDS` in `rpz_factory/categories.py` (`key`, `zone`, `category`, `enum_value`, `url`, and optional `kind` which defaults to `"domain"`). User feeds from `user-feeds.yaml` are appended to `_BUILTIN_FEEDS` to form `_FEEDS`; this step is only for built-in feeds. The constants in `cli.py` (`ALL_SOURCES`, `SOURCE_ZONE_NAMES`, `_SOURCE_URLS`, `_SOURCE_KEY_TO_NAME`, `_SOURCE_NAME_TO_KEY`) are derived from `REGISTRY` at import time, so no edits there are needed for those.
 4. Wire the parser callable into `SOURCE_FETCHERS` in `rpz_factory/cli.py` keyed by feed key. This dict is still hand-maintained because parser callables vary in signature (some are `fetch_and_parse`, some are `plaintext.make_fetcher(...)` factories).
 5. Add the feed to the sources table in `README.md`.
 6. If it should participate in incremental updates, its category should be in `CONF_INCREMENTAL_CATEGORIES` (preferred) or its zone filename in the legacy `CONF_INCREMENTAL_ZONES`. Regenerate the `named.conf` snippet so the new zone has `allow-update`:
