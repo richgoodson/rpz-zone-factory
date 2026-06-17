@@ -152,16 +152,18 @@ def render(
             # trailing zero octets reduces the implied bit count to equal the
             # prefix length, leaving zero host bits, which BIND rejects with
             # "too small prefix length".
-            # Also skip overly broad prefixes (< /24) which BIND rejects by default.
+            # BIND accepts rpz-ip prefixes /1-/32, so there is no lower bound on
+            # how broad a block may be. The one exception is /0: rpz-ip has no
+            # encoding for a zero-length prefix (split into two /1s upstream if
+            # you truly need to match everything), so drop it rather than emit a
+            # record BIND will reject at zone load.
             cidr = entry.normalized_value()
             if "/" in cidr:
                 network, prefix_str = cidr.split("/", 1)
                 prefix_len = int(prefix_str)
-                if prefix_len < 24:
+                if prefix_len < 1:
                     logger.debug(
-                        "Skipping CIDR %s: prefix /%d is below BIND RPZ minimum of /24",
-                        cidr,
-                        prefix_len,
+                        "Skipping CIDR %s: rpz-ip cannot encode a /0 prefix", cidr
                     )
                     continue
                 octets = network.split(".")
