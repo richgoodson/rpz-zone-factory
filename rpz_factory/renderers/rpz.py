@@ -24,7 +24,7 @@ _SERIAL_LINE_RE = re.compile(r"^\s*(\d+)\s*;\s*serial\b", re.IGNORECASE)
 def read_serial_from_zone_file(path: str) -> int | None:
     """Return the SOA serial from a text RPZ zone file, or None if unreadable.
 
-    Only reads the first ~50 lines — the SOA is always near the top. Returns
+    Only reads the first ~50 lines - the SOA is always near the top. Returns
     None for missing files, unparseable files, or binary (raw) zone files
     where the SOA is not ASCII text.
     """
@@ -81,7 +81,7 @@ def compute_next_serial(existing_path: str | None = None) -> int:
     if existing_date < today_date:
         return today_base
 
-    # Same day or future (BIND bumped past us) — always return existing+1.
+    # Same day or future (BIND bumped past us) - always return existing+1.
     return existing + 1
 
 
@@ -148,7 +148,7 @@ def render(
 
         elif entry.entry_type == EntryType.CIDR:
             # RPZ IP-trigger CIDR: <prefix-len>.<reversed-network>.rpz-ip
-            # All 4 octets must be included in the reversed address — stripping
+            # All 4 octets must be included in the reversed address - stripping
             # trailing zero octets reduces the implied bit count to equal the
             # prefix length, leaving zero host bits, which BIND rejects with
             # "too small prefix length".
