@@ -1,9 +1,12 @@
-"""Parser for Spamhaus DROP, EDROP, and DBL feeds.
+"""Parser for Spamhaus DROP and DBL feeds.
 
-DROP/EDROP are CIDR-based IP blocklists. Each line is:
+DROP is a CIDR-based IP blocklist. Each line is:
     <cidr> ; <SBL-id>
 
 DBL is a domain blocklist (one domain per line with comments).
+
+(Spamhaus retired EDROP in 2024, folding its entries into DROP, so there is no
+separate EDROP feed here.)
 """
 
 from __future__ import annotations
@@ -18,10 +21,9 @@ from rpz_factory.models import EntryType, FetchResult, HttpMeta, SourceName, Thr
 logger = logging.getLogger(__name__)
 
 DROP_URL = "https://www.spamhaus.org/drop/drop.txt"
-EDROP_URL = "https://www.spamhaus.org/drop/edrop.txt"
 DBL_URL = "https://www.spamhaus.org/drop/dbl.txt"
 
-# DROP/EDROP line format: 1.2.3.0/24 ; SBLxxxxxx
+# DROP line format: 1.2.3.0/24 ; SBLxxxxxx
 _DROP_LINE_RE = re.compile(r"^(\d+\.\d+\.\d+\.\d+/\d+)\s*;\s*(\S+)")
 
 # DBL line: domain.tld  (may have trailing comment after ;)
@@ -29,7 +31,7 @@ _DBL_LINE_RE = re.compile(r"^([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})\s*(?:;.*)?$")
 
 
 def _parse_drop_text(text: str, source: SourceName) -> FetchResult:
-    """Parse DROP or EDROP format text into CIDR entries."""
+    """Parse DROP format text into CIDR entries."""
     result = FetchResult(source=source)
     seen: set[str] = set()
 
@@ -84,26 +86,6 @@ def fetch_drop(
     result = _parse_drop_text(text, SourceName.SPAMHAUS_DROP)
     logger.info(
         "Spamhaus DROP: parsed %d CIDR entries from %d lines",
-        len(result.entries),
-        result.raw_count,
-    )
-    return result
-
-
-def fetch_edrop() -> FetchResult:
-    """Fetch and parse Spamhaus EDROP list."""
-    result = FetchResult(source=SourceName.SPAMHAUS_EDROP)
-    try:
-        text = fetch_url(EDROP_URL)
-        assert isinstance(text, str)
-    except Exception as exc:
-        logger.error("Failed to fetch Spamhaus EDROP: %s", exc)
-        result.error = str(exc)
-        return result
-
-    result = _parse_drop_text(text, SourceName.SPAMHAUS_EDROP)
-    logger.info(
-        "Spamhaus EDROP: parsed %d CIDR entries from %d lines",
         len(result.entries),
         result.raw_count,
     )

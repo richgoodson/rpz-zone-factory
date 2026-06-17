@@ -16,7 +16,6 @@ class SourceName(enum.Enum):
     ABUSECH_URLHAUS = "abusech_urlhaus"
     CISA_KEV = "cisa_kev"
     SPAMHAUS_DROP = "spamhaus_drop"
-    SPAMHAUS_EDROP = "spamhaus_edrop"
     SPAMHAUS_DBL = "spamhaus_dbl"
     SCAMSNIFFER = "scamsniffer"
     CRYPTOSCAMDB = "cryptoscamdb"
