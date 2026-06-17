@@ -353,7 +353,8 @@ ttl, soa_*)`. Output is text with:
   - `DOMAIN` → `<domain>.<zone>. CNAME .` + `*.<domain>.<zone>. CNAME .`
   - `IP` → `32.<reversed-ip>.rpz-ip.<zone>. CNAME .`
   - `CIDR` → `<prefix>.<reversed-network>.rpz-ip.<zone>. CNAME .`
-    (prefixes <24 skipped: BIND RPZ minimum)
+    (all 4 octets always included; /1-/32 emitted, only /0 skipped since
+    rpz-ip has no zero-length-prefix encoding)
 
 **Important for the shell layer:** the extractor in `run-rpz.sh` parses the
 exact format this renderer produces. Specifically, it expects:
