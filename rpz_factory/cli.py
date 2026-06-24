@@ -374,6 +374,17 @@ def main(argv: list[str] | None = None) -> int:
 
             if result.not_modified:
                 # 304 - use cached entries
+                #
+                # ponytail: this eager cache load is wasted on a steady-state
+                # all-304 run, where _run_per_source skips every zone whose live
+                # .db already exists and never touches these entries. Accepted:
+                # no-op runs are network-bound (13 sequential conditional GETs
+                # dominate wall-clock), so deserializing the caches costs CPU and
+                # transient memory but not latency. The cache is genuinely needed
+                # only when a 304 source's live zone is missing (seed case). To
+                # eliminate the waste, defer load_cache() into _run_per_source so
+                # it runs only for zones that actually render - revisit if CPU or
+                # peak memory on no-op runs ever becomes a concern.
                 logger.info("Source %s: not modified (304), using cache", source_key)
                 not_modified_sources.append(source_key)
                 if source_enum_value:
