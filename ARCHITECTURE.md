@@ -1020,12 +1020,15 @@ mkdir -p /tmp/rpz-test
 On the remote BIND host:
 
 ```sh
-# rsync from your dev machine (excluding venv, cache, IDE state, secrets):
+# rsync from your dev machine (excluding venv, cache, IDE state, secrets,
+# and local agent/dev tooling that has no place on the BIND host):
 rsync -avz --exclude='.git/' --exclude='.venv/' --exclude='.cache/' \
   --exclude='__pycache__/' --exclude='*.pyc' \
   --exclude='.run-rpz.conf' --exclude='allow-audit.log' \
   --exclude='*.rpz.db' --exclude='*.rpz' \
   --exclude='.claude/' --exclude='.DS_Store' \
+  --exclude='.agents/' --exclude='.firecrawl/' \
+  --exclude='.pytest_cache/' --exclude='skills-lock.json' \
   ./ bind-host:~/rpz-zone-factory/
 
 # Then on the BIND host:
