@@ -1781,12 +1781,18 @@ incremental_cname_target() {
 # `python -m rpz_factory.categories`. Falls back to PYTHON_BIN if the
 # venv hasn't been created yet (relevant during --setup before deps are
 # installed).
+#
+# Runs from RPZ_DIR (in a subshell) so `python -m rpz_factory.categories`
+# can import the package. `-m` resolves the module from the current working
+# directory, NOT from the interpreter's location, so without the cd a cron
+# run (whose CWD is $HOME, not the repo) fails the import, returns nothing,
+# and silently disables the incremental/IXFR path for every zone.
 rpz_registry() {
     _vpy="${RPZ_DIR}/${VENV_NAME}/bin/python"
     if [ -x "$_vpy" ]; then
-        "$_vpy" -m rpz_factory.categories "$@"
+        ( cd "$RPZ_DIR" && "$_vpy" -m rpz_factory.categories "$@" )
     else
-        "$PYTHON_BIN" -m rpz_factory.categories "$@" 2>/dev/null
+        ( cd "$RPZ_DIR" && "$PYTHON_BIN" -m rpz_factory.categories "$@" ) 2>/dev/null
     fi
 }
 
@@ -1803,6 +1809,12 @@ resolve_incremental_zones() {
         if [ -n "$_expanded" ]; then
             _EFFECTIVE_INCR_ZONES="allowlist.rpz $_expanded"
         else
+            # Categories are configured but expansion yielded nothing - the
+            # registry call failed (e.g. broken venv) rather than legitimately
+            # returning zero zones. Warn loudly: silently degrading to the
+            # (usually empty) legacy list disables the incremental/IXFR path for
+            # every zone, and every secondary falls back to full AXFR.
+            log_warn "resolve_incremental_zones: CONF_INCREMENTAL_CATEGORIES set but registry returned no zones; IXFR likely disabled this run (falling back to CONF_INCREMENTAL_ZONES)"
             _EFFECTIVE_INCR_ZONES="$CONF_INCREMENTAL_ZONES"
         fi
     else
