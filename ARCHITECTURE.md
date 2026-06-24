@@ -878,7 +878,7 @@ Safe to delete at any time; next run will re-fetch and rebuild.
 - **v0.7.0**: 304-aware fast-path. When every requested source returns
   `304 Not Modified`, run-rpz.sh exits in a few seconds without running
   the full pipeline. RPZ output skips zones individually; Pi-hole (then
-  also combined RPZ, removed in v0.8.0) exits with code 2 when every
+  also combined RPZ, removed in v0.8.0) exits with code 3 when every
   source returned 304. Category-based selection introduced
   (`CONF_CATEGORIES`, `CONF_INCREMENTAL_CATEGORIES`,
   `CONF_SOURCES_EXTRA`, `CONF_SOURCES_EXCLUDE`). New `--force` flag to

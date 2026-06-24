@@ -87,16 +87,17 @@ Run `python run.py --help` for the canonical list. Current flags:
 |------|---------|
 | `0` | Success (output written) |
 | `1` | Error |
-| `2` | Success but no output written (all sources returned 304: the v0.7.0 fast-path) |
+| `2` | Usage error (bad/unknown CLI flag: argparse's standard exit) |
+| `3` | Success but no output written (all sources returned 304: the v0.7.0 fast-path) |
 
-Exit code `2` only applies to Pi-hole output. RPZ output handles the fast-path per zone (see below) and exits `0` even when every zone was skipped.
+Exit code `3` only applies to Pi-hole output. RPZ output handles the fast-path per zone (see below) and exits `0` even when every zone was skipped. Code `2` is reserved for argparse usage errors and is deliberately kept distinct from the no-output fast-path so a malformed argument never masquerades as a clean no-op.
 
 ## Conditional HTTP and the fast-path
 
 Every HTTP feed is fetched with `If-Modified-Since` / `ETag` headers. HTTP metadata is persisted to `.cache/*.meta.json` between runs. On a 304 response, the engine:
 
 - **For RPZ output:** skips the entire render pipeline (parse, filter, dedup, render) for any zone whose source returned 304 with no error, *provided the live `.db` already exists on disk*. Zones whose source returned new content still render normally on the same run.
-- **For Pi-hole output:** if every requested source returned 304 *and* the live blocklist file exists, the engine exits with code 2 without writing anything. Any source returning real content forces a full render.
+- **For Pi-hole output:** if every requested source returned 304 *and* the live blocklist file exists, the engine exits with code 3 without writing anything. Any source returning real content forces a full render.
 - **Allowlist:** the allowlist source is a local text file, not HTTP. The engine compares `allowlist.txt` mtime against the live `allowlist.rpz.db` mtime and skips the allowlist render if the text file is older.
 
 Pass `--force` to bypass all of this and always render. Use after manual zone edits or when debugging.

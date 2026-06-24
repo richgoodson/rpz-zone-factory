@@ -1,6 +1,6 @@
 #!/bin/sh
 # run-rpz.sh - Cron/interactive wrapper for rpz-zone-factory
-# Version: 0.8.0
+# Version: 0.10.0
 # Portable: Debian, Ubuntu, FreeBSD 13+
 # POSIX sh - no bashisms.
 #
@@ -98,8 +98,28 @@ DO_SETUP=0
 DO_RELOAD=0        # set by run_rpz when CONF_RELOAD=yes; gates per-zone freeze/reload/thaw
 DO_FULL_REBUILD=0  # force full rebuild path even for incremental zones
 DO_FORCE=0         # bypass v0.7.0 "all sources unchanged" fast-path
+# RPZ_ARGS holds the arguments passed to run.py, ONE ARGUMENT PER LINE
+# (newline-delimited). This preserves argument boundaries - a path with a
+# space in it stays a single argument - which a space-joined string cannot.
+# Build it only via _add_arg; split it back into argv at exec time (run_rpz)
+# with IFS=newline. Never pass it through `eval`.
 RPZ_ARGS=""
 EXIT_CODE=0
+
+# Append each operand as one newline-delimited argument to RPZ_ARGS.
+# Quote single values that may contain spaces (paths); leave space-separated
+# lists (categories, feed keys) unquoted at the call site so each token is
+# appended as its own argument.
+_add_arg() {
+    for _aa in "$@"; do
+        if [ -z "$RPZ_ARGS" ]; then
+            RPZ_ARGS="$_aa"
+        else
+            RPZ_ARGS="${RPZ_ARGS}
+${_aa}"
+        fi
+    done
+}
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -433,7 +453,10 @@ parse_args() {
                 ;;
             --)
                 shift
-                RPZ_ARGS="$*"
+                # Preserve each post-"--" argument's boundary (newline-delimited)
+                # rather than space-joining with "$*", which would lose spaces
+                # inside any single argument.
+                _add_arg "$@"
                 break
                 ;;
             *)
@@ -1618,26 +1641,31 @@ build_args_from_config() {
         return 1  # No saved config
     fi
 
-    RPZ_ARGS="--output ${CONF_OUTPUT}"
+    # Build RPZ_ARGS fresh, one argument per line (see _add_arg). Path values
+    # are quoted so spaces inside them are preserved as a single argument;
+    # space-separated lists (categories, feed keys) are left unquoted so each
+    # token becomes its own argument.
+    RPZ_ARGS=""
+    _add_arg --output "$CONF_OUTPUT"
 
     if [ "$CONF_OUTPUT" = "rpz" ]; then
         if [ -n "$CONF_OUTPUT_FILE" ]; then
             # With validation enabled, write fresh zones into a .tmp staging
             # subdirectory so live zones stay intact until validation passes.
             if [ "$CONF_CHECKZONE" = "yes" ] || [ "$CONF_COMPILE_ZONE" = "yes" ]; then
-                RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}/.tmp"
+                _add_arg --output-file "${CONF_OUTPUT_FILE}/.tmp"
             else
-                RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}"
+                _add_arg --output-file "$CONF_OUTPUT_FILE"
             fi
         fi
 
         if [ -n "$CONF_ALLOWLIST_FILE" ]; then
-            RPZ_ARGS="$RPZ_ARGS --allowlist ${CONF_ALLOWLIST_FILE}"
+            _add_arg --allowlist "$CONF_ALLOWLIST_FILE"
         fi
     else
         # Pi-hole output: single flat-file blocklist.
         if [ -n "$CONF_OUTPUT_FILE" ]; then
-            RPZ_ARGS="$RPZ_ARGS --output-file ${CONF_OUTPUT_FILE}"
+            _add_arg --output-file "$CONF_OUTPUT_FILE"
         fi
     fi
 
@@ -1649,27 +1677,33 @@ build_args_from_config() {
     # When CONF_CATEGORIES is set, --categories + --sources (extra) is passed
     # to Python and resolution happens there. Legacy CONF_SOURCES is still
     # honored for users who haven't re-run --setup.
+    # These are space-separated lists, so expand unquoted to split each token
+    # into its own argument (registry keys/category names never contain spaces).
     if [ -n "$CONF_CATEGORIES" ]; then
-        RPZ_ARGS="$RPZ_ARGS --categories ${CONF_CATEGORIES}"
+        # shellcheck disable=SC2086
+        _add_arg --categories $CONF_CATEGORIES
         if [ -n "$CONF_SOURCES_EXTRA" ]; then
-            RPZ_ARGS="$RPZ_ARGS --sources ${CONF_SOURCES_EXTRA}"
+            # shellcheck disable=SC2086
+            _add_arg --sources $CONF_SOURCES_EXTRA
         fi
     elif [ -n "$CONF_SOURCES" ] && [ "$CONF_SOURCES" != "all" ]; then
-        RPZ_ARGS="$RPZ_ARGS --sources ${CONF_SOURCES}"
+        # shellcheck disable=SC2086
+        _add_arg --sources $CONF_SOURCES
     fi
     if [ -n "$CONF_SOURCES_EXCLUDE" ]; then
-        RPZ_ARGS="$RPZ_ARGS --exclude-sources ${CONF_SOURCES_EXCLUDE}"
+        # shellcheck disable=SC2086
+        _add_arg --exclude-sources $CONF_SOURCES_EXCLUDE
     fi
 
     case "$CONF_VERBOSITY" in
-        1) RPZ_ARGS="$RPZ_ARGS -v" ;;
-        2) RPZ_ARGS="$RPZ_ARGS -vv" ;;
+        1) _add_arg -v ;;
+        2) _add_arg -vv ;;
     esac
 
     # Pass --force through to rpz-zone-factory to bypass the v0.7.0
     # all-sources-unchanged fast-path.
     if [ $DO_FORCE -eq 1 ]; then
-        RPZ_ARGS="$RPZ_ARGS --force"
+        _add_arg --force
     fi
 
     log_info "Using saved config from .run-rpz.conf"
@@ -2369,7 +2403,7 @@ run_rpz() {
             fi
         done
         if [ $_need_force -eq 1 ]; then
-            RPZ_ARGS="$RPZ_ARGS --force"
+            _add_arg --force
         fi
     fi
 
@@ -2391,16 +2425,32 @@ run_rpz() {
     log_info "Running rpz-zone-factory..."
     log_info "  RPZ_DIR: $RPZ_DIR"
     if [ -n "$RPZ_ARGS" ]; then
-        log_info "  Args: $RPZ_ARGS"
+        # Flatten the newline-delimited arg list onto one line for the log only.
+        log_info "  Args: $(printf '%s' "$RPZ_ARGS" | tr '\n' ' ')"
     fi
+
+    # Split the newline-delimited RPZ_ARGS back into positional parameters so
+    # each argument (including any path containing spaces) reaches run.py
+    # intact. This replaces an `eval`, which word-split and glob-expanded the
+    # arguments and would mangle a spaced path into multiple tokens. set -f
+    # disables globbing during the split; IFS=newline keeps spaces inside an
+    # argument from splitting it.
+    _oldifs=$IFS
+    IFS='
+'
+    set -f
+    # shellcheck disable=SC2086
+    set -- $RPZ_ARGS
+    set +f
+    IFS=$_oldifs
 
     # Execute
     if [ "$MODE" = "interactive" ]; then
-        eval "\"$_venv_py\" \"$_run_py\" $RPZ_ARGS"
+        "$_venv_py" "$_run_py" "$@"
         EXIT_CODE=$?
     else
         _stderr_tmp=$(mktemp /tmp/rpz-run.XXXXXX 2>/dev/null || echo "/tmp/rpz-run.$$")
-        eval "\"$_venv_py\" \"$_run_py\" $RPZ_ARGS" 2>"$_stderr_tmp"
+        "$_venv_py" "$_run_py" "$@" 2>"$_stderr_tmp"
         EXIT_CODE=$?
 
         if [ -s "$_stderr_tmp" ]; then
@@ -2412,10 +2462,16 @@ run_rpz() {
         rm -f "$_stderr_tmp"
     fi
 
-    # Exit code 2 from rpz-zone-factory means "no upstream changes; nothing
+    # Exit code 3 from rpz-zone-factory means "no upstream changes; nothing
     # rendered" (the v0.7.0 fast-path). Treat as a successful no-op and skip
     # the entire post-processing pipeline (validation, IXFR, reload, seed).
-    if [ $EXIT_CODE -eq 2 ]; then
+    #
+    # This sentinel is deliberately 3, not 2: argparse exits 2 on a usage error
+    # (an unknown/misformed flag, e.g. a config path with a space that split
+    # into a stray token). Keeping the no-op sentinel off 2 means such a
+    # mistake surfaces as a loud error below instead of masquerading as a
+    # clean no-op.
+    if [ $EXIT_CODE -eq 3 ]; then
         log_info "rpz-zone-factory: no upstream changes - skipping post-processing"
         return 0
     fi
@@ -2629,12 +2685,24 @@ run_rpz() {
             # Sync journals to disk first so any in-flight dynamic updates
             # are persisted before we replace files. With -clean BIND also
             # removes the journal after writing, leaving us a clean slate.
-            log_info "Syncing all dynamic zones: rndc sync -clean"
-            _sync_output=$($RNDC_BIN sync -clean 2>&1)
-            _sync_rc=$?
-            if [ $_sync_rc -ne 0 ]; then
-                log_warn "rndc sync -clean failed: $_sync_output"
-            fi
+            #
+            # Scope this to the full-rebuild bucket ONLY. A global
+            # `rndc sync -clean` (no zone arg) would also clean the journals of
+            # the incremental zones we just nsupdate'd in Phase 3 - whose
+            # journals we deliberately preserved (run_incremental_for_zone uses
+            # `rndc sync` without -clean) so secondaries can IXFR the delta. A
+            # global clean here would race against those pending IXFRs and force
+            # the secondaries to AXFR instead. Full-bucket zones get their files
+            # replaced and journals removed below anyway, so cleaning only those
+            # loses nothing.
+            for _zone_name in $_full_bucket; do
+                log_info "Syncing dynamic zone before rebuild: rndc sync -clean $_zone_name"
+                _sync_output=$($RNDC_BIN sync -clean "$_zone_name" 2>&1)
+                _sync_rc=$?
+                if [ $_sync_rc -ne 0 ]; then
+                    log_warn "rndc sync -clean $_zone_name failed: $_sync_output"
+                fi
+            done
 
             for _zone_name in $_full_bucket; do
                 _db_file="${_tmp_dir}/${_zone_name}.db"

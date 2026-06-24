@@ -31,11 +31,13 @@ from rpz_factory.parsers import (
 from rpz_factory.renderers import pihole, rpz
 from rpz_factory.renderers.rpz import compute_next_serial
 
-# Exit code 2 signals "no upstream changes; nothing rendered". Distinct
-# from 0 (success, output written) and 1 (error). run-rpz.sh treats this
-# as a successful no-op and skips post-processing (validation, IXFR,
-# reload, seeding).
-EXIT_NO_CHANGES = 2
+# Exit code 3 signals "no upstream changes; nothing rendered". Distinct
+# from 0 (success, output written) and 1 (error). Deliberately NOT 2, which
+# argparse reserves for usage errors (bad/unknown flags) and exits with via
+# SystemExit; sharing 2 would make a config-driven arg mistake masquerade as a
+# clean no-op in run-rpz.sh. run-rpz.sh treats 3 as a successful no-op and
+# skips post-processing (validation, IXFR, reload, seeding).
+EXIT_NO_CHANGES = 3
 
 ALL_SOURCES = all_feed_keys()
 

@@ -382,7 +382,7 @@ This is operator responsibility, not script enforcement. The chunker hard-caps p
 Every HTTP feed uses `If-Modified-Since` / `ETag` headers. When every requested source returns `304 Not Modified`, run-rpz.sh exits in roughly the time it takes to make the conditional HTTP requests (a few seconds for the full set) instead of running the full pipeline (~30s in steady state).
 
 - **RPZ output (per-zone fast-path):** any zone whose source returned 304 with no error and whose live `.db` exists is skipped entirely (no parse, no filter, no render, no diff, no IXFR, no seed, no reload). Zones with new content render normally on the same run.
-- **Pi-hole output (whole-file fast-path):** if every source returned 304 and the live blocklist file exists, the Python engine exits with code 2 and run-rpz.sh skips its post-processing.
+- **Pi-hole output (whole-file fast-path):** if every source returned 304 and the live blocklist file exists, the Python engine exits with code 3 and run-rpz.sh skips its post-processing.
 - **Allowlist:** the allowlist source is a local text file, not HTTP, so the fast-path uses an mtime check instead. If `allowlist.txt` hasn't been modified since the live `allowlist.rpz.db` was last written, the allowlist render is skipped.
 - **`--force`** bypasses all of this and forces a full pipeline run. Use after manual zone edits or for debugging.
 
