@@ -141,8 +141,14 @@ def render(
         elif entry.entry_type == EntryType.IP:
             # RPZ IP trigger: encode IP in reverse + prefix length
             # For a single IP: 32.<reverse-ip>.rpz-ip
+            # rpz-ip is IPv4-only here; a non-dotted-quad value (e.g. IPv6 that
+            # slipped past a parser) would render an owner name BIND rejects at
+            # zone load, so drop it rather than emit a poisoned record.
             ip = entry.normalized_value()
             octets = ip.split(".")
+            if len(octets) != 4:
+                logger.debug("Skipping non-IPv4 address %s", ip)
+                continue
             reversed_ip = ".".join(reversed(octets))
             buf.write(f"32.{reversed_ip}.rpz-ip.{zone_name}. CNAME .\n")
 
@@ -167,6 +173,9 @@ def render(
                     )
                     continue
                 octets = network.split(".")
+                if len(octets) != 4:
+                    logger.debug("Skipping non-IPv4 CIDR %s", cidr)
+                    continue
                 # Always include all 4 octets in reversed order
                 reversed_network = ".".join(reversed(octets))
                 buf.write(

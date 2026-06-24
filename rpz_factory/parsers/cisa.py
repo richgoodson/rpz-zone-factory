@@ -25,9 +25,10 @@ CISA_KEV_URL = (
     "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 )
 
-# Match domains in text (simplified but effective)
+# Match domains in text (simplified but effective). TLD is alphabetic or an
+# ACE-encoded IDN TLD (xn--...), so Punycode TLDs are not silently dropped.
 _DOMAIN_RE = re.compile(
-    r"(?:https?://)?([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,})",
+    r"(?:https?://)?([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.(?:xn--[a-zA-Z0-9-]+|[a-zA-Z]{2,}))",
 )
 
 # Known vendor/non-threat domains to skip from CISA descriptions

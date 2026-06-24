@@ -54,6 +54,12 @@ def fetch_and_parse(
             logger.debug("Skipping non-IP line: %s", token)
             continue
 
+        # rpz-ip encoding is IPv4-only; an IPv6 address would render as a
+        # garbage owner name BIND rejects at zone load. Drop it here.
+        if ip.version != 4:
+            logger.debug("Skipping non-IPv4 address: %s", token)
+            continue
+
         value = str(ip)
         if value in seen:
             continue

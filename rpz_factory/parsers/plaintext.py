@@ -43,11 +43,11 @@ _HOSTS_PREFIXES = (
 
 # Domain validation: at least one dot, label rules per RFC 1035 (length
 # 1-63, alnum + hyphen, no leading/trailing hyphen). Total length checked
-# separately. We're permissive on Punycode (xn--) and IDN - labels match
-# fine since they're already ACE-encoded.
+# separately. The TLD label is alphabetic OR an ACE-encoded IDN TLD (xn--...,
+# e.g. .рф -> xn--p1ai), so Punycode TLDs are not silently dropped.
 _DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
-    r"[a-zA-Z]{2,63}$"
+    r"(?:[a-zA-Z]{2,63}|xn--[a-zA-Z0-9-]{1,59})$"
 )
 
 

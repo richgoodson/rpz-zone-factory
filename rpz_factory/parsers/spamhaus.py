@@ -27,7 +27,10 @@ DBL_URL = "https://www.spamhaus.org/drop/dbl.txt"
 _DROP_LINE_RE = re.compile(r"^(\d+\.\d+\.\d+\.\d+/\d+)\s*;\s*(\S+)")
 
 # DBL line: domain.tld  (may have trailing comment after ;)
-_DBL_LINE_RE = re.compile(r"^([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})\s*(?:;.*)?$")
+# TLD is alphabetic or an ACE-encoded IDN TLD (xn--...), so Punycode TLDs match.
+_DBL_LINE_RE = re.compile(
+    r"^([a-zA-Z0-9._-]+\.(?:[a-zA-Z]{2,}|xn--[a-zA-Z0-9-]+))\s*(?:;.*)?$"
+)
 
 
 def _parse_drop_text(text: str, source: SourceName) -> FetchResult:
