@@ -706,23 +706,26 @@ Phase 3: Apply incremental zones (BIND stays live)
           pre-checked); route to full bucket
       * → failed; route to full bucket
 
-Phase 4: Full rebuild prep
-  If _full_bucket has any zones AND DO_RELOAD:
-    rndc sync -clean    # flush all journals
-    rndc freeze          # freeze all dynamic zones
+Phase 4-6: Full-rebuild writes + activation (per-zone loop, only when
+           DO_RELOAD). For each zone in _full_bucket:
+  1. rndc freeze <zone>. The result classifies the zone:
+     success / "already frozen" → dynamic; "not dynamic" → static.
+  2. Compile .tmp/<zone>.db to a stage file <final>.new.$$ via
+     named-compilezone -F raw (or cp if compilation is disabled).
+     Staging needs only dir-write permission, not write access to the
+     existing (possibly bind-owned) file.
+  3. chmod 664, then atomic `mv -f` stage → <output>/<zone>.db.
+  4. Remove the zone's orphaned .jnl (the freeze guarantees no writer
+     holds it for dynamic zones; static zones shouldn't have one).
+  5. Activate: dynamic → rndc thaw <zone> (re-reads the file
+     synchronously); static → rndc reload <zone>.
 
-Phase 5: Full rebuild writes
-  For each zone in _full_bucket:
-    Compile .db from .tmp using named-compilezone -F raw (if enabled)
-    Otherwise cp .tmp/<zone>.db → <output>/<zone>.db
-  Remove orphaned .jnl files ONLY for zones in _full_bucket.
-  NEVER touches .jnl files for zones in _incremental_bucket - those
-  journals are live and BIND is actively using them.
-
-Phase 6: Reload and thaw
-  For each zone in _full_bucket:
-    rndc reload <zone>
-  rndc thaw    # resume dynamic updates for all zones
+  Each zone is frozen and thawed individually - there is NO server-wide
+  rndc freeze / rndc sync -clean / rndc thaw. Per-zone thaw is deliberate:
+  a global thaw is asynchronous and races the file replacement, while
+  rndc thaw <zone> re-reads synchronously. Journals for zones in
+  _incremental_bucket are never touched - they are live and BIND is
+  actively using them.
 
 Phase 7: Seed snapshots
   For each zone in _full_bucket that IS configured as incremental:
@@ -1064,31 +1067,28 @@ transferring deltas.
 
 In priority order, if anyone wants to extend this:
 
-1. **Post-incremental zone-file compile as an atomic rename.** Currently
-   `named-compilezone -o <final> ...` writes directly to the final path.
-   Not atomic. For large zones a reader could see a half-written file.
-   Write to `.tmp` first, then `mv`.
-
-2. **Per-zone `rndc freeze`/`thaw` instead of server-wide.** The current
-   code freezes EVERYTHING when any zone needs a full rebuild. If you have
-   non-RPZ dynamic zones on the same server, this could disrupt them.
-   `rndc freeze <zone>` is per-zone but the iteration adds complexity.
-
-3. **Metrics emission.** Would be nice to Prometheus-textfile-export
+1. **Metrics emission.** Would be nice to Prometheus-textfile-export
    counts of adds/dels per zone per run. Easy to bolt onto the
    `log_info "Incremental[$_zone_name]: ..."` line.
 
-4. **Parallel nsupdate.** v0.9.1 added serial chunking of oversized
+2. **Parallel nsupdate.** v0.9.1 added serial chunking of oversized
    nsupdate batches (`apply_nsupdate_chunked`). Running chunks in
    parallel rather than serially could further reduce wall-clock time
    on very large diffs, but requires care with ordering: all deletes
    must complete before any add can run, otherwise a re-add could
    race against an uncompleted delete and produce no journal entry.
 
-5. **Per-source zone config:** right now the renderer hardcodes the
-   source → zone-name mapping in `SOURCE_ZONE_NAMES`. Making that
-   configurable would let operators split/merge zones at will.
+3. **Configurable zone remapping.** `SOURCE_ZONE_NAMES` is derived from
+   `REGISTRY` (`cli.py`), and `user-feeds.yaml` already lets operators add
+   their own feeds and zones from config with no code changes. What's still
+   fixed is the shape: each feed renders to exactly one zone named
+   `<key>.<category>.rpz`. Splitting one feed across zones, or merging
+   several feeds into one zone, would mean decoupling the feed→zone
+   relationship from that naming convention.
 
-6. **Integration tests.** None currently exist. The shell layer
-   especially would benefit from a test harness that spins up BIND in
-   a container.
+4. **Integration tests.** A unit-test suite exists (`tests/`, pytest,
+   added in v0.10.0) covering the Python layer: user-feeds
+   loading/validation, the registry merge, IPv4 parsing, and a CLI
+   end-to-end. What's missing is an *integration* harness for the shell
+   layer - spinning up BIND in a container to exercise freeze/thaw,
+   nsupdate, and IXFR end to end.
