@@ -18,6 +18,7 @@ allow-audit.log
 # legacy / personal scratch
 Makefile
 scripts/
+.scratch/
 IXFR-LESSONS-LEARNED.md
 CLAUDE.md
 run-rpz.sh.backup
