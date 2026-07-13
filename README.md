@@ -107,6 +107,17 @@ Categories: `malware`, `ads`, `tracking`, `scam`, `cryptojacking`,
 edit `CONF_CATEGORIES` in `.run-rpz.conf`. Add or drop individual feeds
 with `CONF_SOURCES_EXTRA` / `CONF_SOURCES_EXCLUDE`.
 
+### Feed attribution and licensing
+
+All threat and blocklist data comes from the providers above; this project
+is grateful for their work and redistributes none of it. The pipeline
+fetches each feed directly from its source at run time, and the zone files
+it generates are derived from that data, so your use of them is governed by
+each provider's terms, not this project's MIT license. Some providers
+(Spamhaus DROP, for example) restrict commercial use. If you run this
+anywhere other than a personal network, check the license or terms of use
+for each feed you enable before deploying.
+
 ## Adding Your Own Feeds
 
 The feeds above are built in. To add a feed from any other URL without
