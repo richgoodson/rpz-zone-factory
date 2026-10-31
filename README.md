@@ -165,7 +165,7 @@ RPZ zones not propagating to secondaries, feeds erroring persistently
 behind a successful exit code, and the cron pipeline not running at all.
 Problems go to syslog for forensics and to a Discord webhook for attention.
 Serial mismatches are re-checked after a 90-second settle so an in-flight
-refresh does not page, and an unchanged alert is suppressed for 24 hours.
+refresh does not page, and each problem line alerts once per 24 hours (a new problem alerts even when it appears beside a known one).
 
 Setup: create a webhook (Discord channel settings, Integrations,
 Webhooks), put its URL in `discord.webhook` next to the script (mode 600;

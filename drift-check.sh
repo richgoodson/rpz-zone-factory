@@ -18,8 +18,8 @@
 #
 # Alerts go to a Discord webhook (URL read from a mode-600 file, never from
 # argv or this script). Serial mismatches are re-checked after a settle delay
-# before alerting, so a secondary caught mid-refresh does not page. Identical
-# alerts are suppressed for RESEND_HOURS via a fingerprint in the state dir.
+# before alerting, so a secondary caught mid-refresh does not page. Each problem
+# line is suppressed for RESEND_HOURS via per-line fingerprints in the state dir.
 # Detail always goes to syslog regardless, for forensics.
 #
 # Config (via .run-rpz.conf next to this script; the topology values have no
@@ -276,7 +276,7 @@ check_feeds
 if [ -z "$PROBLEMS" ]; then
     # Healthy: clear any previous alert fingerprint so the next problem,
     # even an identical recurrence, alerts immediately.
-    rm -f "${STATE_DIR}/last-alert.md5" "${STATE_DIR}/last-alert.epoch"
+    rm -f "${STATE_DIR}/alerted-lines" "${STATE_DIR}/last-alert.md5" "${STATE_DIR}/last-alert.epoch"
     exit 0
 fi
 
@@ -285,23 +285,46 @@ printf '%s' "$PROBLEMS" | while IFS= read -r _line; do
     [ -n "$_line" ] && log_syslog "$_line"
 done
 
-# Suppress an unchanged alert inside the resend window.
-_fp=$(printf '%s' "$PROBLEMS" | md5 -q 2>/dev/null || printf '%s' "$PROBLEMS" | md5sum | awk '{print $1}')
+# Suppress problem lines already alerted inside the resend window. Fingerprints
+# are per line, not per alert: a new problem appearing beside a known one
+# alerts for the new one only, and the known one does not re-alert when the
+# new one clears.
+fp() { printf '%s' "$1" | md5 -q 2>/dev/null || printf '%s' "$1" | md5sum | awk '{print $1}'; }
+_alerted="${STATE_DIR}/alerted-lines"   # "<epoch> <md5>" per alerted problem line
 _now=$(date +%s)
 _resend=$((CONF_MONITOR_RESEND_HOURS * 3600))
-if [ -f "${STATE_DIR}/last-alert.md5" ]; then
-    _prev_fp=$(cat "${STATE_DIR}/last-alert.md5")
-    _prev_ts=$(cat "${STATE_DIR}/last-alert.epoch" 2>/dev/null || echo 0)
-    if [ "$_fp" = "$_prev_fp" ] && [ $((_now - _prev_ts)) -lt "$_resend" ]; then
-        exit 1
+: > "${_alerted}.$$"
+[ -f "$_alerted" ] && awk -v cutoff=$((_now - _resend)) '$1 > cutoff' "$_alerted" > "${_alerted}.$$"
+: > "${_alerted}.new.$$"
+_known=0
+printf '%s\n' "$PROBLEMS" | while IFS= read -r _line; do
+    [ -z "$_line" ] && continue
+    _h=$(fp "$_line")
+    if grep -q " ${_h}\$" "${_alerted}.$$"; then
+        echo "$_h" >> "${_alerted}.known.$$"
+    else
+        echo "$_line"
+        echo "$_now $_h" >> "${_alerted}.new.$$"
     fi
+done > "${_alerted}.lines.$$"
+[ -f "${_alerted}.known.$$" ] && _known=$(wc -l < "${_alerted}.known.$$" | tr -d ' ')
+rm -f "${_alerted}.known.$$"
+
+if [ ! -s "${_alerted}.lines.$$" ]; then
+    mv "${_alerted}.$$" "$_alerted"
+    rm -f "${_alerted}.new.$$" "${_alerted}.lines.$$"
+    exit 1
 fi
 
+_still=""
+[ "$_known" -gt 0 ] && _still="(+${_known} previously alerted problem(s) still open)
+"
 send_discord "[!] rpz drift-check on $(hostname) found problems:
 
-${PROBLEMS}
-(details in daemon.log; identical alerts suppressed for ${CONF_MONITOR_RESEND_HOURS}h)" &&
-    { printf '%s' "$_fp" > "${STATE_DIR}/last-alert.md5"
-      printf '%s' "$_now" > "${STATE_DIR}/last-alert.epoch"; }
+$(cat "${_alerted}.lines.$$")
+${_still}(details in daemon.log; each problem re-alerts after ${CONF_MONITOR_RESEND_HOURS}h)" &&
+    cat "${_alerted}.new.$$" >> "${_alerted}.$$"
+mv "${_alerted}.$$" "$_alerted"
+rm -f "${_alerted}.new.$$" "${_alerted}.lines.$$"
 
 exit 1
