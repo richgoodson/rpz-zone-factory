@@ -19,6 +19,10 @@ allow-audit.log
 abuse.ch.key
 *.authkey
 
+# drift-check monitor: webhook URL + alert-dedup state
+discord.webhook
+.monitor-state/
+
 # legacy / personal scratch
 Makefile
 scripts/

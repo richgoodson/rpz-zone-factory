@@ -1046,6 +1046,7 @@ rsync -avz --exclude='.git/' --exclude='.venv/' --exclude='.cache/' \
   --exclude='__pycache__/' --exclude='*.pyc' \
   --exclude='.run-rpz.conf' --exclude='allow-audit.log' \
   --exclude='abuse.ch.key' --exclude='*.authkey' \
+  --exclude='discord.webhook' --exclude='.monitor-state/' \
   --exclude='*.rpz.db' --exclude='*.rpz' \
   --exclude='.claude/' --exclude='.DS_Store' \
   --exclude='.agents/' --exclude='.firecrawl/' \

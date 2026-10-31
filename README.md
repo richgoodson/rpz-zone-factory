@@ -157,6 +157,33 @@ If abuse.ch changes the export path, override the whole URL template with
 the `URLHAUS_RPZ_URL` environment variable (keep the literal `{auth_key}`
 placeholder in it).
 
+### Drift monitoring (drift-check.sh)
+
+`drift-check.sh` watches for the failures that syslog records but nobody
+reads: slaved zones drifting from their master or expiring out of service,
+RPZ zones not propagating to secondaries, feeds erroring persistently
+behind a successful exit code, and the cron pipeline not running at all.
+Problems go to syslog for forensics and to a Discord webhook for attention.
+Serial mismatches are re-checked after a 90-second settle so an in-flight
+refresh does not page, and an unchanged alert is suppressed for 24 hours.
+
+Setup: create a webhook (Discord channel settings, Integrations,
+Webhooks), put its URL in `discord.webhook` next to the script (mode 600;
+gitignored), verify with `./drift-check.sh --test`, then add a cron entry
+offset from the pipeline run:
+
+```
+47 * * * * /path/to/rpz-zone-factory/drift-check.sh
+```
+
+Configuration lives in `.run-rpz.conf`. `CONF_MONITOR_REF_MASTER` (the
+master to compare slaved zones against) and `CONF_MONITOR_SECONDARIES`
+(the RPZ secondaries) have no in-script defaults, so site addressing
+stays out of the repo; while either is unset the corresponding check is
+off and the script alerts about that instead of skipping quietly.
+`CONF_MONITOR_WEBHOOK_FILE`, `CONF_MONITOR_EXCLUDE_ZONES`, and
+`CONF_MONITOR_RESEND_HOURS` are optional.
+
 ### Feed attribution and licensing
 
 All threat and blocklist data comes from the providers above; this project
