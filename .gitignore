@@ -15,6 +15,10 @@ log/
 .run-rpz.conf
 allow-audit.log
 
+# secrets (abuse.ch Auth-Key file; see README "abuse.ch Auth-Key")
+abuse.ch.key
+*.authkey
+
 # legacy / personal scratch
 Makefile
 scripts/

@@ -19,6 +19,23 @@ HEADERS = {
     "User-Agent": "rpz-zone-factory/0.5 (threat-intel aggregator)",
 }
 
+# Literal placeholder in a feed URL that marks where an auth key must be
+# substituted at request time (abuse.ch key-in-path style). URLs are stored
+# and logged in template form only; the key never appears in logs or errors.
+AUTH_KEY_PLACEHOLDER = "{auth_key}"
+
+
+def redact(text: str, secret: str | None) -> str:
+    """Mask every occurrence of *secret* in *text*.
+
+    Applied to exception strings before they reach a logger or a raised
+    error, because requests embeds the full (substituted) URL in its error
+    messages and those strings propagate into syslog.
+    """
+    if secret:
+        return text.replace(secret, "***")
+    return text
+
 
 class NotModified(Exception):
     """Raised when the server returns 304 Not Modified."""
@@ -42,12 +59,19 @@ def fetch_url(
     expect_json: bool = False,
     etag: str | None = None,
     last_modified: str | None = None,
+    auth_key: str | None = None,
 ) -> str | dict[str, Any]:
     """Fetch a URL with retries and exponential backoff.
 
     Returns the response text, or parsed JSON if expect_json=True.
     Raises NotModified if the server returns 304.
     Raises RuntimeError on final failure after all retries.
+
+    If *url* contains AUTH_KEY_PLACEHOLDER, *auth_key* is substituted into
+    the request URL; otherwise a provided key is sent as an Auth-Key header.
+    Either way, *url* (the template) is what gets logged, keyed in the meta
+    store, and embedded in raised errors, so the key itself never leaves
+    this function except in the HTTP request.
     """
     req_headers = dict(HEADERS)
     if etag:
@@ -55,11 +79,19 @@ def fetch_url(
     if last_modified:
         req_headers["If-Modified-Since"] = last_modified
 
+    request_url = url
+    if AUTH_KEY_PLACEHOLDER in url:
+        if not auth_key:
+            raise RuntimeError(f"URL requires an auth key but none was provided: {url}")
+        request_url = url.replace(AUTH_KEY_PLACEHOLDER, auth_key)
+    elif auth_key:
+        req_headers["Auth-Key"] = auth_key
+
     last_exc: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
             logger.debug("Fetching %s (attempt %d/%d)", url, attempt, retries)
-            resp = requests.get(url, timeout=timeout, headers=req_headers)
+            resp = requests.get(request_url, timeout=timeout, headers=req_headers)
 
             if resp.status_code == 304:
                 logger.info("Source %s returned 304 Not Modified", url)
@@ -86,11 +118,15 @@ def fetch_url(
             raise
         except requests.RequestException as exc:
             last_exc = exc
-            logger.warning("Fetch %s attempt %d failed: %s", url, attempt, exc)
+            logger.warning(
+                "Fetch %s attempt %d failed: %s", url, attempt, redact(str(exc), auth_key)
+            )
             if attempt < retries:
                 time.sleep(backoff * attempt)
 
-    raise RuntimeError(f"Failed to fetch {url} after {retries} attempts: {last_exc}")
+    raise RuntimeError(
+        f"Failed to fetch {url} after {retries} attempts: {redact(str(last_exc), auth_key)}"
+    )
 
 
 # Module-level store for HTTP metadata from the last fetch per URL.

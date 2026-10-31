@@ -79,6 +79,9 @@ CONF_CATEGORIES=""             # space-separated categories to fetch (e.g. "malw
 CONF_INCREMENTAL_CATEGORIES="" # space-separated categories whose feeds use the IXFR path
 CONF_SOURCES_EXTRA=""          # extra individual feed keys to add on top of CONF_CATEGORIES
 CONF_SOURCES_EXCLUDE=""        # individual feed keys to drop from the resolved selection
+CONF_ABUSECH_AUTH_KEY_FILE=""  # path to file holding the abuse.ch Auth-Key (free,
+                               # https://auth.abuse.ch/) for urlhaus; read at run time and
+                               # exported to Python as $ABUSECH_AUTH_KEY, never passed as an arg
 
 # Source config file if it exists (overrides defaults above)
 _conf_file="${RPZ_DIR}/.run-rpz.conf"
@@ -927,6 +930,33 @@ run_setup() {
     CONF_SOURCES_EXTRA=$(prompt_value "Extra feeds to add (blank for none)" "$_def_extra")
     _def_excl="${CONF_SOURCES_EXCLUDE:-}"
     CONF_SOURCES_EXCLUDE=$(prompt_value "Feeds to exclude (blank for none)" "$_def_excl")
+
+    printf "\n  abuse.ch retired keyless downloads in October 2026, so the urlhaus\n"
+    printf "  feed now needs a free Auth-Key (no other built-in feed does). Get\n"
+    printf "  one at https://auth.abuse.ch/ - register, copy the Auth-Key from\n"
+    printf "  your profile, and put it in a file by itself, e.g.:\n"
+    printf "    printf '%%s\\\\n' 'YOUR-KEY' > %s/abuse.ch.key && chmod 600 %s/abuse.ch.key\n" "$RPZ_DIR" "$RPZ_DIR"
+    printf "  The file is read at run time and handed to Python via the\n"
+    printf "  environment, so the key never appears in .run-rpz.conf, syslog,\n"
+    printf "  or ps. Leave blank to skip: urlhaus will then log a fetch error\n"
+    printf "  every run and keep serving its last cached data, or drop the feed\n"
+    printf "  via 'Feeds to exclude' above. To add or change the path later,\n"
+    printf "  re-run ./run-rpz.sh --setup or edit CONF_ABUSECH_AUTH_KEY_FILE\n"
+    printf "  in .run-rpz.conf.\n\n"
+    _def_authkey_file="${CONF_ABUSECH_AUTH_KEY_FILE:-}"
+    CONF_ABUSECH_AUTH_KEY_FILE=$(prompt_value "abuse.ch Auth-Key file path (blank to skip)" "$_def_authkey_file")
+    if [ -n "$CONF_ABUSECH_AUTH_KEY_FILE" ]; then
+        if [ ! -r "$CONF_ABUSECH_AUTH_KEY_FILE" ]; then
+            printf "  [!]  Key file does not exist or is not readable: %s\n" "$CONF_ABUSECH_AUTH_KEY_FILE"
+            printf "       Saving the path anyway - create the file before the next run.\n"
+        else
+            printf "  [OK] Key file found: %s\n" "$CONF_ABUSECH_AUTH_KEY_FILE"
+            case $(ls -l "$CONF_ABUSECH_AUTH_KEY_FILE" 2>/dev/null) in
+                -r??------*) ;;
+                *) printf "  [!]  Consider: chmod 600 %s\n" "$CONF_ABUSECH_AUTH_KEY_FILE" ;;
+            esac
+        fi
+    fi
     # Clear the legacy CONF_SOURCES so build_args_from_config takes the
     # category branch unambiguously. The wizard is the source of truth now.
     CONF_SOURCES=""
@@ -1331,6 +1361,12 @@ CONF_VERBOSITY="${CONF_VERBOSITY}"
 CONF_CATEGORIES="${CONF_CATEGORIES}"
 CONF_SOURCES_EXTRA="${CONF_SOURCES_EXTRA}"
 CONF_SOURCES_EXCLUDE="${CONF_SOURCES_EXCLUDE}"
+
+# abuse.ch Auth-Key file (free key, https://auth.abuse.ch/) - required by the
+# urlhaus feed since abuse.ch retired keyless downloads (October 2026). The
+# file holds the bare key; it is read at run time and exported to Python as
+# \$ABUSECH_AUTH_KEY. An existing environment variable wins.
+CONF_ABUSECH_AUTH_KEY_FILE="${CONF_ABUSECH_AUTH_KEY_FILE}"
 
 # Legacy explicit feed list (cleared by --setup; kept for back-compat with
 # manually-edited configs). Ignored when CONF_CATEGORIES is set.
@@ -2400,6 +2436,20 @@ run_rpz() {
     if [ "$CONF_RELOAD" = "yes" ] && [ "$CONF_OUTPUT" = "rpz" ]; then
         DO_RELOAD=1
     fi
+
+    # abuse.ch Auth-Key: read from the key file and hand to Python via the
+    # environment, never argv, so it cannot appear in the syslog Args line
+    # or ps output. An existing environment value wins (manual/debug runs).
+    if [ -z "${ABUSECH_AUTH_KEY:-}" ] && [ -n "$CONF_ABUSECH_AUTH_KEY_FILE" ]; then
+        if [ -r "$CONF_ABUSECH_AUTH_KEY_FILE" ]; then
+            ABUSECH_AUTH_KEY=$(tr -d '[:space:]' < "$CONF_ABUSECH_AUTH_KEY_FILE")
+            [ -z "$ABUSECH_AUTH_KEY" ] && \
+                log_warn "abuse.ch key file is empty: $CONF_ABUSECH_AUTH_KEY_FILE - urlhaus will serve cached data"
+        else
+            log_warn "abuse.ch key file not readable: $CONF_ABUSECH_AUTH_KEY_FILE - urlhaus will serve cached data"
+        fi
+    fi
+    [ -n "${ABUSECH_AUTH_KEY:-}" ] && export ABUSECH_AUTH_KEY
 
     # Seed-gap detection: if any incremental zone is missing its .list.previous
     # snapshot, the v0.7.0 fast-path would skip rendering and prevent the shell

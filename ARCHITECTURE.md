@@ -291,6 +291,22 @@ successful fetch.
 Parsers call `fetch_with_conditional` to get the response, then parse the
 body and return a `FetchResult`.
 
+**Auth-key feeds.** A feed URL may carry the literal `{auth_key}`
+placeholder (`fetcher.AUTH_KEY_PLACEHOLDER`). `fetch_url` substitutes the
+key into the request URL at send time; without a placeholder, a provided
+key goes out as an `Auth-Key` header instead. Everything observable keeps
+the template form: the meta-store key, debug/warning log lines, and raised
+errors (exception text is masked via `fetcher.redact`, since requests
+embeds the substituted URL in its error strings and those propagate to
+syslog). Keying the meta store by template is what keeps `cli.py`'s
+`get_last_fetch_meta(spec.url)` lookup working, because the registry also
+stores the template. Currently only urlhaus uses this: abuse.ch retired
+keyless downloads in October 2026, and the key arrives via the
+`ABUSECH_AUTH_KEY` environment variable, which `run-rpz.sh` reads from the
+file named by `CONF_ABUSECH_AUTH_KEY_FILE` (same pattern as the TSIG key
+files) so it never appears in argv, the logged Args line, or the config
+file itself.
+
 ### `filters.py`
 
 Post-fetch filtering to reduce false positives.
@@ -473,6 +489,7 @@ Full var list (kept aligned with the top of `run-rpz.sh`):
 | `CONF_SOURCES_EXTRA`                | Individual feed keys to add on top of `CONF_CATEGORIES`                          |
 | `CONF_SOURCES_EXCLUDE`              | Individual feed keys to drop from the resolved selection                         |
 | `CONF_SOURCES`                      | (Legacy, pre-v0.7.0) Space-separated list, or `all`; honored when `CONF_CATEGORIES` is empty |
+| `CONF_ABUSECH_AUTH_KEY_FILE`        | Path to the abuse.ch Auth-Key file for the urlhaus feed; read in `run_rpz()` and exported as `ABUSECH_AUTH_KEY` (never argv) |
 | `CONF_CHECKZONE`                    | `yes` → run `named-checkzone` before deploying                                   |
 | `CONF_COMPILE_ZONE`                 | `yes` → compile to raw binary format                                             |
 | `CONF_RELOAD`                       | `yes` → handle BIND reloads/freeze/thaw (RPZ)                                    |
@@ -1028,6 +1045,7 @@ On the remote BIND host:
 rsync -avz --exclude='.git/' --exclude='.venv/' --exclude='.cache/' \
   --exclude='__pycache__/' --exclude='*.pyc' \
   --exclude='.run-rpz.conf' --exclude='allow-audit.log' \
+  --exclude='abuse.ch.key' --exclude='*.authkey' \
   --exclude='*.rpz.db' --exclude='*.rpz' \
   --exclude='.claude/' --exclude='.DS_Store' \
   --exclude='.agents/' --exclude='.firecrawl/' \

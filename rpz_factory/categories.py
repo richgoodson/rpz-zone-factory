@@ -59,13 +59,24 @@ _ALLOWLIST = FeedSpec(
     url="",  # local file, not HTTP
 )
 
+# abuse.ch retired the keyless URLhaus RPZ endpoint (HTTP 410 since
+# 2026-10-21). The replacement export requires a free Auth-Key from
+# https://auth.abuse.ch/, substituted into the URL path at fetch time from
+# $ABUSECH_AUTH_KEY (see fetcher.AUTH_KEY_PLACEHOLDER). The registry stores
+# the template only, so the key never appears in logs, args, or this repo.
+# $URLHAUS_RPZ_URL overrides the whole template if the export filename
+# differs from this default.
+_URLHAUS_DEFAULT_URL = (
+    "https://urlhaus-api.abuse.ch/v2/files/exports/{auth_key}/rpz.txt"
+)
+
 _BUILTIN_FEEDS: tuple[FeedSpec, ...] = (
     FeedSpec(
         key="urlhaus",
         zone="urlhaus.malware.rpz",
         category="malware",
         enum_value="abusech_urlhaus",
-        url="https://urlhaus.abuse.ch/downloads/rpz/",
+        url=os.environ.get("URLHAUS_RPZ_URL") or _URLHAUS_DEFAULT_URL,
     ),
     FeedSpec(
         key="cisa",

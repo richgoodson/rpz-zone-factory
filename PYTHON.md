@@ -24,6 +24,20 @@ If you want to run the CLI directly, activate the venv that `run-rpz.sh --setup`
 python run.py --help
 ```
 
+Direct runs that include the urlhaus feed also need the abuse.ch Auth-Key
+in the environment (run-rpz.sh reads it from the file named by
+`CONF_ABUSECH_AUTH_KEY_FILE` and exports it for you; see "abuse.ch
+Auth-Key" in README.md):
+
+```sh
+ABUSECH_AUTH_KEY=$(cat /path/to/abuse.ch.key) python run.py --sources urlhaus --output rpz --output-file /tmp/rpz-test/
+```
+
+`URLHAUS_RPZ_URL` overrides the download URL template if abuse.ch moves the
+export; keep the literal `{auth_key}` placeholder in it. The key is
+substituted only into the HTTP request. Log lines and errors carry the
+template, with any key occurrence masked (`fetcher.redact`).
+
 ### Generate RPZ zone files
 
 RPZ output always writes one zone file per feed into a directory:

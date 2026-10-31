@@ -1,20 +1,29 @@
 """Parser for Abuse.ch URLhaus RPZ feed.
 
-The feed at https://urlhaus.abuse.ch/downloads/rpz/ is already in RPZ format.
-We parse the CNAME records out of it to extract blocked domains.
+The feed is already in RPZ format; we parse the CNAME records out of it to
+extract blocked domains. The URL comes from the registry (categories.py) and
+requires a free abuse.ch Auth-Key, read from $ABUSECH_AUTH_KEY, since the
+keyless endpoint was retired in October 2026.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 
-from rpz_factory.fetcher import NotModified, fetch_url, get_last_fetch_meta
+from rpz_factory.categories import REGISTRY
+from rpz_factory.fetcher import (
+    AUTH_KEY_PLACEHOLDER,
+    NotModified,
+    fetch_url,
+    get_last_fetch_meta,
+)
 from rpz_factory.models import EntryType, FetchResult, HttpMeta, SourceName, ThreatEntry
 
 logger = logging.getLogger(__name__)
 
-URLHAUS_RPZ_URL = "https://urlhaus.abuse.ch/downloads/rpz/"
+AUTH_KEY_ENV = "ABUSECH_AUTH_KEY"
 
 # Matches RPZ CNAME lines like:
 #   malware.example.com CNAME .
@@ -32,8 +41,17 @@ def fetch_and_parse(
 ) -> FetchResult:
     """Fetch URLhaus RPZ feed and extract domain entries."""
     result = FetchResult(source=SourceName.ABUSECH_URLHAUS)
+    url = REGISTRY["urlhaus"].url
+    auth_key = os.environ.get(AUTH_KEY_ENV, "").strip() or None
+    if AUTH_KEY_PLACEHOLDER in url and not auth_key:
+        result.error = (
+            f"{AUTH_KEY_ENV} is not set; URLhaus downloads require a free "
+            "Auth-Key from https://auth.abuse.ch/ (see README, abuse.ch Auth-Key)"
+        )
+        logger.error("URLhaus: %s", result.error)
+        return result
     try:
-        text = fetch_url(URLHAUS_RPZ_URL, etag=etag, last_modified=last_modified)
+        text = fetch_url(url, etag=etag, last_modified=last_modified, auth_key=auth_key)
         assert isinstance(text, str)
     except NotModified:
         result.not_modified = True

@@ -89,7 +89,7 @@ tell whether the entry is `ads`, `malware`, `ipreputation`, etc.
 
 | Source | Category | Type | Zone | URL |
 |--------|----------|------|------|-----|
-| Abuse.ch URLhaus | malware | Domains (RPZ feed) | `urlhaus.malware.rpz` | https://urlhaus.abuse.ch/downloads/rpz/ |
+| Abuse.ch URLhaus | malware | Domains (RPZ feed) | `urlhaus.malware.rpz` | https://urlhaus-api.abuse.ch/v2/files/exports/ (Auth-Key required, see below) |
 | CISA KEV | vulnerabilities | Domains from CVE data | `cisa-kev.vulnerabilities.rpz` | https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json |
 | Spamhaus DROP | ipreputation | IP/CIDR | `spamhaus-drop.ipreputation.rpz` | https://www.spamhaus.org/drop/drop.txt |
 | Scam Sniffer | scam | Domains (crypto scams) | `scamsniffer.scam.rpz` | https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/domains.json |
@@ -106,6 +106,56 @@ Categories: `malware`, `ads`, `tracking`, `scam`, `cryptojacking`,
 `ipreputation`, `vulnerabilities`. Pick categories at `--setup` time, or
 edit `CONF_CATEGORIES` in `.run-rpz.conf`. Add or drop individual feeds
 with `CONF_SOURCES_EXTRA` / `CONF_SOURCES_EXCLUDE`.
+
+### abuse.ch Auth-Key
+
+abuse.ch retired keyless downloads in October 2026; the old URLhaus RPZ
+endpoint now returns HTTP 410. The urlhaus feed therefore needs a free
+Auth-Key.
+
+**Registering and getting the key:**
+
+1. Go to the abuse.ch authentication portal at https://auth.abuse.ch/.
+   There are no password accounts: sign in with GitHub, Google, LinkedIn,
+   or X, or request a one-time sign-in link by email. First sign-in creates
+   the account; authenticating means accepting the abuse.ch Terms of Use.
+2. Once signed in, create an Auth-Key on your profile page and copy it.
+   One key covers every abuse.ch platform (URLhaus,
+   ThreatFox, MalwareBazaar, Feodo Tracker, SSL Blacklist), so if you
+   already have a key for another abuse.ch service, reuse it.
+3. The key is free for non-commercial use under the abuse.ch Fair Use
+   Policy (https://abuse.ch/terms-of-use/#principles). abuse.ch generates
+   the RPZ export every 5 minutes and asks that you not fetch more often
+   than that; this pipeline fetches hourly with conditional requests, well
+   inside the limit. abuse.ch rate-limits accounts with unusually high
+   query volumes. Commercial / for-profit use may require the paid
+   Spamhaus commercial API instead.
+
+**Installing the key:**
+
+1. Put the key in a file by itself, readable only by the operator account:
+
+   ```sh
+   printf '%s\n' 'YOUR-KEY' > ~/rpz-zone-factory/abuse.ch.key
+   chmod 600 ~/rpz-zone-factory/abuse.ch.key
+   ```
+
+2. Point the pipeline at it: run `./run-rpz.sh --setup` and enter the path
+   at the Auth-Key file prompt, or set `CONF_ABUSECH_AUTH_KEY_FILE` in
+   `.run-rpz.conf` directly.
+
+`run-rpz.sh` reads the file at run time and hands the key to Python through
+the `ABUSECH_AUTH_KEY` environment variable, never through argv. The key
+is substituted into the download URL at request time only. Logs, error
+messages, and the syslog Args line always carry the URL template with the
+key masked, and both the key file and `.run-rpz.conf` are gitignored, so
+the key never lands in the repo, syslog, or `ps` output. Without a key,
+the urlhaus feed logs a fetch error each run and keeps serving its last
+cached data; every other built-in feed is unaffected.
+
+If abuse.ch changes the export path, override the whole URL template with
+the `URLHAUS_RPZ_URL` environment variable (keep the literal `{auth_key}`
+placeholder in it).
 
 ### Feed attribution and licensing
 
@@ -255,6 +305,7 @@ The `--setup` wizard saves all choices to `.run-rpz.conf` in the project directo
 | `CONF_SOURCES_EXTRA` | Individual feed keys to add on top of the resolved category selection |
 | `CONF_SOURCES_EXCLUDE` | Individual feed keys to drop from the resolved selection |
 | `CONF_SOURCES` | (Legacy, pre-v0.7.0.) Space-separated source list, or `all`. Honored only when `CONF_CATEGORIES` is empty. |
+| `CONF_ABUSECH_AUTH_KEY_FILE` | Path to a file holding the abuse.ch Auth-Key (required by the urlhaus feed; see "abuse.ch Auth-Key" above). Read at run time and exported to Python as `ABUSECH_AUTH_KEY`. |
 
 **BIND reload + validation:**
 
