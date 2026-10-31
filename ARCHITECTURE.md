@@ -853,6 +853,16 @@ Safe to delete at any time; next run will re-fetch and rebuild.
 
 ## Release history
 
+- **v0.11.0**: abuse.ch Auth-Key support and drift monitoring. abuse.ch
+  retired keyless downloads in October 2026, so the urlhaus feed moved to the
+  authenticated export: `{auth_key}` placeholder substitution in `fetcher.py`
+  with key masking in every log and error path, `CONF_ABUSECH_AUTH_KEY_FILE`
+  in the shell layer (key file read at run time, exported as an environment
+  variable, never argv), and a setup-wizard prompt. New `drift-check.sh`
+  monitor: slaved-zone serial drift, RPZ propagation to secondaries, feed
+  health, and pipeline liveness, alerting to a Discord webhook with syslog
+  as the forensic record. The fetcher User-Agent now derives from
+  `__version__` instead of a hardcoded string.
 - **v0.10.0**: user-supplied web feeds via an optional `user-feeds.yaml`.
   Operator-defined domain and IPv4 IP/CIDR feeds from arbitrary URLs, with no
   code changes. New `userfeeds.py` (dependency-free loader/validator), a

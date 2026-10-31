@@ -9,6 +9,8 @@ from typing import Any
 
 import requests
 
+from rpz_factory import __version__
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 30
@@ -16,7 +18,7 @@ DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF = 2.0
 
 HEADERS = {
-    "User-Agent": "rpz-zone-factory/0.5 (threat-intel aggregator)",
+    "User-Agent": f"rpz-zone-factory/{__version__} (threat-intel aggregator)",
 }
 
 # Literal placeholder in a feed URL that marks where an auth key must be
