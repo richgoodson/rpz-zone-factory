@@ -182,7 +182,13 @@ master to compare slaved zones against) and `CONF_MONITOR_SECONDARIES`
 stays out of the repo; while either is unset the corresponding check is
 off and the script alerts about that instead of skipping quietly.
 `CONF_MONITOR_WEBHOOK_FILE`, `CONF_MONITOR_EXCLUDE_ZONES`, and
-`CONF_MONITOR_RESEND_HOURS` are optional.
+`CONF_MONITOR_RESEND_HOURS` are optional. List values
+(`CONF_MONITOR_SECONDARIES`, `CONF_MONITOR_EXCLUDE_ZONES`) are
+space-separated, no commas:
+
+```sh
+CONF_MONITOR_EXCLUDE_ZONES="16.172.in-addr.arpa 32.172.in-addr.arpa"
+```
 
 ### Feed attribution and licensing
 
