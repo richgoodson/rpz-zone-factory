@@ -136,8 +136,8 @@ Auth-Key.
 1. Put the key in a file by itself, readable only by the operator account:
 
    ```sh
-   printf '%s\n' 'YOUR-KEY' > ~/rpz-zone-factory/abuse.ch.key
-   chmod 600 ~/rpz-zone-factory/abuse.ch.key
+   printf '%s\n' 'YOUR-KEY' > rpz-zone-factory/abuse.ch.key
+   chmod 600 rpz-zone-factory/abuse.ch.key
    ```
 
 2. Point the pipeline at it: run `./run-rpz.sh --setup` and enter the path
